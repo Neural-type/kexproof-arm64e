@@ -19,14 +19,14 @@ jobs:
           tar -xf /tmp/sdk.tar.xz -C "$HOME/theos/sdks"
 
       - name: Build KexProof (arm64e)
-        working-directory: KexProof
+        working-directory: .
         env:
           THEOS: ${{ env.HOME }}/theos
         run: |
           make package FINALPACKAGE=1 THEOS="$THEOS"
 
       - name: Sign + package IPA
-        working-directory: KexProof
+        working-directory: .
         run: |
           BIN="$(find .theos/_ -path '*/KexProof.app/KexProof' -type f | head -1)"
           test -f "$BIN"
@@ -50,4 +50,4 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: KexProof-arm64e
-          path: KexProof/out/KexProof-arm64e.ipa
+          path: out/KexProof-arm64e.ipa
