@@ -13,7 +13,7 @@ jobs:
 
       - name: Install Theos + SDK
         run: |
-          git clone --depth=1 https://github.com/theos/theos.git /Users/runner/theos
+          git clone --depth=1 --recurse-submodules --shallow-submodules https://github.com/theos/theos.git /Users/runner/theos
           mkdir -p /Users/runner/theos/sdks
           curl -sL "https://github.com/theos/sdks/releases/download/master-146e41f/iPhoneOS16.5.sdk.tar.xz" -o /tmp/sdk.tar.xz
           tar -xf /tmp/sdk.tar.xz -C /Users/runner/theos/sdks
