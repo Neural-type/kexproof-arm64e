@@ -15,7 +15,7 @@ jobs:
         run: |
           git clone --depth=1 https://github.com/theos/theos.git "$HOME/theos"
           mkdir -p "$HOME/theos/sdks"
-          curl -sL "https://github.com/theos/sdks/releases/download/v0.0.4/iPhoneOS16.5.sdk.tar.xz" -o /tmp/sdk.tar.xz
+          curl -sL "https://github.com/theos/sdks/releases/download/master-146e41f/iPhoneOS16.5.sdk.tar.xz" -o /tmp/sdk.tar.xz
           tar -xf /tmp/sdk.tar.xz -C "$HOME/theos/sdks"
 
       - name: Build KexProof (arm64e)
