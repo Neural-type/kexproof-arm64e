@@ -13,15 +13,15 @@ jobs:
 
       - name: Install Theos + SDK
         run: |
-          git clone --depth=1 https://github.com/theos/theos.git "$HOME/theos"
-          mkdir -p "$HOME/theos/sdks"
+          git clone --depth=1 https://github.com/theos/theos.git /Users/runner/theos
+          mkdir -p /Users/runner/theos/sdks
           curl -sL "https://github.com/theos/sdks/releases/download/master-146e41f/iPhoneOS16.5.sdk.tar.xz" -o /tmp/sdk.tar.xz
-          tar -xf /tmp/sdk.tar.xz -C "$HOME/theos/sdks"
+          tar -xf /tmp/sdk.tar.xz -C /Users/runner/theos/sdks
 
       - name: Build KexProof (arm64e)
         working-directory: .
         env:
-          THEOS: ${{ env.HOME }}/theos
+          THEOS: /Users/runner/theos
         run: |
           make package FINALPACKAGE=1 THEOS="$THEOS"
 
