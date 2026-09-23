@@ -1,0 +1,289 @@
+make: Entering directory '/tmp/kexproof-build.Fd0Dy0'
+make: Entering directory '/tmp/kexproof-build.Fd0Dy0'
+[0;36m==> [1;39mCleaning…[m
+make: Leaving directory '/tmp/kexproof-build.Fd0Dy0'
+[1;31m> [1;3;39mMaking all for application KexProof…[m
+bash: -c: line 1: syntax error near unexpected token `('
+bash: -c: line 1: `echo "-I/mnt/c/JAILBREAK/.analysis/theos/include/iphone -I/mnt/c/JAILBREAK/.analysis/theos/include -I/mnt/c/JAILBREAK/.analysis/theos/vendor/include -I/mnt/c/JAILBREAK/.analysis/theos/include/_fallback -include /mnt/c/JAILBREAK/.analysis/theos/Prefix.pch -iquote /tmp/kexproof-build.Fd0Dy0 -fcolor-diagnostics -DTARGET_IPHONE=1 -Os -Wall -ggdb -Wno-unused-command-line-argument -Qunused-arguments -F/mnt/c/JAILBREAK/.analysis/theos/sdks/iPhoneOS16.5.sdk/System/Library/PrivateFrameworks -F/mnt/c/JAILBREAK/.analysis/theos/vendor/lib/iphone/rootless -F/mnt/c/JAILBREAK/.analysis/theos/lib/iphone/rootless -Werror -D THEOS_PACKAGE_INSTALL_PREFIX="\"/var/jb\"" -isysroot "/mnt/c/JAILBREAK/.analysis/theos/sdks/iPhoneOS16.5.sdk" -target -apple-ios15.0   -fobjc-arc -O2 -Wall -Wextra -Wno-error -Wno-deprecated-declarations -include stdio.h -ISources/shim -ISources/include -ISources/xpf/src -ISources/xpf/external/ChOma/include -ISources/xpf/external/img4lib -DUSE_COMMONCRYPTO -DUSE_LIBCOMPRESSION -DiOS10 -DDER_MULTIBYTE_TAGS=1 "-D__unused=__attribute__((unused))" -DDER_TAG_SIZE=8 -Wno-variadic-macros -Wno-multichar -Wno-four-char-constants -Wno-unused-parameter   -DTHEOS_INSTANCE_NAME="\"KexProof\"" -fmodules -fcxx-modules -fmodule-name=KexProof -fbuild-session-file=/tmp/kexproof-build.Fd0Dy0/.theos/build_session -fmodules-prune-after=345600 -fmodules-prune-interval=86400 -fmodules-validate-once-per-build-session  -arch        -stdlib=libc++        -c warnings=error    -Xfrontend -color-diagnostics -Xcc -fcolor-diagnostics -Xcc -DTARGET_IPHONE=1 -Xcc -Os -Xcc -Wall -Xcc -ggdb -Xcc -Wno-unused-command-line-argument -Xcc -Qunused-arguments -Xcc -F/mnt/c/JAILBREAK/.analysis/theos/sdks/iPhoneOS16.5.sdk/System/Library/PrivateFrameworks -Xcc -F/mnt/c/JAILBREAK/.analysis/theos/vendor/lib/iphone/rootless -Xcc -F/mnt/c/JAILBREAK/.analysis/theos/lib/iphone/rootless -Xcc -Werror -Xcc -D -Xcc THEOS_PACKAGE_INSTALL_PREFIX="\"/var/jb\"" -Xcc -isysroot -Xcc "/mnt/c/JAILBREAK/.analysis/theos/sdks/iPhoneOS16.5.sdk" -Xcc -target -Xcc -apple-ios15.0 -Xcc -fobjc-arc -Xcc -O2 -Xcc -Wall -Xcc -Wextra -Xcc -Wno-error -Xcc -Wno-deprecated-declarations -Xcc -include -Xcc stdio.h -Xcc -ISources/shim -Xcc -ISources/include -Xcc -ISources/xpf/src -Xcc -ISources/xpf/external/ChOma/include -Xcc -ISources/xpf/external/img4lib -Xcc -DUSE_COMMONCRYPTO -Xcc -DUSE_LIBCOMPRESSION -Xcc -DiOS10 -Xcc -DDER_MULTIBYTE_TAGS=1 -Xcc "-D__unused=__attribute__((unused))" -Xcc -DDER_TAG_SIZE=8 -Xcc -Wno-variadic-macros -Xcc -Wno-multichar -Xcc -Wno-four-char-constants -Xcc -Wno-unused-parameter -Xcc -DTHEOS_INSTANCE_NAME="\"KexProof\"" -Xcc -fmodules -Xcc -fcxx-modules -Xcc -fmodule-name=KexProof -Xcc -fbuild-session-file=/tmp/kexproof-build.Fd0Dy0/.theos/build_session -Xcc -fmodules-prune-after=345600 -Xcc -fmodules-prune-interval=86400 -Xcc -fmodules-validate-once-per-build-session -Xcc -arch -Xcc -stdlib=libc++ -DTHEOS_SWIFT -DTARGET_IPHONE -O -whole-module-optimization -num-threads 1 -module-name KexProof -g -F/mnt/c/JAILBREAK/.analysis/theos/sdks/iPhoneOS16.5.sdk/System/Library/PrivateFrameworks -F/mnt/c/JAILBREAK/.analysis/theos/vendor/lib/iphone/rootless -F/mnt/c/JAILBREAK/.analysis/theos/lib/iphone/rootless -swift-version 5 -parse-as-library -sdk "/mnt/c/JAILBREAK/.analysis/theos/sdks/iPhoneOS16.5.sdk"        " | md5sum | cut -c1-8'
+[0;35m==> [1;39mCopying resource directories into the application wrapper…[m
+bash: -c: line 1: syntax error near unexpected token `('
+bash: -c: line 1: `echo "-I/mnt/c/JAILBREAK/.analysis/theos/include/iphone -I/mnt/c/JAILBREAK/.analysis/theos/include -I/mnt/c/JAILBREAK/.analysis/theos/vendor/include -I/mnt/c/JAILBREAK/.analysis/theos/include/_fallback -include /mnt/c/JAILBREAK/.analysis/theos/Prefix.pch -iquote /tmp/kexproof-build.Fd0Dy0 -fcolor-diagnostics -DTARGET_IPHONE=1 -Os -Wall -ggdb -Wno-unused-command-line-argument -Qunused-arguments -F/mnt/c/JAILBREAK/.analysis/theos/sdks/iPhoneOS16.5.sdk/System/Library/PrivateFrameworks -F/mnt/c/JAILBREAK/.analysis/theos/vendor/lib/iphone/rootless -F/mnt/c/JAILBREAK/.analysis/theos/lib/iphone/rootless -Werror -D THEOS_PACKAGE_INSTALL_PREFIX="\"/var/jb\"" -isysroot "/mnt/c/JAILBREAK/.analysis/theos/sdks/iPhoneOS16.5.sdk" -target -apple-ios15.0   -fobjc-arc -O2 -Wall -Wextra -Wno-error -Wno-deprecated-declarations -include stdio.h -ISources/shim -ISources/include -ISources/xpf/src -ISources/xpf/external/ChOma/include -ISources/xpf/external/img4lib -DUSE_COMMONCRYPTO -DUSE_LIBCOMPRESSION -DiOS10 -DDER_MULTIBYTE_TAGS=1 "-D__unused=__attribute__((unused))" -DDER_TAG_SIZE=8 -Wno-variadic-macros -Wno-multichar -Wno-four-char-constants -Wno-unused-parameter   -DTHEOS_INSTANCE_NAME="\"KexProof\"" -fmodules -fcxx-modules -fmodule-name=KexProof -fbuild-session-file=/tmp/kexproof-build.Fd0Dy0/.theos/build_session -fmodules-prune-after=345600 -fmodules-prune-interval=86400 -fmodules-validate-once-per-build-session  -arch        -stdlib=libc++        -c warnings=error    -Xfrontend -color-diagnostics -Xcc -fcolor-diagnostics -Xcc -DTARGET_IPHONE=1 -Xcc -Os -Xcc -Wall -Xcc -ggdb -Xcc -Wno-unused-command-line-argument -Xcc -Qunused-arguments -Xcc -F/mnt/c/JAILBREAK/.analysis/theos/sdks/iPhoneOS16.5.sdk/System/Library/PrivateFrameworks -Xcc -F/mnt/c/JAILBREAK/.analysis/theos/vendor/lib/iphone/rootless -Xcc -F/mnt/c/JAILBREAK/.analysis/theos/lib/iphone/rootless -Xcc -Werror -Xcc -D -Xcc THEOS_PACKAGE_INSTALL_PREFIX="\"/var/jb\"" -Xcc -isysroot -Xcc "/mnt/c/JAILBREAK/.analysis/theos/sdks/iPhoneOS16.5.sdk" -Xcc -target -Xcc -apple-ios15.0 -Xcc -fobjc-arc -Xcc -O2 -Xcc -Wall -Xcc -Wextra -Xcc -Wno-error -Xcc -Wno-deprecated-declarations -Xcc -include -Xcc stdio.h -Xcc -ISources/shim -Xcc -ISources/include -Xcc -ISources/xpf/src -Xcc -ISources/xpf/external/ChOma/include -Xcc -ISources/xpf/external/img4lib -Xcc -DUSE_COMMONCRYPTO -Xcc -DUSE_LIBCOMPRESSION -Xcc -DiOS10 -Xcc -DDER_MULTIBYTE_TAGS=1 -Xcc "-D__unused=__attribute__((unused))" -Xcc -DDER_TAG_SIZE=8 -Xcc -Wno-variadic-macros -Xcc -Wno-multichar -Xcc -Wno-four-char-constants -Xcc -Wno-unused-parameter -Xcc -DTHEOS_INSTANCE_NAME="\"KexProof\"" -Xcc -fmodules -Xcc -fcxx-modules -Xcc -fmodule-name=KexProof -Xcc -fbuild-session-file=/tmp/kexproof-build.Fd0Dy0/.theos/build_session -Xcc -fmodules-prune-after=345600 -Xcc -fmodules-prune-interval=86400 -Xcc -fmodules-validate-once-per-build-session -Xcc -arch -Xcc -stdlib=libc++ -DTHEOS_SWIFT -DTARGET_IPHONE -O -whole-module-optimization -num-threads 1 -module-name KexProof -g -F/mnt/c/JAILBREAK/.analysis/theos/sdks/iPhoneOS16.5.sdk/System/Library/PrivateFrameworks -F/mnt/c/JAILBREAK/.analysis/theos/vendor/lib/iphone/rootless -F/mnt/c/JAILBREAK/.analysis/theos/lib/iphone/rootless -swift-version 5 -parse-as-library -sdk "/mnt/c/JAILBREAK/.analysis/theos/sdks/iPhoneOS16.5.sdk"        " | md5sum | cut -c1-8'
+bash: -c: line 1: syntax error near unexpected token `('
+bash: -c: line 1: `echo "-I/mnt/c/JAILBREAK/.analysis/theos/include/iphone -I/mnt/c/JAILBREAK/.analysis/theos/include -I/mnt/c/JAILBREAK/.analysis/theos/vendor/include -I/mnt/c/JAILBREAK/.analysis/theos/include/_fallback -include /mnt/c/JAILBREAK/.analysis/theos/Prefix.pch -iquote /tmp/kexproof-build.Fd0Dy0 -fcolor-diagnostics -DTARGET_IPHONE=1 -Os -Wall -ggdb -Wno-unused-command-line-argument -Qunused-arguments -F/mnt/c/JAILBREAK/.analysis/theos/sdks/iPhoneOS16.5.sdk/System/Library/PrivateFrameworks -F/mnt/c/JAILBREAK/.analysis/theos/vendor/lib/iphone/rootless -F/mnt/c/JAILBREAK/.analysis/theos/lib/iphone/rootless -Werror -D THEOS_PACKAGE_INSTALL_PREFIX="\"/var/jb\"" -isysroot "/mnt/c/JAILBREAK/.analysis/theos/sdks/iPhoneOS16.5.sdk" -target arm64-apple-ios15.0   -fobjc-arc -O2 -Wall -Wextra -Wno-error -Wno-deprecated-declarations -include stdio.h -ISources/shim -ISources/include -ISources/xpf/src -ISources/xpf/external/ChOma/include -ISources/xpf/external/img4lib -DUSE_COMMONCRYPTO -DUSE_LIBCOMPRESSION -DiOS10 -DDER_MULTIBYTE_TAGS=1 "-D__unused=__attribute__((unused))" -DDER_TAG_SIZE=8 -Wno-variadic-macros -Wno-multichar -Wno-four-char-constants -Wno-unused-parameter   -DTHEOS_INSTANCE_NAME="\"KexProof\"" -fmodules -fcxx-modules -fmodule-name=KexProof -fbuild-session-file=/tmp/kexproof-build.Fd0Dy0/.theos/build_session -fmodules-prune-after=345600 -fmodules-prune-interval=86400 -fmodules-validate-once-per-build-session  -arch arm64       -stdlib=libc++        -c warnings=error    -Xfrontend -color-diagnostics -Xcc -fcolor-diagnostics -Xcc -DTARGET_IPHONE=1 -Xcc -Os -Xcc -Wall -Xcc -ggdb -Xcc -Wno-unused-command-line-argument -Xcc -Qunused-arguments -Xcc -F/mnt/c/JAILBREAK/.analysis/theos/sdks/iPhoneOS16.5.sdk/System/Library/PrivateFrameworks -Xcc -F/mnt/c/JAILBREAK/.analysis/theos/vendor/lib/iphone/rootless -Xcc -F/mnt/c/JAILBREAK/.analysis/theos/lib/iphone/rootless -Xcc -Werror -Xcc -D -Xcc THEOS_PACKAGE_INSTALL_PREFIX="\"/var/jb\"" -Xcc -isysroot -Xcc "/mnt/c/JAILBREAK/.analysis/theos/sdks/iPhoneOS16.5.sdk" -Xcc -target -Xcc arm64-apple-ios15.0 -Xcc -fobjc-arc -Xcc -O2 -Xcc -Wall -Xcc -Wextra -Xcc -Wno-error -Xcc -Wno-deprecated-declarations -Xcc -include -Xcc stdio.h -Xcc -ISources/shim -Xcc -ISources/include -Xcc -ISources/xpf/src -Xcc -ISources/xpf/external/ChOma/include -Xcc -ISources/xpf/external/img4lib -Xcc -DUSE_COMMONCRYPTO -Xcc -DUSE_LIBCOMPRESSION -Xcc -DiOS10 -Xcc -DDER_MULTIBYTE_TAGS=1 -Xcc "-D__unused=__attribute__((unused))" -Xcc -DDER_TAG_SIZE=8 -Xcc -Wno-variadic-macros -Xcc -Wno-multichar -Xcc -Wno-four-char-constants -Xcc -Wno-unused-parameter -Xcc -DTHEOS_INSTANCE_NAME="\"KexProof\"" -Xcc -fmodules -Xcc -fcxx-modules -Xcc -fmodule-name=KexProof -Xcc -fbuild-session-file=/tmp/kexproof-build.Fd0Dy0/.theos/build_session -Xcc -fmodules-prune-after=345600 -Xcc -fmodules-prune-interval=86400 -Xcc -fmodules-validate-once-per-build-session -Xcc -arch -Xcc arm64 -Xcc -stdlib=libc++ -DTHEOS_SWIFT -DTARGET_IPHONE -O -whole-module-optimization -num-threads 1 -module-name KexProof -g -F/mnt/c/JAILBREAK/.analysis/theos/sdks/iPhoneOS16.5.sdk/System/Library/PrivateFrameworks -F/mnt/c/JAILBREAK/.analysis/theos/vendor/lib/iphone/rootless -F/mnt/c/JAILBREAK/.analysis/theos/lib/iphone/rootless -swift-version 5 -parse-as-library -sdk "/mnt/c/JAILBREAK/.analysis/theos/sdks/iPhoneOS16.5.sdk"        " | md5sum | cut -c1-8'
+[0;32m==> [1;39mCompiling Sources/KPCompilerRT.m (arm64)…[m
+[0;32m==> [1;39mCompiling Sources/xpf/src/decompress.c (arm64)…[m
+[0;32m==> [1;39mCompiling Sources/exploit/free_thread.c (arm64)…[m
+[1mSources/exploit/free_thread.c:71:20: [0m[0;1;35mwarning: [0m[1mincompatible integer to pointer conversion returning 'int' from a function with result type 'void *' [-Wint-conversion][0m
+            return KERN_FAILURE;
+[0;1;32m                   ^~~~~~~~~~~~
+[0m[1m/mnt/c/JAILBREAK/.analysis/theos/sdks/iPhoneOS16.5.sdk/usr/include/mach/kern_return.h:94:41: [0m[0;1;30mnote: [0mexpanded from macro 'KERN_FAILURE'[0m
+#define KERN_FAILURE                    5
+[0;1;32m                                        ^
+[0m1 warning generated.
+[0;32m==> [1;39mCompiling Sources/exploit/surface.c (arm64)…[m
+[0;32m==> [1;39mCompiling Sources/exploit/phys_oob.c (arm64)…[m
+[0;32m==> [1;39mCompiling Sources/exploit/utils.c (arm64)…[m
+[0;32m==> [1;39mCompiling Sources/exploit/poc.c (arm64)…[m
+[0;32m==> [1;39mCompiling Sources/xpf/external/ChOma/src/Base64.c (arm64)…[m
+[1mSources/xpf/external/ChOma/src/Base64.c:24:30: [0m[0;1;35mwarning: [0m[1mcomparison of integers of different signs: 'int' and 'size_t' (aka 'unsigned long') [-Wsign-compare][0m
+    for (int i = 0, j = 0; i < input_length;) {
+[0;1;32m                           ~ ^ ~~~~~~~~~~~~
+[0m[1mSources/xpf/external/ChOma/src/Base64.c:26:30: [0m[0;1;35mwarning: [0m[1mcomparison of integers of different signs: 'int' and 'size_t' (aka 'unsigned long') [-Wsign-compare][0m
+        uint32_t octet_a = i < input_length ? (unsigned char)data[i++] : 0;
+[0;1;32m                           ~ ^ ~~~~~~~~~~~~
+[0m[1mSources/xpf/external/ChOma/src/Base64.c:27:30: [0m[0;1;35mwarning: [0m[1mcomparison of integers of different signs: 'int' and 'size_t' (aka 'unsigned long') [-Wsign-compare][0m
+        uint32_t octet_b = i < input_length ? (unsigned char)data[i++] : 0;
+[0;1;32m                           ~ ^ ~~~~~~~~~~~~
+[0m[1mSources/xpf/external/ChOma/src/Base64.c:28:30: [0m[0;1;35mwarning: [0m[1mcomparison of integers of different signs: 'int' and 'size_t' (aka 'unsigned long') [-Wsign-compare][0m
+        uint32_t octet_c = i < input_length ? (unsigned char)data[i++] : 0;
+[0;1;32m                           ~ ^ ~~~~~~~~~~~~
+[0m4 warnings generated.
+[0;32m==> [1;39mCompiling Sources/shim/info.c (arm64)…[m
+[1mSources/shim/info.c:82:18: [0m[0;1;35mwarning: [0m[1mcomparison of integers of different signs: 'cpu_subtype_t' (aka 'int') and 'unsigned int' [-Wsign-compare][0m
+                                          cpuFamily == CPUFAMILY_ARM_IBIZA ||                           // M3
+[0;1;32m                                          ~~~~~~~~~ ^  ~~~~~~~~~~~~~~~~~~~
+[0m[1mSources/shim/info.c:78:18: [0m[0;1;35mwarning: [0m[1mcomparison of integers of different signs: 'cpu_subtype_t' (aka 'int') and 'unsigned int' [-Wsign-compare][0m
+                                          cpuFamily == CPUFAMILY_ARM_EVEREST_SAWTOOTH ||        // A16
+[0;1;32m                                          ~~~~~~~~~ ^  ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+[0m[1mSources/shim/info.c:77:30: [0m[0;1;35mwarning: [0m[1mcomparison of integers of different signs: 'cpu_subtype_t' (aka 'int') and 'unsigned int' [-Wsign-compare][0m
+        bool hasJitbox = (cpuFamily == CPUFAMILY_ARM_BLIZZARD_AVALANCHE ||      // A15 / M2
+[0;1;32m                          ~~~~~~~~~ ^  ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+[0m[1mSources/shim/info.c:103:16: [0m[0;1;35mwarning: [0m[1mcomparison of integers of different signs: 'cpu_subtype_t' (aka 'int') and 'unsigned int' [-Wsign-compare][0m
+        if (cpuFamily == CPUFAMILY_ARM_MONSOON_MISTRAL) {
+[0;1;32m            ~~~~~~~~~ ^  ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+[0m4 warnings generated.
+[0;32m==> [1;39mCompiling Sources/exploit/krw.c (arm64)…[m
+[0;32m==> [1;39mCompiling Sources/exploit/socket.c (arm64)…[m
+[1mSources/exploit/socket.c:59:27: [0m[0;1;35mwarning: [0m[1mpassing 'mach_port_t *' (aka 'unsigned int *') to parameter of type 'int *' converts between pointers to integer types with different sign [-Wpointer-sign][0m
+    fileport_makeport(fd, &output_socket_port);
+[0;1;32m                          ^~~~~~~~~~~~~~~~~~~
+[0m[1mSources/include/sys/fileport.h:9:43: [0m[0;1;30mnote: [0mpassing argument to parameter 'osir_return' here[0m
+fileport_t fileport_makeport(int fd, int *osir_return);
+[0;1;32m                                          ^
+[0m1 warning generated.
+[0;32m==> [1;39mCompiling Sources/xpf/external/ChOma/src/BufferedStream.c (arm64)…[m
+[0;32m==> [1;39mCompiling Sources/main.m (arm64)…[m
+[0;32m==> [1;39mCompiling Sources/xpf/external/ChOma/src/CSBlob.c (arm64)…[m
+[0;32m==> [1;39mCompiling Sources/KPLog.m (arm64)…[m
+[0;32m==> [1;39mCompiling Sources/xpf/src/bad_recovery.c (arm64)…[m
+[1mSources/xpf/src/bad_recovery.c:246:17: [0m[0;1;35mwarning: [0m[1munused function 'xpf_find_thread_machine_kstackptr' [-Wunused-function][0m
+static uint64_t xpf_find_thread_machine_kstackptr(void)
+[0;1;32m                ^
+[0m1 warning generated.
+[0;32m==> [1;39mCompiling Sources/shim/translation.c (arm64)…[m
+[1mSources/shim/translation.c:81:11: [0m[0;1;35mwarning: [0m[1munused variable 'pa' [-Wunused-variable][0m
+        uint64_t pa = 0;
+[0;1;32m                 ^
+[0m1 warning generated.
+[0;32m==> [1;39mCompiling Sources/xpf/external/ChOma/src/CodeDirectory.c (arm64)…[m
+[1mSources/xpf/external/ChOma/src/CodeDirectory.c:11:23: [0m[0;1;35mwarning: [0m[1mcomparison of integers of different signs: 'int' and 'unsigned long' [-Wsign-compare][0m
+    for (int i = 0; i < sizeof(cdhash_t); i++) {
+[0;1;32m                    ~ ^ ~~~~~~~~~~~~~~~~
+[0m[1mSources/xpf/external/ChOma/src/CodeDirectory.c:31:14: [0m[0;1;35mwarning: [0m[1mcomparison of integers of different signs: 'int' and 'unsigned int' [-Wsign-compare][0m
+    if (slot == codeDir->nCodeSlots - 1) {
+[0;1;32m        ~~~~ ^  ~~~~~~~~~~~~~~~~~~~~~~~
+[0m[1mSources/xpf/external/ChOma/src/CodeDirectory.c:94:23: [0m[0;1;35mwarning: [0m[1mcomparison of integers of different signs: 'int' and 'uint32_t' (aka 'unsigned int') [-Wsign-compare][0m
+    for (int i = 0; i < codeDir.nCodeSlots; i++) {
+[0;1;32m                    ~ ^ ~~~~~~~~~~~~~~~~~~
+[0m[1mSources/xpf/external/ChOma/src/CodeDirectory.c:536:23: [0m[0;1;35mwarning: [0m[1mcomparison of integers of different signs: 'int' and 'uint32_t' (aka 'unsigned int') [-Wsign-compare][0m
+    for (int i = 1; i <= codeDir.nSpecialSlots; i++) {
+[0;1;32m                    ~ ^  ~~~~~~~~~~~~~~~~~~~~~
+[0m4 warnings generated.
+[0;32m==> [1;39mCompiling Sources/xpf/src/common.c (arm64)…[m
+[1mSources/xpf/src/common.c:36:20: [0m[0;1;35mwarning: [0m[1mcomparison of integers of different signs: 'int' and 'uint32_t' (aka 'unsigned int') [-Wsign-compare][0m
+        for (int i = 0; i < n; i++) {
+[0;1;32m                        ~ ^ ~
+[0m[1mSources/xpf/src/common.c:157:6: [0m[0;1;35mwarning: [0m[1munused variable 'r' [-Wunused-variable][0m
+        int r = arm64_dec_mov_imm(pfsec_read32(textSection, movAddr), &movReg, NULL, NULL, NULL);
+[0;1;32m            ^
+[0m[1mSources/xpf/src/common.c:681:20: [0m[0;1;35mwarning: [0m[1mcomparison of integers of different signs: 'int' and 'uint32_t' (aka 'unsigned int') [-Wsign-compare][0m
+        for (int i = 0; i < idx; i++) {
+[0;1;32m                        ~ ^ ~~~
+[0m[1mSources/xpf/src/common.c:1419:20: [0m[0;1;35mwarning: [0m[1mcomparison of integers of different signs: 'int' and 'unsigned long' [-Wsign-compare][0m
+        for (int i = 0; i < (sizeof(stringSectionCandidates) / sizeof(*stringSectionCandidates)); i++) {
+[0;1;32m                        ~ ^  ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+[0m[1mSources/xpf/src/common.c:1421:21: [0m[0;1;35mwarning: [0m[1mcomparison of integers of different signs: 'int' and 'unsigned long' [-Wsign-compare][0m
+                for (int y = 0; y < (sizeof(stringCandidateMetrics) / sizeof(*stringCandidateMetrics)); y++) {
+[0;1;32m                                ~ ^  ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+[0m[1mSources/xpf/src/common.c:1431:20: [0m[0;1;35mwarning: [0m[1mcomparison of integers of different signs: 'int' and 'unsigned long' [-Wsign-compare][0m
+        for (int y = 0; y < (sizeof(stringCandidateMetrics) / sizeof(*stringCandidateMetrics)); y++) {
+[0;1;32m                        ~ ^  ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+[0m[1mSources/xpf/src/common.c:1441:20: [0m[0;1;35mwarning: [0m[1mcomparison of integers of different signs: 'int' and 'unsigned long' [-Wsign-compare][0m
+        for (int i = 0; i < (sizeof(textSectionCandidates) / sizeof(*textSectionCandidates)); i++) {
+[0;1;32m                        ~ ^  ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+[0m[1mSources/xpf/src/common.c:1475:20: [0m[0;1;35mwarning: [0m[1mcomparison of integers of different signs: 'int' and 'unsigned long' [-Wsign-compare][0m
+        for (int i = 0; i < (sizeof(textSectionCandidates) / sizeof(*textSectionCandidates)); i++) {
+[0;1;32m                        ~ ^  ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+[0m[1mSources/xpf/src/common.c:1512:20: [0m[0;1;35mwarning: [0m[1mcomparison of integers of different signs: 'int' and 'unsigned long' [-Wsign-compare][0m
+        for (int i = 0; i < (sizeof(textSectionCandidates) / sizeof(*textSectionCandidates)); i++) {
+[0;1;32m                        ~ ^  ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+[0m9 warnings generated.
+[0;32m==> [1;39mCompiling Sources/xpf/src/sptm_txm.c (arm64)…[m
+[1mSources/xpf/src/sptm_txm.c:786:37: [0m[0;1;35mwarning: [0m[1munused variable 'subsAnyMask' [-Wunused-variable][0m
+        uint32_t subsAnyInst = 0x6b000000, subsAnyMask = 0xffe00000;
+[0;1;32m                                           ^
+[0m[1mSources/xpf/src/sptm_txm.c:786:11: [0m[0;1;35mwarning: [0m[1munused variable 'subsAnyInst' [-Wunused-variable][0m
+        uint32_t subsAnyInst = 0x6b000000, subsAnyMask = 0xffe00000;
+[0;1;32m                 ^
+[0m[1mSources/xpf/src/sptm_txm.c:827:13: [0m[0;1;35mwarning: [0m[1mcomparison of integers of different signs: 'int' and 'uint32_t' (aka 'unsigned int') [-Wsign-compare][0m
+        while (idx <= idxToFind) {
+[0;1;32m               ~~~ ^  ~~~~~~~~~
+[0m3 warnings generated.
+[0;32m==> [1;39mCompiling Sources/ClearSword.m (arm64)…[m
+[0;32m==> [1;39mCompiling Sources/xpf/src/ppl.c (arm64)…[m
+[0;32m==> [1;39mCompiling Sources/shim/primitives.c (arm64)…[m
+[0;32m==> [1;39mCompiling Sources/xpf/src/non_ppl.c (arm64)…[m
+[1mSources/xpf/src/non_ppl.c:134:20: [0m[0;1;35mwarning: [0m[1mcomparison of integers of different signs: 'int' and 'uint32_t' (aka 'unsigned int') [-Wsign-compare][0m
+        for (int i = 0; i < n; i++) {
+[0;1;32m                        ~ ^ ~
+[0m1 warning generated.
+[0;32m==> [1;39mCompiling Sources/KPViewController.m (arm64)…[m
+[0;32m==> [1;39mCompiling Sources/xpf/src/xpf.c (arm64)…[m
+[1mSources/xpf/src/xpf.c:623:7: [0m[0;1;35mwarning: [0m[1munused variable 'r' [-Wunused-variable][0m
+                int r = pfsec_read_string(gXPF.kernelConstSection, vmaddr, &gXPF.kernelVersionString);
+[0;1;32m                    ^
+[0m[1mSources/xpf/src/xpf.c:632:8: [0m[0;1;35mwarning: [0m[1munused variable 'r' [-Wunused-variable][0m
+                        int r = pfsec_read_string(gXPF.kernelInfoPlistSection, vmaddr, &gXPF.kernelInfoPlist);
+[0;1;32m                            ^
+[0m[1mSources/xpf/src/xpf.c:759:20: [0m[0;1;35mwarning: [0m[1mcomparison of integers of different signs: 'int' and 'uint32_t' (aka 'unsigned int') [-Wsign-compare][0m
+        for (int i = 0; i < setCount; i++) {
+[0;1;32m                        ~ ^ ~~~~~~~~
+[0m[1mSources/xpf/src/xpf.c:815:11: [0m[0;1;35mwarning: [0m[1munused variable 'setCount' [-Wunused-variable][0m
+        uint32_t setCount = (sizeof(gSets)/sizeof(XPFSet*));
+[0;1;32m                 ^
+[0m4 warnings generated.
+[0;32m==> [1;39mCompiling Sources/xpf/external/ChOma/src/Fat.c (arm64)…[m
+[1mSources/xpf/external/ChOma/src/Fat.c:144:27: [0m[0;1;35mwarning: [0m[1mcomparison of integers of different signs: 'int' and 'uint32_t' (aka 'unsigned int') [-Wsign-compare][0m
+        for (int i = 0; i < fat->slicesCount; i++) {
+[0;1;32m                        ~ ^ ~~~~~~~~~~~~~~~~
+[0m[1mSources/xpf/external/ChOma/src/Fat.c:179:27: [0m[0;1;35mwarning: [0m[1mcomparison of integers of different signs: 'int' and 'uint32_t' (aka 'unsigned int') [-Wsign-compare][0m
+        for (int i = 0; i < fat->slicesCount; i++) {
+[0;1;32m                        ~ ^ ~~~~~~~~~~~~~~~~
+[0m2 warnings generated.
+[0;32m==> [1;39mCompiling Sources/xpf/external/ChOma/src/DyldSharedCache.c (arm64)…[m
+[1mSources/xpf/external/ChOma/src/DyldSharedCache.c:130:20: [0m[0;1;35mwarning: [0m[1mcomparison of integers of different signs: 'off_t' (aka 'long long') and 'unsigned long' [-Wsign-compare][0m
+    if (sb.st_size < sizeof(struct dyld_cache_header)) goto fail;
+[0;1;32m        ~~~~~~~~~~ ^ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+[0m[1mSources/xpf/external/ChOma/src/DyldSharedCache.c:169:46: [0m[0;1;35mwarning: [0m[1mcomparison of integers of different signs: 'ssize_t' (aka 'long') and 'size_t' (aka 'unsigned long') [-Wsign-compare][0m
+    return !(read(dscFile->fd, outBuf, size) == size);
+[0;1;32m             ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ ^  ~~~~
+[0m[1mSources/xpf/external/ChOma/src/DyldSharedCache.c:306:27: [0m[0;1;35mwarning: [0m[1mcomparison of integers of different signs: 'int' and 'uint32_t' (aka 'unsigned int') [-Wsign-compare][0m
+        for (int k = 0; k < header->mappingCount; k++) {
+[0;1;32m                        ~ ^ ~~~~~~~~~~~~~~~~~~~~
+[0m[1mSources/xpf/external/ChOma/src/DyldSharedCache.c:412:31: [0m[0;1;35mwarning: [0m[1mcomparison of integers of different signs: 'int' and 'uint64_t' (aka 'unsigned long long') [-Wsign-compare][0m
+            for (int k = 0; k < imagesCount; k++) {
+[0;1;32m                            ~ ^ ~~~~~~~~~~~
+[0m[1mSources/xpf/external/ChOma/src/DyldSharedCache.c:450:43: [0m[0;1;35mwarning: [0m[1mcomparison of integers of different signs: 'unsigned int' and 'int' [-Wsign-compare][0m
+        if (sharedCache->symbolFile.index != -1) {
+[0;1;32m            ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ ^  ~~
+[0m[1mSources/xpf/external/ChOma/src/DyldSharedCache.c:532:23: [0m[0;1;35mwarning: [0m[1mcomparison of integers of different signs: 'int' and 'unsigned int' [-Wsign-compare][0m
+    for (int i = 0; i < sharedCache->fileCount; i++) {
+[0;1;32m                    ~ ^ ~~~~~~~~~~~~~~~~~~~~~~
+[0m6 warnings generated.
+[0;32m==> [1;39mCompiling Sources/xpf/external/ChOma/src/Host.c (arm64)…[m
+[0;32m==> [1;39mCompiling Sources/xpf/external/ChOma/src/MachOLoadCommand.c (arm64)…[m
+[0;32m==> [1;39mCompiling Sources/xpf/external/ChOma/src/MemoryStream.c (arm64)…[m
+[1mSources/xpf/external/ChOma/src/MemoryStream.c:8:17: [0m[0;1;35mwarning: [0m[1mcomparison of integers of different signs: 'int' and 'size_t' (aka 'unsigned long') [-Wsign-compare][0m
+        if (ret != size) { return -1; }
+[0;1;32m            ~~~ ^  ~~~~
+[0m[1mSources/xpf/external/ChOma/src/MemoryStream.c:18:17: [0m[0;1;35mwarning: [0m[1mcomparison of integers of different signs: 'int' and 'size_t' (aka 'unsigned long') [-Wsign-compare][0m
+        if (ret != size) { return -1; }
+[0;1;32m            ~~~ ^  ~~~~
+[0m2 warnings generated.
+[0;32m==> [1;39mCompiling Sources/xpf/external/img4lib/lzss.c (arm64)…[m
+[0;32m==> [1;39mCompiling Sources/xpf/external/ChOma/src/Util.c (arm64)…[m
+[1mSources/xpf/external/ChOma/src/Util.c:19:23: [0m[0;1;35mwarning: [0m[1mcomparison of integers of different signs: 'int' and 'size_t' (aka 'unsigned long') [-Wsign-compare][0m
+    for (int i = 0; i < n; i++) {
+[0;1;32m                    ~ ^ ~
+[0m[1mSources/xpf/external/ChOma/src/Util.c:40:23: [0m[0;1;35mwarning: [0m[1mcomparison of integers of different signs: 'int' and 'size_t' (aka 'unsigned long') [-Wsign-compare][0m
+    for (int j = 0; j < size; j++) {
+[0;1;32m                    ~ ^ ~~~~
+[0m2 warnings generated.
+[0;32m==> [1;39mCompiling Sources/xpf/external/ChOma/src/DER.c (arm64)…[m
+[0;32m==> [1;39mCompiling Sources/xpf/external/img4lib/libvfs/vfs_lzss.c (arm64)…[m
+[0;32m==> [1;39mCompiling Sources/xpf/external/img4lib/libvfs/vfs_lzfse.c (arm64)…[m
+[0;32m==> [1;39mCompiling Sources/xpf/external/img4lib/libvfs/vfs_file.c (arm64)…[m
+[0;32m==> [1;39mCompiling Sources/xpf/external/ChOma/src/MachO.c (arm64)…[m
+[1mSources/xpf/external/ChOma/src/MachO.c:216:23: [0m[0;1;35mwarning: [0m[1mcomparison of integers of different signs: 'int' and 'uint32_t' (aka 'unsigned int') [-Wsign-compare][0m
+    for (int j = 0; j < macho->machHeader.ncmds; j++) {
+[0;1;32m                    ~ ^ ~~~~~~~~~~~~~~~~~~~~~~~
+[0m[1mSources/xpf/external/ChOma/src/MachO.c:340:27: [0m[0;1;35mwarning: [0m[1mcomparison of integers of different signs: 'int' and 'uint32_t' (aka 'unsigned int') [-Wsign-compare][0m
+        for (int i = 0; i < symtabCommand.nsyms; i++) {
+[0;1;32m                        ~ ^ ~~~~~~~~~~~~~~~~~~~
+[0m[1mSources/xpf/external/ChOma/src/MachO.c:529:44: [0m[0;1;35mwarning: [0m[1mcomparison of integers of different signs: 'uint64_t' (aka 'unsigned long long') and 'int64_t' (aka 'long long') [-Wsign-compare][0m
+                if (segmentCommand->vmaddr < base) {
+[0;1;32m                    ~~~~~~~~~~~~~~~~~~~~~~ ^ ~~~~
+[0m[1mSources/xpf/external/ChOma/src/MachO.c:784:27: [0m[0;1;35mwarning: [0m[1mcomparison of integers of different signs: 'int' and 'uint32_t' (aka 'unsigned int') [-Wsign-compare][0m
+        for (int j = 0; j < fatArray[i]->slicesCount; j++) {
+[0;1;32m                        ~ ^ ~~~~~~~~~~~~~~~~~~~~~~~~
+[0m4 warnings generated.
+[0;32m==> [1;39mCompiling Sources/xpf/external/ChOma/src/PatchFinder_arm64.c (arm64)…[m
+[0;32m==> [1;39mCompiling Sources/xpf/external/ChOma/src/PatchFinder.c (arm64)…[m
+[0;32m==> [1;39mCompiling Sources/xpf/external/img4lib/libvfs/vfs_mem.c (arm64)…[m
+[0;32m==> [1;39mCompiling Sources/xpf/external/img4lib/libvfs/vfs_enc.c (arm64)…[m
+[0;32m==> [1;39mCompiling Sources/xpf/external/ChOma/src/arm64.c (arm64)…[m
+[0;32m==> [1;39mCompiling Sources/KPDump.m (arm64)…[m
+[0;32m==> [1;39mCompiling Sources/xpf/external/img4lib/libvfs/vfs_sub.c (arm64)…[m
+[0;32m==> [1;39mCompiling Sources/xpf/external/ChOma/src/Entitlements.c (arm64)…[m
+[1mSources/xpf/external/ChOma/src/Entitlements.c:179:31: [0m[0;1;35mwarning: [0m[1mcomparison of integers of different signs: 'int' and 'uint32_t' (aka 'unsigned int') [-Wsign-compare][0m
+            for (int i = 0; i < entitlement->value.arrayValue.nItems; i++) {
+[0;1;32m                            ~ ^ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+[0m[1mSources/xpf/external/ChOma/src/Entitlements.c:189:23: [0m[0;1;35mwarning: [0m[1mcomparison of integers of different signs: 'int' and 'uint32_t' (aka 'unsigned int') [-Wsign-compare][0m
+    for (int i = 0; i < array.nItems; i++) {
+[0;1;32m                    ~ ^ ~~~~~~~~~~~~
+[0m[1mSources/xpf/external/ChOma/src/Entitlements.c:206:23: [0m[0;1;35mwarning: [0m[1mcomparison of integers of different signs: 'int' and 'uint32_t' (aka 'unsigned int') [-Wsign-compare][0m
+    for (int i = 0; i < array.nItems; i++) {
+[0;1;32m                    ~ ^ ~~~~~~~~~~~~
+[0m[1mSources/xpf/external/ChOma/src/Entitlements.c:270:22: [0m[0;1;35mwarning: [0m[1mcomparison of integers of different signs: 'int' and 'uint32_t' (aka 'unsigned int') [-Wsign-compare][0m
+    for(int i = 0; i < nEntitlements; i++) {
+[0;1;32m                   ~ ^ ~~~~~~~~~~~~~
+[0m[1mSources/xpf/external/ChOma/src/Entitlements.c:447:23: [0m[0;1;35mwarning: [0m[1mcomparison of integers of different signs: 'int' and 'uint32_t' (aka 'unsigned int') [-Wsign-compare][0m
+    for (int i = 0; i < entitlements->nEntitlements; i++) {
+[0;1;32m                    ~ ^ ~~~~~~~~~~~~~~~~~~~~~~~~~~~
+[0m[1mSources/xpf/external/ChOma/src/Entitlements.c:464:27: [0m[0;1;35mwarning: [0m[1mcomparison of integers of different signs: 'int' and 'uint32_t' (aka 'unsigned int') [-Wsign-compare][0m
+        for (int i = 0; i < entitlements->nEntitlements; i++) {
+[0;1;32m                        ~ ^ ~~~~~~~~~~~~~~~~~~~~~~~~~~~
+[0m6 warnings generated.
+[0;32m==> [1;39mCompiling Sources/KPRunner.m (arm64)…[m
+[0;32m==> [1;39mCompiling Sources/xpf/external/img4lib/libDER/DER_Decode.c (arm64)…[m
+[0;32m==> [1;39mCompiling Sources/xpf/external/img4lib/libDER/DER_Encode.c (arm64)…[m
+[0;32m==> [1;39mCompiling Sources/xpf/external/ChOma/src/FileStream.c (arm64)…[m
+[0;32m==> [1;39mCompiling Sources/KPAppDelegate.m (arm64)…[m
+[0;32m==> [1;39mCompiling Sources/xpf/external/img4lib/libDER/oids.c (arm64)…[m
+[1mSources/xpf/external/img4lib/libDER/oids.c:365:1: [0m[0;1;35mwarning: [0m[1mambiguous expansion of macro '__unused' [-Wambiguous-macro][0m
+__unused static const DERByte
+[0;1;32m^
+[0m[1m/mnt/c/JAILBREAK/.analysis/theos/sdks/iPhoneOS16.5.sdk/usr/include/sys/cdefs.h:169:9: [0m[0;1;30mnote: [0mexpanding this definition of '__unused'[0m
+#define __unused        __attribute__((__unused__))
+[0;1;32m        ^
+[0m[1m<command line>:7:9: [0m[0;1;30mnote: [0mother definition of '__unused'[0m
+#define __unused __attribute__((unused))
+[0;1;32m        ^
+[0m[1mSources/xpf/external/img4lib/libDER/oids.c:431:1: [0m[0;1;35mwarning: [0m[1mambiguous expansion of macro '__unused' [-Wambiguous-macro][0m
+__unused const DERItem
+[0;1;32m^
+[0m[1m/mnt/c/JAILBREAK/.analysis/theos/sdks/iPhoneOS16.5.sdk/usr/include/sys/cdefs.h:169:9: [0m[0;1;30mnote: [0mexpanding this definition of '__unused'[0m
+#define __unused        __attribute__((__unused__))
+[0;1;32m        ^
+[0m[1m<command line>:7:9: [0m[0;1;30mnote: [0mother definition of '__unused'[0m
+#define __unused __attribute__((unused))
+[0;1;32m        ^
+[0m2 warnings generated.
+[0;32m==> [1;39mCompiling Sources/xpf/external/img4lib/libvfs/vfs_img4.c (arm64)…[m
+[0;33m==> [1;39mLinking application KexProof (arm64)…[m
+[0;34m==> [1;39mGenerating debug symbols for KexProof…[m
+[0;34m==> [1;39mStripping KexProof (arm64)…[m
+[0;34m==> [1;39mSigning KexProof…[m
+[1;31m> [1;3;39mMaking stage for application KexProof…[m
+bash: -c: line 1: syntax error near unexpected token `('
+bash: -c: line 1: `echo "-I/mnt/c/JAILBREAK/.analysis/theos/include/iphone -I/mnt/c/JAILBREAK/.analysis/theos/include -I/mnt/c/JAILBREAK/.analysis/theos/vendor/include -I/mnt/c/JAILBREAK/.analysis/theos/include/_fallback -include /mnt/c/JAILBREAK/.analysis/theos/Prefix.pch -iquote /tmp/kexproof-build.Fd0Dy0 -fcolor-diagnostics -DTARGET_IPHONE=1 -Os -Wall -ggdb -Wno-unused-command-line-argument -Qunused-arguments -F/mnt/c/JAILBREAK/.analysis/theos/sdks/iPhoneOS16.5.sdk/System/Library/PrivateFrameworks -F/mnt/c/JAILBREAK/.analysis/theos/vendor/lib/iphone/rootless -F/mnt/c/JAILBREAK/.analysis/theos/lib/iphone/rootless -Werror -D THEOS_PACKAGE_INSTALL_PREFIX="\"/var/jb\"" -isysroot "/mnt/c/JAILBREAK/.analysis/theos/sdks/iPhoneOS16.5.sdk" -target -apple-ios15.0   -fobjc-arc -O2 -Wall -Wextra -Wno-error -Wno-deprecated-declarations -include stdio.h -ISources/shim -ISources/include -ISources/xpf/src -ISources/xpf/external/ChOma/include -ISources/xpf/external/img4lib -DUSE_COMMONCRYPTO -DUSE_LIBCOMPRESSION -DiOS10 -DDER_MULTIBYTE_TAGS=1 "-D__unused=__attribute__((unused))" -DDER_TAG_SIZE=8 -Wno-variadic-macros -Wno-multichar -Wno-four-char-constants -Wno-unused-parameter   -DTHEOS_INSTANCE_NAME="\"KexProof\"" -fmodules -fcxx-modules -fmodule-name=KexProof -fbuild-session-file=/tmp/kexproof-build.Fd0Dy0/.theos/build_session -fmodules-prune-after=345600 -fmodules-prune-interval=86400 -fmodules-validate-once-per-build-session  -arch        -stdlib=libc++        -c warnings=error    -Xfrontend -color-diagnostics -Xcc -fcolor-diagnostics -Xcc -DTARGET_IPHONE=1 -Xcc -Os -Xcc -Wall -Xcc -ggdb -Xcc -Wno-unused-command-line-argument -Xcc -Qunused-arguments -Xcc -F/mnt/c/JAILBREAK/.analysis/theos/sdks/iPhoneOS16.5.sdk/System/Library/PrivateFrameworks -Xcc -F/mnt/c/JAILBREAK/.analysis/theos/vendor/lib/iphone/rootless -Xcc -F/mnt/c/JAILBREAK/.analysis/theos/lib/iphone/rootless -Xcc -Werror -Xcc -D -Xcc THEOS_PACKAGE_INSTALL_PREFIX="\"/var/jb\"" -Xcc -isysroot -Xcc "/mnt/c/JAILBREAK/.analysis/theos/sdks/iPhoneOS16.5.sdk" -Xcc -target -Xcc -apple-ios15.0 -Xcc -fobjc-arc -Xcc -O2 -Xcc -Wall -Xcc -Wextra -Xcc -Wno-error -Xcc -Wno-deprecated-declarations -Xcc -include -Xcc stdio.h -Xcc -ISources/shim -Xcc -ISources/include -Xcc -ISources/xpf/src -Xcc -ISources/xpf/external/ChOma/include -Xcc -ISources/xpf/external/img4lib -Xcc -DUSE_COMMONCRYPTO -Xcc -DUSE_LIBCOMPRESSION -Xcc -DiOS10 -Xcc -DDER_MULTIBYTE_TAGS=1 -Xcc "-D__unused=__attribute__((unused))" -Xcc -DDER_TAG_SIZE=8 -Xcc -Wno-variadic-macros -Xcc -Wno-multichar -Xcc -Wno-four-char-constants -Xcc -Wno-unused-parameter -Xcc -DTHEOS_INSTANCE_NAME="\"KexProof\"" -Xcc -fmodules -Xcc -fcxx-modules -Xcc -fmodule-name=KexProof -Xcc -fbuild-session-file=/tmp/kexproof-build.Fd0Dy0/.theos/build_session -Xcc -fmodules-prune-after=345600 -Xcc -fmodules-prune-interval=86400 -Xcc -fmodules-validate-once-per-build-session -Xcc -arch -Xcc -stdlib=libc++ -DTHEOS_SWIFT -DTARGET_IPHONE -O -whole-module-optimization -num-threads 1 -module-name KexProof -g -F/mnt/c/JAILBREAK/.analysis/theos/sdks/iPhoneOS16.5.sdk/System/Library/PrivateFrameworks -F/mnt/c/JAILBREAK/.analysis/theos/vendor/lib/iphone/rootless -F/mnt/c/JAILBREAK/.analysis/theos/lib/iphone/rootless -swift-version 5 -parse-as-library -sdk "/mnt/c/JAILBREAK/.analysis/theos/sdks/iPhoneOS16.5.sdk"        " | md5sum | cut -c1-8'
+make: Entering directory '/tmp/kexproof-build.Fd0Dy0'
+[0;36m==> [1;36mNotice:[m Neither plutil, ply, or libplist-utils are installed, so XML plist files were not optimized.
+make: Leaving directory '/tmp/kexproof-build.Fd0Dy0'
+make: Entering directory '/tmp/kexproof-build.Fd0Dy0'
+dm.pl: building package `com.stealth.kexproof:iphoneos-arm64' in `./packages/com.stealth.kexproof_1.0.0_iphoneos-arm64.deb'
+make: Leaving directory '/tmp/kexproof-build.Fd0Dy0'
+make: Leaving directory '/tmp/kexproof-build.Fd0Dy0'
+dpkg-deb: building package 'com.stealth.kexproof' in '/mnt/c/JAILBREAK/KexProof/packages/com.stealth.kexproof_1.0.0_iphoneos-arm64.deb'.
+ccb93eb7b919bcb94e74615a86235c1763a346a3948deb02f709acf12131fd77  /mnt/c/JAILBREAK/KexProof/packages/com.stealth.kexproof_1.0.0_iphoneos-arm64.deb
+6284f4d3d168221a0be31421037994fcf7d34616474bb3237528876afeffe887  /mnt/c/JAILBREAK/KexProof/packages/KexProof-1.0.0.ipa

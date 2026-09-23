@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+
+# Ask Sileo to respring only after dpkg has completed the transaction. Calling
+# sbreload directly from a maintainer script can terminate Sileo mid-install
+# and leave dpkg interrupted.
+finish() {
+    local action="${1:-}"
+    [[ -z "${action}" || -z "${CYDIA:-}" ]] && return
+    local cydia=(${CYDIA})
+    [[ "${cydia[1]:-0}" -eq 1 ]] || return
+    echo "finish:${action}" >&${cydia[0]}
+}
+
+/var/jb/usr/bin/uicache -a 2>/dev/null || /var/jb/usr/bin/uicache 2>/dev/null || true
+finish restart
+exit 0

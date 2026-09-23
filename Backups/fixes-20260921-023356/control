@@ -1,0 +1,8 @@
+Package: com.stealth.kexproof
+Name: KexProof
+Description: ClearSword (CVE-2025-43520) kernel exploit PoC: lands kernel R/W and dumps SPTM/TXM structures to a shareable report.
+Maintainer: YellU
+Author: YellU
+Section: Utilities
+Architecture: iphoneos-arm64
+Version: 1.5.4
