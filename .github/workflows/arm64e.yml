@@ -17,6 +17,7 @@ jobs:
           mkdir -p /Users/runner/theos/sdks
           curl -sL "https://github.com/theos/sdks/releases/download/master-146e41f/iPhoneOS16.5.sdk.tar.xz" -o /tmp/sdk.tar.xz
           tar -xf /tmp/sdk.tar.xz -C /Users/runner/theos/sdks
+          git clone --depth=1 https://github.com/theos/dm.pl.git /tmp/dmpl && mkdir -p /Users/runner/theos/bin && cp /tmp/dmpl/dm.pl /Users/runner/theos/bin/ && chmod +x /Users/runner/theos/bin/dm.pl
 
       - name: Build KexProof (arm64e)
         working-directory: .
