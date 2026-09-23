@@ -600,7 +600,7 @@ int xpf_start_with_kernel_path(const char *kernelPath, const char *optSptmPath, 
 				if (flavor == ARM_THREAD_STATE64) {
 					arm_thread_state64_t *threadState = (arm_thread_state64_t *)(cmdData + 8);
 #ifdef __arm64e__
-					gXPF.kernelEntry = LITTLE_TO_HOST((uint64_t)threadState->__pc);
+					gXPF.kernelEntry = LITTLE_TO_HOST((uint64_t)threadState->__opaque_pc);
 #else
 					gXPF.kernelEntry = LITTLE_TO_HOST((uint64_t)threadState->__pc);
 #endif
