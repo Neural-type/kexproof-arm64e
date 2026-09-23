@@ -42,7 +42,7 @@ KexProof_CFLAGS = \
 
 # clang 11's arm64e chained fixups crash dyld4 on iOS 18 ("Address size fault"
 # in _dyld_lookup_section_info) — emit the legacy fixup format instead.
-KexProof_LDFLAGS = -fuse-ld=/home/bobinskij/llvm17/bin/ld64.lld -Xlinker -arch -Xlinker arm64 -Xlinker -platform_version -Xlinker ios -Xlinker 15.0 -Xlinker 15.0 -Xlinker -fixup_chains
+KexProof_LDFLAGS =
 
 KexProof_INSTALL_PATH = /Applications
 KexProof_RESOURCE_DIRS = Resources
