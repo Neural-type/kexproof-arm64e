@@ -1,0 +1,53 @@
+name: arm64e build
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Theos + SDK
+        run: |
+          git clone --depth=1 https://github.com/theos/theos.git "$HOME/theos"
+          mkdir -p "$HOME/theos/sdks"
+          curl -sL "https://github.com/theos/sdks/releases/download/v0.0.4/iPhoneOS16.5.sdk.tar.xz" -o /tmp/sdk.tar.xz
+          tar -xf /tmp/sdk.tar.xz -C "$HOME/theos/sdks"
+
+      - name: Build KexProof (arm64e)
+        working-directory: KexProof
+        env:
+          THEOS: ${{ env.HOME }}/theos
+        run: |
+          make package FINALPACKAGE=1 THEOS="$THEOS"
+
+      - name: Sign + package IPA
+        working-directory: KexProof
+        run: |
+          BIN="$(find .theos/_ -path '*/KexProof.app/KexProof' -type f | head -1)"
+          test -f "$BIN"
+          # arm64e subtype patch (ptrauth ABI v1) — the Apple linker already
+          # emits 0x80000002 on macOS, but patch defensively.
+          python3 - "$BIN" <<'EOF'
+          import struct, sys
+          p = sys.argv[1]
+          d = bytearray(open(p,'rb').read())
+          cputype, subtype = struct.unpack('<II', d[4:12])
+          if cputype == 0x100000C and subtype != 0x80000002:
+              struct.pack_into('<I', d, 8, 0x80000002)
+              open(p,'wb').write(d)
+          EOF
+          mkdir -p out/Payload
+          cp -R "$(dirname "$BIN")" out/Payload/
+          LDID=$(find "$THEOS" -name ldid -type f | head -1)
+          "$LDID" -SResources/entitlements.plist "$BIN" || true
+          (cd out && zip -qr KexProof-arm64e.ipa Payload)
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: KexProof-arm64e
+          path: KexProof/out/KexProof-arm64e.ipa
