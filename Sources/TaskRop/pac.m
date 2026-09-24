@@ -93,6 +93,8 @@ static void paclog(NSString *fmt, ...)
     va_list ap; va_start(ap, fmt);
     NSString *s = [[NSString alloc] initWithFormat:fmt arguments:ap];
     va_end(ap);
+    extern void KPLogDirect(const char *);
+    KPLogDirect([s UTF8String]); // зеркало в kexproof-live.log (шеринг-кнопка)
     NSString *p = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/kexproof-pac.txt"];
     NSFileHandle *h = [NSFileHandle fileHandleForWritingAtPath:p];
     NSData *d = [[s stringByAppendingString:@"\n"] dataUsingEncoding:NSUTF8StringEncoding];
