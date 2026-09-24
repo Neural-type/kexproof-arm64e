@@ -5145,12 +5145,9 @@ static void *kpParkWorker(void *arg)
                     uint64_t kb = kp_rc_kread64(ktThread + 0x1B8);
                     pacnote([NSString stringWithFormat:@"  kernel thread keys: a=%#llx b=%#llx %@", ka, kb,
                               (ka || kb) ? @"" : @"— НУЛИ: у kernel-тредов нет user-ключей, kernel-signing через thread_t закрыт"]);
-                    if (ka || kb) {
-                        uint64_t ksig = kp_remotepac(ktThread, address, modifier);
-                        pacnote([NSString stringWithFormat:@"  kernel remotepac → %#llx %@", (unsigned long long)ksig,
-                                  ksig != expected ? @"— ОТЛИЧАЕТСЯ от userland: kernel PAC forging РАБОТАЕТ!"
-                                                   : @"— совпала с userland (ключи те же?)"]);
-                    }
+                    // kernel remotepac СНЯТ С ПРОГОНА: у kernel-треда «upcb» — мусор,
+                    // запись оттуда в worker = copy_validate panic (2 ребута).
+                    pacnote(@"  kernel remotepac: пропущен (путь мёртв — ключей нет; upcb kernel-треда невалиден)");
                 }
             }
         }
