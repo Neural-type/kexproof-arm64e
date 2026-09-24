@@ -192,6 +192,18 @@ uint64_t kp_remotepac(uint64_t remotethreadaddr, uint64_t address, uint64_t modi
            got.__pc, got.__x[16], got.__x[0]);
 
     uint64_t signedAddress = got.__x[16];
+
+    // restore pacthread's ORIGINAL machine keys + options before terminate —
+    // a thread that dies with our swapped-in fields makes the kernel mis-free
+    // a machine object (zone panic data.kalloc.32 vs kalloc.type1.1024).
+    kp_threadsetpac(pacKVA, oa, ob);
+    kp_rc_kwrite16(pacKVA + KP_OFF_THREAD_OPTIONS, opt0);
+    uint64_t ra2 = kp_rc_kread64(pacKVA + KP_OFF_THREAD_MACHINE_ROP_PID);
+    uint64_t rb2 = kp_rc_kread64(pacKVA + KP_OFF_THREAD_MACHINE_JOP_PID);
+    uint16_t opt2 = kp_rc_kread16(pacKVA + KP_OFF_THREAD_OPTIONS);
+    paclog(@"    [rp] restore: keys %@ options %#x — terminate",
+           (ra2 == oa && rb2 == ob) ? @"вернули" : @"НЕ ВЕРНУЛИ!", opt2);
+
     kp_paccleanup(pacthread, MACH_PORT_NULL, stack);
     return signedAddress;
 }
