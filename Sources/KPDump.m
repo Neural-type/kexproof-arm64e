@@ -5069,22 +5069,17 @@ static void kpPacLive(NSString *line)
         for (uint32_t o = 0x300; o <= 0x400; o += 8)
             [dumpTh appendFormat:@" +%#x=%#llx", o, kp_rc_kread64(threadVA + o)];
         pacnote(dumpTh);
-        // brute force по широкой сетке: очередь (heap-цепь ≥3 узлов), в которой
-        // встречается наш threadVA
-        uint32_t taskQ = 0, linkQ = 0;
-        for (uint32_t qc = 0x40; qc <= 0xC0 && !taskQ; qc += 8) {
-            for (uint32_t lc = 0x300; lc <= 0x400 && !taskQ; lc += 8) {
-                uint64_t head = selfTask + qc;
-                uint64_t cur = kp_untag_ptr(kp_rc_kread64(head));
-                int chain = 0;
-                for (int n = 0; n < 96 && cur && cur != head; n++) {
-                    if (!kpLooksLikeKernelPointer(cur)) { chain = 0; break; }
-                    chain++;
-                    if (cur - lc == threadVA) { taskQ = qc; linkQ = lc; break; }
-                    cur = kp_untag_ptr(kp_rc_kread64(cur));
-                }
-                if (chain >= 3 && !taskQ)
-                    pacnote([NSString stringWithFormat:@"  цепь из %d узлов при q=0x%x (но нашего треда нет при l=0x%x)", chain, qc, lc]);
+        // идём НАЗАД по цепи от своего треда: линк +0x3c8 известен из дампа,
+        // шагаем по next пока цепь не замкнётся на голову внутри selfTask
+        uint32_t taskQ = 0, linkQ = 0x3c8;
+        {
+            uint64_t cur = kp_untag_ptr(kp_rc_kread64(threadVA + linkQ));
+            for (int n = 0; n < 32 && cur; n++) {
+                pacnote([NSString stringWithFormat:@"  walk[%d]=%#llx%@", n, cur,
+                          (cur >= selfTask && cur < selfTask + 0x100) ? @" ← ГОЛОВА" : @""]);
+                if (cur >= selfTask && cur < selfTask + 0x100) { taskQ = (uint32_t)(cur - selfTask); break; }
+                if (!kpLooksLikeKernelPointer(cur)) break;
+                cur = kp_untag_ptr(kp_rc_kread64(cur));
             }
         }
         pacnote([NSString stringWithFormat:@"  self-calib: task.threads=0x%x link=0x%x %@", taskQ, linkQ,
