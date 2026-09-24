@@ -11,11 +11,15 @@
 #define KP_OFF_THREAD_MACHINE_ROP_PID   0x1B0
 #define KP_OFF_THREAD_MACHINE_JOP_PID   0x1B8
 #define KP_OFF_THREAD_MACHINE_KSTACKPTR 0x140
+#define KP_OFF_THREAD_OPTIONS           0xC0
 #define KP_OFF_THREAD_T_TRO             0x3E8
 #define KP_OFF_THREAD_AST               0x40C
 #define KP_OFF_THREAD_MACH_EXC_CODE     0x398
 #define KP_OFF_THREAD_MACH_EXC_REASON   0x390
 #define KP_OFF_THREAD_MACH_EXC_TYPE     0x394
+
+// xnu osfmk/kern/thread.h
+#define KP_TH_IN_MACH_EXCEPTION         0x8000
 
 // arm thread state (same layout as lara RemoteCall.h)
 typedef struct {

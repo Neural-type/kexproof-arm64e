@@ -84,7 +84,7 @@ bool kp_waitexc(mach_port_t excport, kp_excmsg *excbuf, int timeout);
 bool kp_statereply(kp_excmsg *exc, kp_arm_thread_state64_internal *state);
 
 // thread helpers (thread.m port)
-bool kp_threadsetstate(mach_port_t machthread, kp_arm_thread_state64_internal *state);
+bool kp_threadsetstate(mach_port_t machthread, uint64_t threadaddr, kp_arm_thread_state64_internal *state);
 void kp_threadsetpac(uint64_t threadaddr, uint64_t keya, uint64_t keyb);
 
 static void kp_paccleanup(mach_port_t pacthread, mach_port_t excport, void *stack)
@@ -133,15 +133,17 @@ uint64_t kp_remotepac(uint64_t remotethreadaddr, uint64_t address, uint64_t modi
     kr = thread_set_exception_ports(pacthread, EXC_MASK_BAD_ACCESS, excport, EXCEPTION_STATE | MACH_EXCEPTION_CODES, ARM_THREAD_STATE64);
     if (kr != KERN_SUCCESS) { kp_paccleanup(pacthread, excport, stack); return 0; }
 
-    if (!kp_threadsetstate(pacthread, &state)) {
+    // resolve pacthread's kernel thread_t VA first (lara order): threadsetstate
+    // needs it for the TH_IN_MACH_EXCEPTION dance, then we swap keys on it.
+    uint64_t pacKVA = [KPDump rcResolveThreadKVA:pacthread];
+    if (!pacKVA) { kp_paccleanup(pacthread, excport, stack); return 0; }
+
+    if (!kp_threadsetstate(pacthread, pacKVA, &state)) {
         kp_paccleanup(pacthread, excport, stack);
         return 0;
     }
 
-    // swap pacthread's PAC keys for the remote thread's keys: resolve its
-    // kernel thread_t VA through our own ipc table, then write keys there.
-    uint64_t pacKVA = [KPDump rcResolveThreadKVA:pacthread];
-    if (!pacKVA) { kp_paccleanup(pacthread, excport, stack); return 0; }
+    // swap pacthread's PAC keys for the remote thread's keys
     kp_threadsetpac(pacKVA, keya, keyb);
 
     kr = thread_resume(pacthread);
