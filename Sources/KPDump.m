@@ -5069,18 +5069,35 @@ static void kpPacLive(NSString *line)
         for (uint32_t o = 0x300; o <= 0x400; o += 8)
             [dumpTh appendFormat:@" +%#x=%#llx", o, kp_rc_kread64(threadVA + o)];
         pacnote(dumpTh);
-        // идём НАЗАД по цепи от своего треда: линк +0x3c8 известен из дампа,
-        // шагаем по next пока цепь не замкнётся на голову внутри selfTask
-        uint32_t taskQ = 0, linkQ = 0x3c8;
-        {
-            uint64_t cur = kp_untag_ptr(kp_rc_kread64(threadVA + linkQ));
-            for (int n = 0; n < 32 && cur; n++) {
-                pacnote([NSString stringWithFormat:@"  walk[%d]=%#llx%@", n, cur,
-                          (cur >= selfTask && cur < selfTask + 0x100) ? @" ← ГОЛОВА" : @""]);
-                if (cur >= selfTask && cur < selfTask + 0x100) { taskQ = (uint32_t)(cur - selfTask); break; }
+        // идём НАЗАД по цепи от своего треда: кандидаты линка 0x3c8/0x3d0/0x3d8/0x3e0
+        // и головы task+0x50/0x58 — логируем все цепи, ищем голову в selfTask
+        // или узел == нашему link-адресу
+        uint32_t taskQ = 0, linkQ = 0;
+        uint64_t starts[6]; const char *names[6];
+        starts[0] = threadVA + 0x3c8; names[0] = "th+3c8";
+        starts[1] = threadVA + 0x3d0; names[1] = "th+3d0";
+        starts[2] = threadVA + 0x3d8; names[2] = "th+3d8";
+        starts[3] = threadVA + 0x3e0; names[3] = "th+3e0";
+        starts[4] = selfTask + 0x50;  names[4] = "task+50";
+        starts[5] = selfTask + 0x58;  names[5] = "task+58";
+        uint64_t selfLinks[3] = { threadVA + 0x3c8, threadVA + 0x3d8, threadVA + 0x3e0 };
+        for (int s = 0; s < 6 && !taskQ; s++) {
+            NSMutableString *line = [NSMutableString stringWithFormat:@"  chain %s:", names[s]];
+            uint64_t cur = kp_untag_ptr(kp_rc_kread64(starts[s]));
+            for (int n = 0; n < 12 && cur; n++) {
+                [line appendFormat:@" %#llx", cur];
+                if (cur >= selfTask && cur < selfTask + 0x100) {
+                    [line appendString:@" ← ГОЛОВА"];
+                    taskQ = (uint32_t)(cur - selfTask);
+                    if (s < 4) linkQ = (uint32_t)(starts[s] - threadVA);
+                    break;
+                }
+                for (int k = 0; k < 3; k++)
+                    if (cur == selfLinks[k]) { [line appendFormat:@"(наш линк +%#x!)", (uint32_t)(selfLinks[k] - threadVA)]; break; }
                 if (!kpLooksLikeKernelPointer(cur)) break;
                 cur = kp_untag_ptr(kp_rc_kread64(cur));
             }
+            pacnote(line);
         }
         pacnote([NSString stringWithFormat:@"  self-calib: task.threads=0x%x link=0x%x %@", taskQ, linkQ,
                   taskQ ? @"" : @"— НЕ ПОДОБРАЛИ (стоп)"]);
