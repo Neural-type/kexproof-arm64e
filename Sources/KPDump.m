@@ -5053,9 +5053,12 @@ static void kpPacLive(NSString *line)
 
         // --- kernel keys probe: есть ли у kernel_task тредов PAC-ключи? ---
         pacnote(@"--- kernel keys probe ---");
-        extern uint64_t task_self(void);
-        uint64_t selfTask = task_self();
-        pacnote([NSString stringWithFormat:@"  selfTask=%#llx selfThread=%#llx", selfTask, threadVA]);
+        // task_self() через сокет вернул 0 — резолвим от нашего thread_t:
+        // thread+0x3E8 = t_tro (thread_ro), thread_ro+0x28 = tro_task (18.6).
+        uint64_t tro = kp_untag_ptr(kp_rc_kread64(threadVA + 0x3E8));
+        uint64_t selfTask = kp_untag_ptr(kp_rc_kread64(tro + 0x28));
+        pacnote([NSString stringWithFormat:@"  tro=%#llx selfTask=%#llx selfThread=%#llx", tro, selfTask, threadVA]);
+        if (!kpLooksLikeKernelPointer(selfTask)) { pacnote(@"  selfTask не резолвится — стоп"); return r; }
         // дамп для глаз: очередь тредов = два соседних heap-указателя в task,
         // линк в thread_t = указатель обратно на очередь
         NSMutableString *dumpT = [NSMutableString stringWithString:@"  task dump:"];
