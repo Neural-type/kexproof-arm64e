@@ -12,5 +12,6 @@ uint64_t kp_ptrauthstrdisc(const char *name);
 bool kp_pacsignworks(void);
 uint64_t kp_findpacia(void);
 uint64_t kp_remotepac(uint64_t remotethreadaddr, uint64_t address, uint64_t modifier);
+void kp_upcbcalib(uint64_t threadVA);
 
 #endif /* KP_PAC_H */

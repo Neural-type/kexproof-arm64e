@@ -5030,6 +5030,7 @@ static void *kpParkWorker(void *arg)
     extern bool kp_pacsignworks(void);
     extern uint64_t kp_remotepac(uint64_t, uint64_t, uint64_t);
     extern uint64_t kp_findpacia(void);
+    extern void kp_upcbcalib(uint64_t);
 
     uint64_t keya = kp_rc_kread64(threadVA + 0x1B0);
     uint64_t keyb = kp_rc_kread64(threadVA + 0x1B8);
@@ -5202,6 +5203,9 @@ static void *kpParkWorker(void *arg)
                     [dumpU appendFormat:@" +%#x=%#llx", o, kp_rc_kread64(upcb + o)];
                 pacnote(dumpU);
             }
+            // калибровка upcb-слотов: какой оффсет реально влияет на pacia/pacib
+            pacnote(@"--- upcb slot calibration ---");
+            kp_upcbcalib(threadVA);
             if (kpLooksLikeKernelPointer(cdata)) {
                 NSMutableString *cd = [NSMutableString stringWithString:@"  contextData scan:"];
                 int nc = 0;
