@@ -20,6 +20,7 @@
 @property (nonatomic, strong) UIButton *m2uafButton;
 @property (nonatomic, strong) UIButton *physmapButton;
 @property (nonatomic, strong) UIButton *geoButton;
+@property (nonatomic, strong) UIButton *gartButton;
 @property (nonatomic, strong) UIButton *shareButton;
 @property (nonatomic, strong) UILabel *statusLabel;
 @property (nonatomic, copy, nullable) NSString *reportPath;
@@ -82,6 +83,10 @@
                                 color:[UIColor colorWithRed:0.20 green:0.50 blue:0.62 alpha:1.0]];
     [self.geoButton addTarget:self action:@selector(geoTapped) forControlEvents:UIControlEventTouchUpInside];
 
+    self.gartButton = [self makeButton:@"GART recon (IOGPU, read-only)"
+                                 color:[UIColor colorWithRed:0.35 green:0.45 blue:0.30 alpha:1.0]];
+    [self.gartButton addTarget:self action:@selector(gartTapped) forControlEvents:UIControlEventTouchUpInside];
+
     self.m2uafButton = [self makeButton:@"JPEG UAF CVE-2026-20687 (РЕБУТ?)"
                                   color:[UIColor colorWithRed:0.65 green:0.18 blue:0.18 alpha:1.0]];
     [self.m2uafButton addTarget:self action:@selector(m2uafTapped) forControlEvents:UIControlEventTouchUpInside];
@@ -104,6 +109,7 @@
     [self.view addSubview:self.dumpButton];
     [self.view addSubview:self.physmapButton];
     [self.view addSubview:self.geoButton];
+    [self.view addSubview:self.gartButton];
     [self.view addSubview:self.m2uafButton];
     [self.view addSubview:self.shareButton];
 
@@ -144,7 +150,12 @@
         [self.geoButton.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:12],
         [self.geoButton.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-12],
         [self.geoButton.heightAnchor constraintEqualToConstant:38],
-        [self.geoButton.bottomAnchor constraintEqualToAnchor:self.m2uafButton.topAnchor constant:-7],
+        [self.geoButton.bottomAnchor constraintEqualToAnchor:self.gartButton.topAnchor constant:-7],
+
+        [self.gartButton.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:12],
+        [self.gartButton.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-12],
+        [self.gartButton.heightAnchor constraintEqualToConstant:38],
+        [self.gartButton.bottomAnchor constraintEqualToAnchor:self.m2uafButton.topAnchor constant:-7],
 
         [self.m2uafButton.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:12],
         [self.m2uafButton.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-12],
@@ -209,6 +220,7 @@
     [self setExperimentButton:self.dumpButton enabled:krw];
     [self setExperimentButton:self.physmapButton enabled:krw];
     [self setExperimentButton:self.geoButton enabled:krw];
+    [self setExperimentButton:self.gartButton enabled:krw];
 }
 
 - (void)appendLogText:(NSString *)text {
@@ -527,6 +539,17 @@
                                          : @"Physmap write user завершён — см. лог";
             [self appendLogText:report];
             [self saveExperimentReport:report fileName:@"kexproof-physmapwrite.txt"];
+    }];
+}
+
+- (void)gartTapped {
+    [self runDiagnosticWithStatus:@"GART recon: выполняется…" work:^NSDictionary *{
+        return @{@"report": [KPDump gartProbeReport]};
+    } completion:^(NSDictionary *result) {
+            NSString *report = result[@"report"];
+            self.statusLabel.text = @"GART recon завершён — см. лог";
+            [self appendLogText:report];
+            [self saveExperimentReport:report fileName:@"kexproof-gart.txt"];
     }];
 }
 

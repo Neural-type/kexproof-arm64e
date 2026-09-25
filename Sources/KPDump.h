@@ -112,6 +112,10 @@ NS_ASSUME_NONNULL_BEGIN
 // Плюс frame-type диагностика фрейма страницы (XNU_DEFAULT?).
 + (NSString *)physmapWriteUserTestReport;
 
+// GART recon: IOGPU user client → IOGPUDevice → IOGPU → дамп pointer-полей
+// (охота за AGXSecureGart). Read-only.
++ (NSString *)gartProbeReport;
+
 // D1: TXM stack recon (kread-only). Finds thread_t via the thread port,
 // dumps every kernel-VA field with its page's frame type, hunts the 0x2a
 // (TXM stack) page to learn the txm_stack offset empirically, calibrates the
