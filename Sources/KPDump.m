@@ -5257,8 +5257,8 @@ static void kpDumpPtrFields(NSMutableString *r, uint64_t objVA, const char *name
     extern uint64_t proc_self(void);
 
     // 1. open IOGPU user client
-    io_service_t svc = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("IOGPU"));
-    if (!svc) svc = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("AGXAccelerator"));
+    io_service_t svc = IOServiceGetMatchingService(kIOMasterPortDefault, IOServiceMatching("IOGPU"));
+    if (!svc) svc = IOServiceGetMatchingService(kIOMasterPortDefault, IOServiceMatching("AGXAccelerator"));
     kpNote(r, [NSString stringWithFormat:@"  сервис IOGPU: %#x", svc]);
     if (!svc) { [r appendString:@"FAIL: сервис не найден\n"]; return r; }
     io_connect_t conn = 0;
