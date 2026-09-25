@@ -5281,6 +5281,8 @@ static void kpDumpPtrFields(NSMutableString *r, uint64_t objVA, const char *name
     uint64_t selfProc = kp_untag_ptr(kp_rc_kread64(tro + off_thread_ro_tro_proc));
     uint64_t p_ro = kp_untag_ptr(kp_rc_kread64(selfProc + off_proc_p_proc_ro));
     uint64_t selfTask = kp_untag_ptr(kp_rc_kread64(p_ro + off_proc_ro_pr_task));
+    kpNote(r, [NSString stringWithFormat:@"  hops: tva=%#llx tro=%#llx proc=%#llx p_ro=%#llx task=%#llx (tro_proc off=%#x)",
+               tva, tro, selfProc, p_ro, selfTask, off_thread_ro_tro_proc]);
     uint64_t uc = kp_untag_ptr(task_get_ipc_port_kobject(selfTask, conn));
     kpNote(r, [NSString stringWithFormat:@"  userclient @ %#llx (proc=%#llx task=%#llx)", uc, selfProc, selfTask]);
     if (!kpLooksLikeKernelPointer(uc)) { [r appendString:@"FAIL: uc resolve\n"]; return r; }
