@@ -5256,16 +5256,21 @@ static void kpDumpPtrFields(NSMutableString *r, uint64_t objVA, const char *name
     extern uint64_t task_get_ipc_port_kobject(uint64_t, mach_port_t);
     extern uint64_t proc_self(void);
 
-    // 1. open IOGPU user client
+    // 1. open IOGPU user client — тип подбираем перебором
     io_service_t svc = IOServiceGetMatchingService(kIOMasterPortDefault, IOServiceMatching("IOGPU"));
     if (!svc) svc = IOServiceGetMatchingService(kIOMasterPortDefault, IOServiceMatching("AGXAccelerator"));
     kpNote(r, [NSString stringWithFormat:@"  сервис IOGPU: %#x", svc]);
     if (!svc) { [r appendString:@"FAIL: сервис не найден\n"]; return r; }
     io_connect_t conn = 0;
-    kern_return_t kr = IOServiceOpen(svc, mach_task_self(), 0, &conn);
+    kern_return_t kr = 0;
+    for (uint32_t t = 0; t <= 7; t++) {
+        kern_return_t k2 = IOServiceOpen(svc, mach_task_self(), t, &conn);
+        kpNote(r, [NSString stringWithFormat:@"  IOServiceOpen type=%u: kr=%#x conn=%#x", t, k2, conn]);
+        if (k2 == KERN_SUCCESS && conn) { kr = 0; break; }
+        kr = k2;
+    }
     IOObjectRelease(svc);
-    kpNote(r, [NSString stringWithFormat:@"  IOServiceOpen: kr=%#x conn=%#x", kr, conn]);
-    if (kr || !conn) { [r appendString:@"FAIL: IOServiceOpen\n"]; return r; }
+    if (kr || !conn) { [r appendString:@"FAIL: ни один тип не открылся\n"]; return r; }
 
     // 2. port → kobject (IOGPUDeviceUserClient)
     uint64_t selfProc = proc_self();
