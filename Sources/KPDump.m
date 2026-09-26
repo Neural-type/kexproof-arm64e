@@ -5410,6 +5410,7 @@ static void kpDumpPtrFields(NSMutableString *r, uint64_t objVA, const char *name
         uint64_t kbase2 = kconstant(base);
         uint64_t slide2 = kbase2 - 0xfffffff007004000;
         uint64_t gpuVA = gBufGPUVA;
+        uint64_t mux = kp_untag_ptr(kp_rc_kread64(gart + 0x288));
         uint64_t uat = kp_untag_ptr(kp_rc_kread64(mux + 0x10));
         uint64_t uvt = kpLooksLikeKernelPointer(uat) ? kp_untag_ptr(kp_rc_kread64(uat)) : 0;
         uint64_t expectU = 0xfffffff007b34568 + slide2;
