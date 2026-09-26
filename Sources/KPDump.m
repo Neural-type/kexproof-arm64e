@@ -5358,6 +5358,23 @@ static void kpDumpPtrFields(NSMutableString *r, uint64_t objVA, const char *name
         uint32_t roles[4] = {0};
         kreadbuf(gart + 0x1d8, roles, 16);
         kpNote(r, [NSString stringWithFormat:@"  roles: %+d %+d %+d %+d", (int)roles[0], (int)roles[1], (int)roles[2], (int)roles[3]]);
+        // наш pmap → ttep → pa0 буфера (один раз на отчёт, для PTE-матчей)
+        uint64_t ttep = 0, pa0 = 0;
+        {
+            mach_port_t tp = mach_thread_self();
+            uint64_t tva = [self rcResolveThreadKVA:tp];
+            mach_port_deallocate(mach_task_self(), tp);
+            uint64_t tro = kp_untag_ptr(kp_rc_kread64(tva + 0x3E8));
+            uint64_t selfProc = kp_untag_ptr(kp_rc_kread64(tro + off_thread_ro_tro_proc));
+            uint64_t p_ro = kp_untag_ptr(kp_rc_kread64(selfProc + off_proc_p_proc_ro));
+            uint64_t selfTask = kp_untag_ptr(kp_rc_kread64(p_ro + off_proc_ro_pr_task));
+            uint64_t map = kp_untag_ptr(kp_rc_kread64(selfTask + off_task_map));
+            uint64_t pmap = kp_untag_ptr(kp_rc_kread64(map + koffsetof(vm_map, pmap)));
+            ttep = kp_untag_ptr(kp_rc_kread64(pmap + koffsetof(pmap, ttep)));
+            extern uint64_t vtophys(uint64_t, uint64_t);
+            if (ttep && gBufContents) pa0 = vtophys(ttep, (uint64_t)gBufContents);
+            kpNote(r, [NSString stringWithFormat:@"  ttep=%#llx buf contents=%p pa0=%#llx", ttep, gBufContents, pa0]);
+        }
         // все слоты fGartTables, которые должны существовать: {1,7,8,9,10,11,12}
         const int wantIdx[] = {1, 7, 8, 9, 10, 11, 12};
         for (int i = 0; i < 7; i++) {
@@ -5367,23 +5384,7 @@ static void kpDumpPtrFields(NSMutableString *r, uint64_t objVA, const char *name
             if (kpLooksLikeKernelPointer(backing)) {
                 for (uint32_t o = 0; o < 0x88; o += 8)
                     kpNote(r, [NSString stringWithFormat:@"    backing+%#04x = %#llx", o, kp_rc_kread64(backing + o)]);
-                // эмпирическая идентификация fPageTablePtrs: наши физадреса буфера
-                // (через собственный pmap) должны лежать в PTE-таблице
-                mach_port_t tp = mach_thread_self();
-                uint64_t tva = [self rcResolveThreadKVA:tp];
-                mach_port_deallocate(mach_task_self(), tp);
-                uint64_t tro = kp_untag_ptr(kp_rc_kread64(tva + 0x3E8));
-                uint64_t selfProc = kp_untag_ptr(kp_rc_kread64(tro + off_thread_ro_tro_proc));
-                uint64_t p_ro = kp_untag_ptr(kp_rc_kread64(selfProc + off_proc_p_proc_ro));
-                uint64_t selfTask = kp_untag_ptr(kp_rc_kread64(p_ro + off_proc_ro_pr_task));
-                uint64_t map = kp_untag_ptr(kp_rc_kread64(selfTask + off_task_map));
-                uint64_t pmap = kp_untag_ptr(kp_rc_kread64(map + koffsetof(vm_map, pmap)));
-                uint64_t ttep = kp_untag_ptr(kp_rc_kread64(pmap + koffsetof(pmap, ttep)));
-                extern uint64_t vtophys(uint64_t, uint64_t);
-                kpNote(r, [NSString stringWithFormat:@"  ttep=%#llx", ttep]);
-                if (ttep && gBufContents) {
-                    uint64_t pa0 = vtophys(ttep, (uint64_t)gBufContents);
-                    kpNote(r, [NSString stringWithFormat:@"  buf contents=%p pa0=%#llx", gBufContents, pa0]);
+                if (pa0) {
                     // скан массивов backing: ищем PTE с нашим PA (несколько
                     // кодировок: raw и phys>>2 — формат AGX PTE не документирован)
                     for (uint32_t o = 0x28; o <= 0x48; o += 8) {
@@ -5400,6 +5401,26 @@ static void kpDumpPtrFields(NSMutableString *r, uint64_t objVA, const char *name
                     }
                 }
             }
+        }
+
+        // 6. UAT walk до живого PTE нашего буфера (VA=0x10000018000 →
+        //    half=0, pc=16, pd=0, pt=6). gart+0x288=mux, mux+0x18=UAT user.
+        uint64_t mux = kp_untag_ptr(kp_rc_kread64(gart + 0x288));
+        uint64_t uat = kp_untag_ptr(kp_rc_kread64(mux + 0x18));
+        kpNote(r, [NSString stringWithFormat:@"  mux=%#llx uat=%#llx", mux, uat]);
+        if (kpLooksLikeKernelPointer(uat)) {
+            uint64_t L1 = kp_untag_ptr(kp_rc_kread64(uat + 0x28 + 0x08));
+            uint64_t L1e = kp_untag_ptr(kp_rc_kread64(L1 + 16 * 8));
+            uint64_t L2arr = kp_untag_ptr(kp_rc_kread64(uat + 0x28 + 0x18));
+            uint64_t L2base = kp_untag_ptr(kp_rc_kread64(L2arr + 16 * 8));
+            uint64_t L2e = kp_untag_ptr(kp_rc_kread64(L2base + 0));
+            uint64_t L3pp = kp_untag_ptr(kp_rc_kread64(uat + 0x28 + 0x30));
+            uint64_t L3arr = kp_untag_ptr(kp_rc_kread64(L3pp + 16 * 8));
+            uint64_t L3base = kp_untag_ptr(kp_rc_kread64(L3arr + 0));
+            uint64_t pte = kp_rc_kread64(L3base + 6 * 8);
+            kpNote(r, [NSString stringWithFormat:@"  walk: L1=%#llx L1[16]=%#llx L2arr=%#llx L2=%#llx L2[0]=%#llx L3pp=%#llx L3arr=%#llx L3base=%#llx",
+                       L1, L1e, L2arr, L2base, L2e, L3pp, L3arr, L3base]);
+            kpNote(r, [NSString stringWithFormat:@"  PTE нашего буфера [pt=6] = %#llx (ждём phys окно с PA=%#llx)", pte, pa0]);
         }
     }
     return r;
