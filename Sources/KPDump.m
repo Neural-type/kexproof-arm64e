@@ -5442,7 +5442,10 @@ static void kpDumpPtrFields(NSMutableString *r, uint64_t objVA, const char *name
                         // GPU MMIO-апертура (чтение = hw reset), EL2 — паника
                         uint64_t band = (eu >> 32) & 0xff;
                         BOOL heapBand = band >= 0xdf && band <= 0xe8;
-                        if (kpLooksLikeKernelPointer(eu) && !kpVAIsEL2Domain(eu) && heapBand && nq < 90 && ptrs < 40) {
+                        extern uint64_t kvtophys(uint64_t);
+                        uint64_t pa2 = (heapBand && kpLooksLikeKernelPointer(eu)) ? kvtophys(eu) : 0;
+                        BOOL managed = pa2 && kpPAIsManaged(pa2);
+                        if (kpLooksLikeKernelPointer(eu) && !kpVAIsEL2Domain(eu) && managed && nq < 90 && ptrs < 40) {
                             queue[nq++] = eu;
                             if (depth == 0) [dl appendFormat:@" +%#x→%#llx", o, eu];
                             ptrs++;
