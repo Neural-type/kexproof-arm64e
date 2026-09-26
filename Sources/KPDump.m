@@ -5454,6 +5454,13 @@ static void kpDumpPtrFields(NSMutableString *r, uint64_t objVA, const char *name
                 }
                 if (!nnz) [nz appendString:@" (пустая)"];
                 kpNote(r, nz);
+                // скан L3 по нашему phys-окну (bit0=valid, phys=e&~0xfff)
+                for (int j = 0; j < 2048; j++) {
+                    uint64_t e = kp_rc_kread64(L3 + (uint64_t)j * 8);
+                    if (pa0 && (e & 0xFFFFFFFFF000ULL) == (pa0 & 0xFFFFFFFFF000ULL)) {
+                        kpNote(r, [NSString stringWithFormat:@"  НАШ PTE найден: L3[%d]=%#llx ← наш PA!", j, e]);
+                    }
+                }
             }
             // декод phys-окна из живого PTE
             if (pte) {
@@ -5461,6 +5468,14 @@ static void kpDumpPtrFields(NSMutableString *r, uint64_t objVA, const char *name
                     if ((pte >> sh) == pa0 || ((pte >> sh) & 0x3FFFFFFFFFFFULL) == (pa0 & 0x3FFFFFFFFFFFULL))
                         kpNote(r, [NSString stringWithFormat:@"  phys-окно: PA = PTE >> %u", sh]);
             }
+            // сырой дамп IOUAT (ненулевые qword'ы) — ищем user-side mapper
+            NSMutableString *ud = [NSMutableString stringWithString:@"  IOUAT nonzero:"];
+            int nu = 0;
+            for (uint32_t o = 0; o < 0x578 && nu < 48; o += 8) {
+                uint64_t e = kp_rc_kread64(uat + o);
+                if (e) { [ud appendFormat:@" +%#x=%#llx", o, e]; nu++; }
+            }
+            kpNote(r, ud);
         }
         // 7. AGXUC: vtable каждого target'а полей — ищем GPU VM объект
         kpNote(r, @"  --- AGXUC target vtables:");
