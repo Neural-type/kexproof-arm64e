@@ -5440,7 +5440,7 @@ static void kpDumpPtrFields(NSMutableString *r, uint64_t objVA, const char *name
                         uint64_t eu = kp_untag_ptr(e);
                         // heap-полосы df..e5 читаются безопасно; 0xffffffea/ec =
                         // GPU MMIO-апертура (чтение = hw reset), EL2 — паника
-                        uint64_t band = eu >> 40;
+                        uint64_t band = (eu >> 32) & 0xff;
                         BOOL heapBand = band >= 0xdf && band <= 0xe8;
                         if (kpLooksLikeKernelPointer(eu) && !kpVAIsEL2Domain(eu) && heapBand && nq < 90 && ptrs < 40) {
                             queue[nq++] = eu;
