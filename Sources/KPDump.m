@@ -5436,6 +5436,7 @@ static void kpDumpPtrFields(NSMutableString *r, uint64_t objVA, const char *name
             kpNote(r, [NSString stringWithFormat:@"  PTE нашего буфера [pt=6] = %#llx (ждём phys окно с PA=%#llx)", pte, pa0]);
         }
     }
+    }
     return r;
 }
 
