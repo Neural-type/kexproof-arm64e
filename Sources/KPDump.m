@@ -5455,7 +5455,6 @@ static void kpDumpPtrFields(NSMutableString *r, uint64_t objVA, const char *name
             }
         }
     }
-    }
     return r;
 }
 
