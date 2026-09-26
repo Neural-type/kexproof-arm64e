@@ -5229,16 +5229,21 @@ static void *kpParkWorker(void *arg)
 
 extern uint64_t kp_rc_kread64(uint64_t);
 
-// Дамп pointer-полей объекта: какие поля содержат kernel VA и куда они ведут.
+// Дамп pointer-полей объекта: ТОЛЬКО значения, без дереференсов (дереф по
+// physmap в выключенный carveout = аппаратный ресет без паник-лога, проверено).
 static void kpDumpPtrFields(NSMutableString *r, uint64_t objVA, const char *name, uint32_t size)
 {
     kpNote(r, [NSString stringWithFormat:@"  --- %s @ %#llx (pointer fields):", name, objVA]);
     int shown = 0;
     for (uint32_t o = 0; o < size && shown < 128; o += 8) {
-        uint64_t v = kp_untag_ptr(kp_rc_kread64(objVA + o));
-        if (!kpLooksLikeKernelPointer(v)) continue;
-        uint64_t tgt0 = kp_rc_kread64(v); // vtable кандидат / первое поле
-        kpNote(r, [NSString stringWithFormat:@"    +%#04x → %#llx  [0]=%#llx", o, v, tgt0]);
+        uint64_t v = kp_rc_kread64(objVA + o);
+        uint64_t u = kp_untag_ptr(v);
+        if (!kpLooksLikeKernelPointer(u)) continue;
+        // v == u → чистый указатель; иначе — PAC-тегнутый (пишем оба)
+        if (v == u)
+            kpNote(r, [NSString stringWithFormat:@"    +%#04x → %#llx", o, u]);
+        else
+            kpNote(r, [NSString stringWithFormat:@"    +%#04x → %#llx (raw %#llx)", o, u, v]);
         shown++;
     }
     if (!shown) kpNote(r, @"    (нет kernel-указателей)");
