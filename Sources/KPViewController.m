@@ -581,6 +581,13 @@
     if ([[NSFileManager defaultManager] fileExistsAtPath:prev]) {
         [items addObject:[NSURL fileURLWithPath:prev]];
     }
+    // инкрементальные файлы стадий (переживают панику)
+    for (NSString *fn in @[@"kexproof-gart.txt", @"kexproof-pac.txt"]) {
+        NSString *fp = [NSHomeDirectory() stringByAppendingPathComponent:[@"Documents/" stringByAppendingString:fn]];
+        if ([[NSFileManager defaultManager] fileExistsAtPath:fp]) {
+            [items addObject:[NSURL fileURLWithPath:fp]];
+        }
+    }
     if (items.count == 0) {
         self.statusLabel.text = @"Пока нечем делиться (ни отчёта, ни live-лога)";
         return;
