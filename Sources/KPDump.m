@@ -5311,6 +5311,7 @@ static void kpDumpPtrFields(NSMutableString *r, uint64_t objVA, const char *name
     uint64_t gart = kp_untag_ptr(kp_rc_kread64(accel + 0xd0));
     kpNote(r, [NSString stringWithFormat:@"  accel+0xd0 → gart @ %#llx", gart]);
     // таблицы создаются лениво при первой GPU-работе — делаем Metal-буфер
+    // и РЕАЛЬНУЮ compute-запись (иначе PTE не материализуются)
     @autoreleasepool {
         id<MTLDevice> mtl = MTLCreateSystemDefaultDevice();
         kpNote(r, [NSString stringWithFormat:@"  MTLDevice: %@", mtl ? @"ok" : @"FAIL"]);
@@ -5322,6 +5323,27 @@ static void kpDumpPtrFields(NSMutableString *r, uint64_t objVA, const char *name
                 gGartBuf = buf;
                 kpNote(r, [NSString stringWithFormat:@"  Metal buf contents=%p gpuAddress=%#llx",
                            buf.contents, (unsigned long long)buf.gpuAddress]);
+                // compute-запись 0x1337 в contents[0] — форсит PTE + доказывает DMA
+                NSError *err = nil;
+                id<MTLLibrary> lib = [mtl newLibraryWithSource:
+                    @"kernel void touchIt(device uint *b [[buffer(0)]]) { b[0] = 0x1337; }"
+                    options:nil error:&err];
+                id<MTLFunction> fn = lib ? [lib newFunctionWithName:@"touchIt"] : nil;
+                id<MTLComputePipelineState> pipe = fn ? [mtl newComputePipelineStateWithFunction:fn error:&err] : nil;
+                id<MTLCommandQueue> q = pipe ? [mtl newCommandQueue] : nil;
+                id<MTLCommandBuffer> cb = q ? [q commandBuffer] : nil;
+                id<MTLComputeCommandEncoder> enc = cb ? [cb computeCommandEncoder] : nil;
+                if (enc) {
+                    [enc setComputePipelineState:pipe];
+                    [enc setBuffer:buf offset:0 atIndex:0];
+                    [enc dispatchThreads:MTLSizeMake(1,1,1) threadsPerThreadgroup:MTLSizeMake(1,1,1)];
+                    [enc endEncoding];
+                    [cb commit];
+                    [cb waitUntilCompleted];
+                    uint32_t rb = *(volatile uint32_t *)buf.contents;
+                    kpNote(r, [NSString stringWithFormat:@"  GPU write test: contents[0]=%#x (%@)", rb,
+                               rb == 0x1337 ? @"GPU DMA РАБОТАЕТ" : @"не дошло"]);
+                } else kpNote(r, [NSString stringWithFormat:@"  compute chain оборвалась: %@", err]);
             } else kpNote(r, @"  Metal buf: FAIL");
         }
     }
@@ -5362,14 +5384,17 @@ static void kpDumpPtrFields(NSMutableString *r, uint64_t objVA, const char *name
                 if (ttep && gBufContents) {
                     uint64_t pa0 = vtophys(ttep, (uint64_t)gBufContents);
                     kpNote(r, [NSString stringWithFormat:@"  buf contents=%p pa0=%#llx", gBufContents, pa0]);
-                    // скан массивов backing: ищем PTE с нашим PA
+                    // скан массивов backing: ищем PTE с нашим PA (несколько
+                    // кодировок: raw и phys>>2 — формат AGX PTE не документирован)
                     for (uint32_t o = 0x28; o <= 0x48; o += 8) {
                         uint64_t arr = kp_untag_ptr(kp_rc_kread64(backing + o));
                         if (!kpLooksLikeKernelPointer(arr)) continue;
                         NSMutableString *line = [NSMutableString stringWithFormat:@"    arr[+%#x] @ %#llx:", o, arr];
                         for (int j = 0; j < 8; j++) {
                             uint64_t e = kp_rc_kread64(arr + (uint64_t)j * 8);
-                            [line appendFormat:@" %#llx%@", e, (pa0 && (e & ~0x3fffULL) == (pa0 & ~0x3fffULL)) ? @"←PTE!" : @""];
+                            BOOL hitRaw = ((e & 0xFFFFFFFFC000ULL) == (pa0 & 0xFFFFFFFFC000ULL)) && (e & ~0x3fffULL);
+                            BOOL hitSh2 = (((e << 2) & 0xFFFFFFFFC000ULL) == (pa0 & 0xFFFFFFFFC000ULL)) && e && !(e >> 62);
+                            [line appendFormat:@" %#llx%@", e, hitRaw ? @"←PTE!" : (hitSh2 ? @"←PTE(>>2)!" : @"")];
                         }
                         kpNote(r, line);
                     }
