@@ -5325,7 +5325,6 @@ static void kpDumpPtrFields(NSMutableString *r, uint64_t objVA, const char *name
     }
     extern uint64_t kp_rc_kread64(uint64_t);
     extern void kp_rc_kwrite64(uint64_t, uint64_t);
-    extern void kreadbuf(uint64_t, void *, uint64_t);
 
     // 1. IOGPU user client (type 1 — единственный рабочий на 18.6)
     io_service_t svc = IOServiceGetMatchingService(kIOMasterPortDefault, IOServiceMatching("IOGPU"));
