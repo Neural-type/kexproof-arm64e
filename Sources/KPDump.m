@@ -5394,8 +5394,9 @@ static void kpDumpPtrFields(NSMutableString *r, uint64_t objVA, const char *name
     GNOTE( [NSString stringWithFormat:@"  rbuf VA=%#llx PA=%#llx", rVA, rPA]);
 
     // перечисление коннектов
-    uint64_t vtMP = 0xfffffff007b03d68 + slide2;   // IOMachPort
-    uint64_t vtUC = 0xfffffff007b5ba08 + slide2;   // AGXDeviceUserClient
+    uint64_t slideC = kconstant(base) - 0xfffffff007004000;
+    uint64_t vtMP = 0xfffffff007b03d68 + slideC;   // IOMachPort
+    uint64_t vtUC = 0xfffffff007b5ba08 + slideC;   // AGXDeviceUserClient
     int found = 0;
     for (uint32_t i = 1; i < 2048 && found < 8; i++) {
         uint64_t eVA = kpRCIsTable + (uint64_t)sizeof_ipc_entry * i;
