@@ -5418,20 +5418,25 @@ static void kpDumpPtrFields(NSMutableString *r, uint64_t objVA, const char *name
         // AGXShared по uc+0x120
         uint64_t agxShared = kp_untag_ptr(kp_rc_kread64(uc2 + 0x120));
         kpNote(r, [NSString stringWithFormat:@"    AGXShared=%#llx", agxShared]);
-        // ищем mapper по magic в целях полей AGXShared
+        // сначала сверим магик на ИЗВЕСТНОМ mapper'е из нашей цепочки (iouat+0x20)
+        uint64_t uat2 = kp_untag_ptr(kp_rc_kread64(kp_untag_ptr(kp_rc_kread64(accel + 0xd0)) + 0x288));
+        uint64_t uat3 = kp_untag_ptr(kp_rc_kread64(uat2 + 0x10));
+        uint64_t knownMapper = kp_untag_ptr(kp_rc_kread64(uat3 + 0x20));
+        kpNote(r, [NSString stringWithFormat:@"    известный mapper=%#llx magic[+0x18]=%#llx", knownMapper,
+                   kpLooksLikeKernelPointer(knownMapper) ? kp_rc_kread64(knownMapper + 0x18) : 0]);
+        // дампим ВСЕ цели полей AGXShared с их +0x18 — офлайн узнаю mapper
         if (kpLooksLikeKernelPointer(agxShared) && kvtophys(agxShared) && kpPAIsManaged(kvtophys(agxShared))) {
             for (uint32_t o = 0; o < 0x1d8; o += 8) {
                 uint64_t cand = kp_untag_ptr(kp_rc_kread64(agxShared + o));
                 if (!kpLooksLikeKernelPointer(cand)) continue;
+                uint64_t band = (cand >> 32) & 0xff;
+                if (!(band >= 0xdf && band <= 0xe8)) continue;
+                if (kpVAIsEL2Domain(cand)) continue;
                 uint64_t pc6 = kvtophys(cand);
                 if (!pc6 || !kpPAIsManaged(pc6)) continue;
-                if (kpVAIsEL2Domain(cand)) continue;
-                uint64_t magic = kp_rc_kread64(cand + 0x18);
-                if (magic == 0xbee500010004ULL) {
-                    kpNote(r, [NSString stringWithFormat:@"    mapper кандидат: uc+0x120 + %#x → %#llx", o, cand]);
-                    char lbl[32]; snprintf(lbl, sizeof(lbl), "conn%d", found);
-                    kpUatWalkScan(r, cand, rVA, rPA, lbl);
-                }
+                uint64_t m18 = kp_rc_kread64(cand + 0x18);
+                uint64_t m30 = kp_rc_kread64(cand + 0x30);
+                kpNote(r, [NSString stringWithFormat:@"    shared+%#x → %#llx  [+0x18]=%#llx [+0x30]=%#llx", o, cand, m18, m30]);
             }
         }
     }
