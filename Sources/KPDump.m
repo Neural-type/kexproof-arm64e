@@ -5234,7 +5234,7 @@ static void kpDumpPtrFields(NSMutableString *r, uint64_t objVA, const char *name
 {
     kpNote(r, [NSString stringWithFormat:@"  --- %s @ %#llx (pointer fields):", name, objVA]);
     int shown = 0;
-    for (uint32_t o = 0; o < size && shown < 48; o += 8) {
+    for (uint32_t o = 0; o < size && shown < 128; o += 8) {
         uint64_t v = kp_untag_ptr(kp_rc_kread64(objVA + o));
         if (!kpLooksLikeKernelPointer(v)) continue;
         uint64_t tgt0 = kp_rc_kread64(v); // vtable кандидат / первое поле
@@ -5279,17 +5279,23 @@ static void kpDumpPtrFields(NSMutableString *r, uint64_t objVA, const char *name
     kpNote(r, [NSString stringWithFormat:@"  userclient @ %#llx", uc]);
     if (!kpLooksLikeKernelPointer(uc)) { [r appendString:@"FAIL: uc resolve\n"]; return r; }
 
-    // 3. цепочка: UC+0x120 → IOGPUDevice, +0x88 → IOGPU
-    uint64_t device = kp_untag_ptr(kp_rc_kread64(uc + 0x120));
-    uint64_t iogpu = kp_untag_ptr(kp_rc_kread64(device + 0x88));
-    kpNote(r, [NSString stringWithFormat:@"  IOGPUDevice=%#llx IOGPU=%#llx", device, iogpu]);
+    // 3. цепочка: conn → IOMachPort → +0x30 (pacda) → AGXDeviceUserClient
+    //    → +0xf8 → AGXAcceleratorG16P → +0x208 → IOGPUDevice
+    uint64_t mp = kp_untag_ptr([self rcResolveThreadKVA:conn]);
+    kpNote(r, [NSString stringWithFormat:@"  IOMachPort @ %#llx", mp]);
+    if (!kpLooksLikeKernelPointer(mp)) { [r appendString:@"FAIL: machport resolve\n"]; return r; }
+    uint64_t rawUC = kp_rc_kread64(mp + 0x30);
+    uint64_t uc = kp_untag_ptr(rawUC);
+    kpNote(r, [NSString stringWithFormat:@"  +0x30 raw=%#llx → AGXUC @ %#llx", rawUC, uc]);
+    if (!kpLooksLikeKernelPointer(uc)) { [r appendString:@"FAIL: uc\n"]; return r; }
+    uint64_t accel = kp_untag_ptr(kp_rc_kread64(uc + 0xf8));
+    uint64_t iogpuDev = kp_untag_ptr(kp_rc_kread64(accel + 0x208));
+    kpNote(r, [NSString stringWithFormat:@"  accel(AGXAcceleratorG16P)=%#llx IOGPUDevice=%#llx", accel, iogpuDev]);
 
-    // 4. самодокументирующийся дамп: pointer-поля uc/device/iogpu
-    kpDumpPtrFields(r, uc, "userclient", 0x180);
-    if (kpLooksLikeKernelPointer(device)) kpDumpPtrFields(r, device, "IOGPUDevice", 0x400);
-    if (kpLooksLikeKernelPointer(iogpu)) kpDumpPtrFields(r, iogpu, "IOGPU", 0x400);
-    // кандидаты gart: поля, чьи цели похожи на объект с vtable в kernelcache
-    // (первый qword цели = vtable → kernel text/data диапазон)
+    // 4. самодокументирующийся дамп: uc / accel (gart там) / device
+    kpDumpPtrFields(r, uc, "AGXDeviceUserClient", 0x138);
+    if (kpLooksLikeKernelPointer(accel)) kpDumpPtrFields(r, accel, "AGXAcceleratorG16P", 0x8c00);
+    if (kpLooksLikeKernelPointer(iogpuDev)) kpDumpPtrFields(r, iogpuDev, "IOGPUDevice", 0x100);
     return r;
 }
 
