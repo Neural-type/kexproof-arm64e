@@ -5438,9 +5438,8 @@ static void kpDumpPtrFields(NSMutableString *r, uint64_t objVA, const char *name
                         BOOL hit = pa0 && ((e & 0x0003FFFFFFFFC000ULL) == (pa0 & 0x0003FFFFFFFFC000ULL));
                         if (hit) [dl appendFormat:@" +%#x=%#llx←PTE!", o, e];
                         uint64_t eu = kp_untag_ptr(e);
-                        if (kpLooksLikeKernelPointer(eu) && nq < 90 && ptrs < 40 &&
-                            ((eu >> 40) == 0xffffffdfULL >> 32 || (eu >> 40) == 0xffffffe0ULL >> 32 || (eu >> 40) == 0xffffffe1ULL >> 32 ||
-                             (eu >= slide2 + 0xfffffff007004000 && eu < slide2 + 0xfffffff007004000 + 0x4000000))) {
+                        extern uint64_t kvtophys(uint64_t);
+                        if (kpLooksLikeKernelPointer(eu) && !kpVAIsEL2Domain(eu) && kvtophys(eu) != 0 && nq < 90 && ptrs < 40) {
                             queue[nq++] = eu;
                             if (depth == 0) [dl appendFormat:@" +%#x→%#llx", o, eu];
                             ptrs++;
