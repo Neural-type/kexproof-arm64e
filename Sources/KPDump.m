@@ -5284,7 +5284,7 @@ static void kpGartLive(NSString *line)
     if (!gGartLive) return;
     // os_log → device syslog, читается по USB через idevicesyslog В РЕАЛЬНОМ
     // времени — паника ничего не забирает (не файл, не контейнер).
-    os_log_error(OS_LOG_DEFAULT, "[GART] %s", [line UTF8String]);
+    os_log_error(OS_LOG_DEFAULT, "[GART] %{public}s", [line UTF8String]);
     extern void KPLogDirect(const char *);
     KPLogDirect([line UTF8String]); // зеркало в kexproof-live.log (переживает ребут)
     NSString *p = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/kexproof-gart.txt"];
