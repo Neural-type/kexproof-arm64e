@@ -5228,6 +5228,9 @@ static void *kpParkWorker(void *arg)
 
 // Полный walk+скан одного mapper'а: L1arr → L2 → L3 → наш PTE, скан L3 по PA.
 // Возвращает kernel VA L3-страницы (или 0).
+static void kpGartLive(NSString *line);
+#define GNOTE2(...) do { kpNote(r, (__VA_ARGS__)); kpGartLive((__VA_ARGS__)); } while (0)
+#define GNOTE(...) GNOTE2(__VA_ARGS__)
 static uint64_t kpUatWalkScan(NSMutableString *r, uint64_t mapper, uint64_t gpuVA, uint64_t pa0, const char *label)
 {
     extern uint64_t kp_rc_kread64(uint64_t);
@@ -5276,19 +5279,6 @@ static id gGartBuf = nil; // удерживаем MTLBuffer живым межд�
 // Live-запись GART-стадий: паника не сотрёт готовое (как kexproof-pac.txt).
 static BOOL gGartLive = NO;
 static void kpGartLive(NSString *line)
-{
-    if (!gGartLive) return;
-    NSString *p = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/kexproof-gart.txt"];
-    NSFileHandle *h = [NSFileHandle fileHandleForWritingAtPath:p];
-    NSData *d = [[line stringByAppendingString:@"
-"] dataUsingEncoding:NSUTF8StringEncoding];
-    if (!h) { [d writeToFile:p atomically:NO]; return; }
-    [h seekToEndOfFile];
-    [h writeData:d];
-    [h closeFile];
-}
-#define GNOTE2(...) do { kpNote(r, (__VA_ARGS__)); kpGartLive((__VA_ARGS__)); } while (0)
-#define GNOTE(...) GNOTE2(__VA_ARGS__)
 {
     if (!gGartLive) return;
     NSString *p = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/kexproof-gart.txt"];
