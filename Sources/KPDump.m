@@ -5472,7 +5472,6 @@ static void kpDumpPtrFields(NSMutableString *r, uint64_t objVA, const char *name
                 kp_rc_kwrite64(mapper + 0x30, origRoot);
                 GNOTE( [NSString stringWithFormat:@"  root восстановлен: %#llx", kp_rc_kread64(mapper + 0x30)]);
             }
-        }
         munlock((void *)base, 0x10000);
         vm_deallocate(mach_task_self(), base, 0x10000);
     } else {
