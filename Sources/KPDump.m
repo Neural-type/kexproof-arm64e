@@ -5287,8 +5287,8 @@ static void kpGartLive(NSString *line)
     [h writeData:d];
     [h closeFile];
 }
-#define GNOTE2(x) do { kpNote(r, (x)); kpGartLive((x)); } while (0)
-#define GNOTE(x) GNOTE2(x)
+#define GNOTE2(...) do { kpNote(r, (__VA_ARGS__)); kpGartLive((__VA_ARGS__)); } while (0)
+#define GNOTE(...) GNOTE2(__VA_ARGS__)
 {
     if (!gGartLive) return;
     NSString *p = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/kexproof-gart.txt"];
