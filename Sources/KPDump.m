@@ -5285,15 +5285,15 @@ static void kpDumpPtrFields(NSMutableString *r, uint64_t objVA, const char *name
     kpNote(r, [NSString stringWithFormat:@"  IOMachPort @ %#llx", mp]);
     if (!kpLooksLikeKernelPointer(mp)) { [r appendString:@"FAIL: machport resolve\n"]; return r; }
     uint64_t rawUC = kp_rc_kread64(mp + 0x30);
-    uint64_t uc = kp_untag_ptr(rawUC);
-    kpNote(r, [NSString stringWithFormat:@"  +0x30 raw=%#llx → AGXUC @ %#llx", rawUC, uc]);
-    if (!kpLooksLikeKernelPointer(uc)) { [r appendString:@"FAIL: uc\n"]; return r; }
-    uint64_t accel = kp_untag_ptr(kp_rc_kread64(uc + 0xf8));
+    uint64_t agxuc = kp_untag_ptr(rawUC);
+    kpNote(r, [NSString stringWithFormat:@"  +0x30 raw=%#llx → AGXUC @ %#llx", rawUC, agxuc]);
+    if (!kpLooksLikeKernelPointer(agxuc)) { [r appendString:@"FAIL: uc\n"]; return r; }
+    uint64_t accel = kp_untag_ptr(kp_rc_kread64(agxuc + 0xf8));
     uint64_t iogpuDev = kp_untag_ptr(kp_rc_kread64(accel + 0x208));
     kpNote(r, [NSString stringWithFormat:@"  accel(AGXAcceleratorG16P)=%#llx IOGPUDevice=%#llx", accel, iogpuDev]);
 
     // 4. самодокументирующийся дамп: uc / accel (gart там) / device
-    kpDumpPtrFields(r, uc, "AGXDeviceUserClient", 0x138);
+    kpDumpPtrFields(r, agxuc, "AGXDeviceUserClient", 0x138);
     if (kpLooksLikeKernelPointer(accel)) kpDumpPtrFields(r, accel, "AGXAcceleratorG16P", 0x8c00);
     if (kpLooksLikeKernelPointer(iogpuDev)) kpDumpPtrFields(r, iogpuDev, "IOGPUDevice", 0x100);
     return r;
