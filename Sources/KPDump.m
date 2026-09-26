@@ -5383,7 +5383,9 @@ static void kpDumpPtrFields(NSMutableString *r, uint64_t objVA, const char *name
             int ix = wantIdx[i];
             uint64_t backing = kp_untag_ptr(kp_rc_kread64(gart + 0x1e8 + (uint64_t)ix * 8));
             kpNote(r, [NSString stringWithFormat:@"  fGartTables[%d] = %#llx", ix, backing]);
-            if (kpLooksLikeKernelPointer(backing)) {
+            // phys-гейт на ВСЕ чтения по вычисленным указателям (LLC bus error)
+            BOOL backOK = kpLooksLikeKernelPointer(backing) && kvtophys(backing) && kpPAIsManaged(kvtophys(backing));
+            if (backOK) {
                 for (uint32_t o = 0; o < 0x88; o += 8)
                     kpNote(r, [NSString stringWithFormat:@"    backing+%#04x = %#llx", o, kp_rc_kread64(backing + o)]);
                 if (pa0) {
@@ -5391,7 +5393,8 @@ static void kpDumpPtrFields(NSMutableString *r, uint64_t objVA, const char *name
                     // кодировок: raw и phys>>2 — формат AGX PTE не документирован)
                     for (uint32_t o = 0x28; o <= 0x48; o += 8) {
                         uint64_t arr = kp_untag_ptr(kp_rc_kread64(backing + o));
-                        if (!kpLooksLikeKernelPointer(arr)) continue;
+                        uint64_t arrpa = kpLooksLikeKernelPointer(arr) ? kvtophys(arr) : 0;
+                        if (!arrpa || !kpPAIsManaged(arrpa)) continue;
                         NSMutableString *line = [NSMutableString stringWithFormat:@"    arr[+%#x] @ %#llx:", o, arr];
                         for (int j = 0; j < 8; j++) {
                             uint64_t e = kp_rc_kread64(arr + (uint64_t)j * 8);
