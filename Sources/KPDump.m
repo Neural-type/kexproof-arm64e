@@ -5281,6 +5281,8 @@ static BOOL gGartLive = NO;
 static void kpGartLive(NSString *line)
 {
     if (!gGartLive) return;
+    extern void KPLogDirect(const char *);
+    KPLogDirect([line UTF8String]); // зеркало в kexproof-live.log (переживает ребут)
     NSString *p = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/kexproof-gart.txt"];
     NSFileHandle *h = [NSFileHandle fileHandleForWritingAtPath:p];
     NSData *d = [[line stringByAppendingString:@"\n"] dataUsingEncoding:NSUTF8StringEncoding];
