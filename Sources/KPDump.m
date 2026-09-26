@@ -5301,6 +5301,39 @@ static void kpDumpPtrFields(NSMutableString *r, uint64_t objVA, const char *name
     kpDumpPtrFields(r, agxuc, "AGXDeviceUserClient", 0x138);
     if (kpLooksLikeKernelPointer(accel)) kpDumpPtrFields(r, accel, "AGXAcceleratorG16P", 0x8c00);
     if (kpLooksLikeKernelPointer(iogpuDev)) kpDumpPtrFields(r, iogpuDev, "IOGPUDevice", 0x100);
+
+    // 5. gart: accel+0xd0 → AGXGartG16 (IOGPU::start: blraa slot197 → str [x19,#0xd0]).
+    //    Сверка vtable: slid 0xfffffff007b62560 (AGXGartG16).
+    uint64_t gart = kp_untag_ptr(kp_rc_kread64(accel + 0xd0));
+    kpNote(r, [NSString stringWithFormat:@"  accel+0xd0 → gart @ %#llx", gart]);
+    if (kpLooksLikeKernelPointer(gart)) {
+        uint64_t gvt = kp_rc_kread64(gart);
+        uint64_t kbase = kconstant(base);
+        uint64_t slide = kbase - 0xfffffff007004000;
+        uint64_t expect = 0xfffffff007b62560 + slide;
+        kpNote(r, [NSString stringWithFormat:@"  gart vtable=%#llx (ждём AGXGartG16=%#llx → %@)",
+                   gvt, expect, gvt == expect ? @"СОВПАЛО" : @"другой класс"]);
+        // роли ttbr: 4×int32 при +0x1d8..+0x1e4
+        uint32_t roles[4] = {0};
+        kreadbuf(gart + 0x1d8, roles, 16);
+        kpNote(r, [NSString stringWithFormat:@"  roles: %+d %+d %+d %+d", (int)roles[0], (int)roles[1], (int)roles[2], (int)roles[3]]);
+        // первый role ≥ 0 → per-task user ttbr
+        int idx = -1;
+        for (int i = 0; i < 4; i++) if ((int)roles[i] >= 0 && (int)roles[i] < 32) { idx = (int)roles[i]; break; }
+        if (idx >= 0) {
+            uint64_t backing = kp_untag_ptr(kp_rc_kread64(gart + 0x1e8 + (uint64_t)idx * 8));
+            kpNote(r, [NSString stringWithFormat:@"  ttbr idx=%d → backing @ %#llx", idx, backing]);
+            if (kpLooksLikeKernelPointer(backing)) {
+                // backing (AGXSharedGartTableBackingG16, 0x88) — весь сырой дамп
+                for (uint32_t o = 0; o < 0x88; o += 8) {
+                    uint64_t v = kp_rc_kread64(backing + o);
+                    kpNote(r, [NSString stringWithFormat:@"    backing+%#04x = %#llx", o, v]);
+                }
+            }
+        } else {
+            kpNote(r, @"  роль user ttbr не найдена (все −1?)");
+        }
+    }
     return r;
 }
 
