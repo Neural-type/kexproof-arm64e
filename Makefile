@@ -21,7 +21,7 @@ KexProof_FILES = \
 	$(filter-out $(KP_IMG4_DIR)/libvfs/vfs_lzvn.c, $(wildcard $(KP_IMG4_DIR)/libvfs/*.c)) \
 	$(wildcard $(KP_IMG4_DIR)/libDER/*.c)
 
-KexProof_FRAMEWORKS = UIKit Foundation CoreFoundation Security QuartzCore CoreLocation
+KexProof_FRAMEWORKS = UIKit Foundation CoreFoundation Security QuartzCore CoreLocation Metal
 KexProof_PRIVATE_FRAMEWORKS = IOSurface IOKit
 KexProof_LIBRARIES = compression
 
