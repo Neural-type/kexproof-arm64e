@@ -5351,7 +5351,8 @@ static BOOL kpHuntPtrOK(uint64_t v)
     extern void kp_rc_kwrite64(uint64_t, uint64_t);
     extern uint64_t vtophys(uint64_t, uint64_t);
 
-    // 1. self thread → tro → proc → proc_ro → task → map → pmap → ttep
+    // 1. is_table (нужна rcResolveThreadKVA) + self thread → … → pmap → ttep
+    if (![self rcIsTableWithLog:r]) { [r appendString:@"FAIL: is_table\n"]; gGartLive = NO; return r; }
     mach_port_t tp = mach_thread_self();
     uint64_t tva = [self rcResolveThreadKVA:tp];
     mach_port_deallocate(mach_task_self(), tp);
