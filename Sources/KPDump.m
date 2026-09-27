@@ -5401,40 +5401,12 @@ static BOOL kpHuntPtrOK(uint64_t v)
     }
     GNOTE( [NSString stringWithFormat:@"  heap/userland страниц: %u", nheap]);
 
-    // 3c. СНАЧАЛА сэмплы типов (read-only, безопасно). 0x13 ИСКЛЮЧЁН:
-    //     read-fault через апертуру (v10). Остальные — идентификация.
-    static const uint8_t sampleT[] = {0x06, 0x37, 0x09, 0x11, 0x18, 0x14, 0x0c, 0x10, 0x01, 0x27, 0x30, 0x34, 0x35, 0x36, 0x02};
-    for (int si = 0; si < (int)sizeof(sampleT); si++) {
-        uint8_t t = sampleT[si];
-        if (!typeCount[t]) continue;
-        uint32_t shown = 0;
-        for (uint32_t i = 0; i < nall && shown < 2; i++) {
-            if ((uint32_t)(allPages[i] >> 32) != t) continue;
-            uint64_t pa = pb + ((uint64_t)(uint32_t)allPages[i] << 14);
-            uint8_t sm[0x40];
-            kreadbuf(gPrimitives.phystokv(pa), sm, 0x40);
-            NSMutableString *s = [NSMutableString stringWithFormat:@"  0x%02x сэмпл %#llx:", t, pa];
-            for (int q = 0; q < 8; q++) {
-                uint64_t v;
-                memcpy(&v, sm + q * 8, 8);
-                [s appendFormat:@" %#llx", v];
-            }
-            GNOTE( s);
-            shown++;
-        }
-    }
-
-    // 3d. write-test по каждому типу (метод v9: нулевой qword → pattern →
-    //     readback → restore). 0x21 — контроль. Исключены: 0x0e (write-fault,
-    //     v9), 0x13 (read-fault, v10), 0x06 (kernel text — заведомо защищён),
-    //     0x17/0x02 (таблицы — защищены).
+    // 3c. write-test ЧИТАЕМЫХ типов — ПЕРВЫМИ (порядок меняем: v10/v11
+    //     дохли в sample-фазе на read-fault 0x13/0x14, не дойдя до записи).
+    //     0x21 — контроль. Исключены: 0x0e (write-fault), 0x13/0x14
+    //     (read-fault), 0x06 (kernel text), 0x17/0x02 (таблицы).
     extern void kp_rc_kwrite64(uint64_t, uint64_t);
-    static const uint8_t wtest[] = {
-        0x21, 0x37, 0x09, 0x11, 0x18, 0x14, 0x0c, 0x10,
-        0x01, 0x03, 0x04, 0x05, 0x27, 0x28, 0x29, 0x2a, 0x2b, 0x2c, 0x2e, 0x2f,
-        0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x38, 0x39, 0x3a, 0x1b, 0x1c,
-        0x15, 0x16, 0x08, 0x0a, 0x12,
-    };
+    static const uint8_t wtest[] = { 0x21, 0x37, 0x09, 0x11, 0x18 };
     for (int wi = 0; wi < (int)sizeof(wtest); wi++) {
         uint8_t t = wtest[wi];
         if (!typeCount[t]) continue;
@@ -5471,8 +5443,32 @@ static BOOL kpHuntPtrOK(uint64_t v)
         if (!done) GNOTE( [NSString stringWithFormat:@"    → 0x%02x: нулевого qword не нашлось за 8 страниц", t]);
     }
 
+    // 3d. сэмплы оставшихся read-unknown типов (read-only; read-fault на
+    //     типе = исключаем его в следующей сборке — виновник последней
+    //     строкой syslog). 0x13/0x14 уже read-fault — не трогаем.
+    static const uint8_t sampleT[] = {0x0c, 0x10, 0x01, 0x27, 0x30, 0x34, 0x35, 0x36, 0x02};
+    for (int si = 0; si < (int)sizeof(sampleT); si++) {
+        uint8_t t = sampleT[si];
+        if (!typeCount[t]) continue;
+        uint32_t shown = 0;
+        for (uint32_t i = 0; i < nall && shown < 2; i++) {
+            if ((uint32_t)(allPages[i] >> 32) != t) continue;
+            uint64_t pa = pb + ((uint64_t)(uint32_t)allPages[i] << 14);
+            uint8_t sm[0x40];
+            kreadbuf(gPrimitives.phystokv(pa), sm, 0x40);
+            NSMutableString *s = [NSMutableString stringWithFormat:@"  0x%02x сэмпл %#llx:", t, pa];
+            for (int q = 0; q < 8; q++) {
+                uint64_t v;
+                memcpy(&v, sm + q * 8, 8);
+                [s appendFormat:@" %#llx", v];
+            }
+            GNOTE( s);
+            shown++;
+        }
+    }
+
     free(heapPages); free(allPages);
-    GNOTE( @"  write-matrix v10 завершена");
+    GNOTE( @"  write-matrix v12 завершена");
     gGartLive = NO;
     return r;
 }
