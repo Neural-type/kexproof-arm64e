@@ -5414,7 +5414,11 @@ static void kpDumpPtrFields(NSMutableString *r, uint64_t objVA, const char *name
             for (int q = 0; q < nv; q++) if (visited[q] == tvv) { seen = YES; break; }
             if (seen) continue;
             if (nv < 512) visited[nv++] = tvv;
-            if (!kvtophys(tvv) || !kvtophys(tvv + 0x1F8)) continue; // оба конца замаплены
+            // Гейт против паники: VA замаплен И PA в managed DRAM. Без
+            // managed-проверки читаем MMIO/GPU-carveout PA через физапертуру
+            // → "Unexpected fault" → ребут (именно так умер scan accel).
+            uint64_t pa0 = kvtophys(tvv), pa1 = kvtophys(tvv + 0x1F8);
+            if (!pa0 || !pa1 || !kpPAIsManaged(pa0) || !kpPAIsManaged(pa1)) continue;
             targets++;
             for (uint64_t o2 = 0; o2 < 0x200; o2 += 8) {
                 uint64_t w = kp_rc_kread64(tvv + o2);
@@ -5428,10 +5432,11 @@ static void kpDumpPtrFields(NSMutableString *r, uint64_t objVA, const char *name
                     [hits appendFormat:@"★★ contentsVA: %s+%#llx → %#llx +%#llx\n", roots[ri].nm, off, tvv, o2];
             }
         }
-        GNOTE( [NSString stringWithFormat:@"  scan %s: targets=%d", roots[ri].nm, targets]);
+        GNOTE( [NSString stringWithFormat:@"  scan %s: targets=%d%@", roots[ri].nm, targets,
+                   hits.length ? [@"\n" stringByAppendingString:hits] : @""]);
+        [hits setString:@""];   // печатаем СРАЗУ после каждого root — паника не сожрёт находки
     }
-    GNOTE( [NSString stringWithFormat:@"  hunt итог:\n%@",
-               hits.length ? (NSString *)hits : @"совпадений нет — дескриптор глубже/в другом месте"]);
+    GNOTE( @"  hunt завершён (если находок не было выше — дескриптор глубже/в другом месте)");
     gGartLive = NO;
     return r;
 }
