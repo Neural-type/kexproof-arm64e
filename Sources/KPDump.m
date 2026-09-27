@@ -5293,6 +5293,7 @@ static void kpGartLive(NSString *line)
     if (!h) { [d writeToFile:p atomically:NO]; return; }
     [h seekToEndOfFile];
     [h writeData:d];
+    [h synchronizeFile];   // fsync КАЖДОЙ строки — EL2-ресет не сожрёт page cache
     [h closeFile];
 }
 
