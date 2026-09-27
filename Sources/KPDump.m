@@ -5378,7 +5378,7 @@ static BOOL kpHuntPtrOK(uint64_t v)
     @autoreleasepool {
         NSError *err = nil;
         id<MTLLibrary> lib = [mtl newLibraryWithSource:
-            @"kernel void sg(device ulong *o [[buffer(0)]], uint i [[thread_position_in_grid]]) { ulong *p = (ulong *)((device char *)o + (ulong)i * 0x4000); p[0] = 0x4242424242424242UL; p[1] = 0x1337133713371337UL; }"
+            @"kernel void sg(device ulong *o [[buffer(0)]], uint i [[thread_position_in_grid]]) { device ulong *p = (device ulong *)((device char *)o + (ulong)i * 0x4000); p[0] = 0x4242424242424242UL; p[1] = 0x1337133713371337UL; }"
             options:nil error:&err];
         id<MTLFunction> fn = lib ? [lib newFunctionWithName:@"sg"] : nil;
         id<MTLComputePipelineState> pipe = fn ? [mtl newComputePipelineStateWithFunction:fn error:&err] : nil;
