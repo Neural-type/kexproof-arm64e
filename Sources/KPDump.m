@@ -5446,55 +5446,100 @@ static BOOL kpHuntPtrOK(uint64_t v)
     }
     GNOTE( [NSString stringWithFormat:@"  sig-скан: найдено %d страниц bufB", nsig]);
 
-    // 3d. needle-скан ВСЕХ типов страниц по всем 17 PA буфера.
-    //     Page-mask compare, БЕЗ valid-гейта (v6 требовал (v&1) — возможно,
-    //     зря). Приоритет типов: сначала безопасные/вероятные, 0x0b в конце.
-    //     Перед каждым типом — строка в лог: если какой-то тип фолтит при
-    //     чтении апертурой, увидим виновника в syslog.
+    // 3d. 0x17: переобнаружить структуры буфера (page-list {phys,1} и PTE
+    //     0xc00…c88) и сдампить их заголовки (первые 16 qword страницы) —
+    //     там могут быть магии/обратные указатели, идентифицирующие владельца.
     if (nsig) {
-        static const uint8_t prio[] = {0x17,0x21,0x0e,0x13,0x37,0x06,0x09,0x11,0x18,0x14,0x0c,0x10,0x0b};
-        int hits = 0;
-        for (int pi = 0; pi < 13 && hits < 24; pi++) {
-            uint8_t t = prio[pi];
-            if (!typeCount[t]) continue;
-            GNOTE( [NSString stringWithFormat:@"  скан типа 0x%02x (%u страниц)…", t, typeCount[t]]);
-            uint32_t scanned = 0;
-            for (uint32_t i = 0; i < nall && hits < 24; i++) {
-                if ((uint32_t)(allPages[i] >> 32) != t) continue;
-                uint64_t pa = pb + ((uint64_t)(uint32_t)allPages[i] << 14);
-                uint64_t va = gPrimitives.phystokv(pa);
-                uint8_t pgch[0x1000];
-                for (int seg = 0; seg < 4 && hits < 24; seg++) {
-                    kreadbuf(va + (uint64_t)seg * 0x1000, pgch, 0x1000);
-                    for (int q = 0; q < 512; q++) {
-                        uint64_t v;
-                        memcpy(&v, pgch + q * 8, 8);
-                        uint64_t vm = v & 0xFFFFFFFFF000ULL;
-                        if (!vm) continue;
-                        for (int ni = 0; ni < nsig; ni++) {
-                            if (vm != sigPA[ni]) continue;
-                            GNOTE( [NSString stringWithFormat:@"★ HIT: type=0x%02x page=%#llx slot=%d val=%#llx (needle=bufB[%d])",
-                                       t, pa, seg * 512 + q, v, ni]);
-                            for (int c = q - 4; c <= q + 4; c++) {
-                                if (c < 0 || c >= 512) continue;
-                                uint64_t cv;
-                                memcpy(&cv, pgch + c * 8, 8);
-                                GNOTE( [NSString stringWithFormat:@"    ctx[%+d] = %#llx", c - q, cv]);
-                            }
-                            hits++;
-                            break;
-                        }
-                        if (hits >= 24) break;
+        uint64_t listPage = 0, ptePage = 0;
+        for (uint32_t i = 0; i < nall && (!listPage || !ptePage); i++) {
+            if ((uint32_t)(allPages[i] >> 32) != 0x17) continue;
+            uint64_t pa = pb + ((uint64_t)(uint32_t)allPages[i] << 14);
+            uint64_t va = gPrimitives.phystokv(pa);
+            uint8_t pgch[0x1000];
+            for (int seg = 0; seg < 4; seg++) {
+                kreadbuf(va + (uint64_t)seg * 0x1000, pgch, 0x1000);
+                for (int q = 0; q < 512; q++) {
+                    uint64_t v;
+                    memcpy(&v, pgch + q * 8, 8);
+                    uint64_t vm = v & 0xFFFFFFFFF000ULL;
+                    if (!vm) continue;
+                    for (int ni = 0; ni < nsig; ni++) {
+                        if (vm != sigPA[ni]) continue;
+                        if ((v >> 56) == 0xc0) { if (!ptePage) ptePage = pa; }
+                        else if (!(v & 0xFFFULL)) { if (!listPage) listPage = pa; }
+                        break;
                     }
+                    if (listPage && ptePage) break;
                 }
-                if (++scanned == 32768)
-                    GNOTE( [NSString stringWithFormat:@"    …тип 0x%02x: 32768 страниц…", t]);
+                if (listPage && ptePage) break;
             }
         }
-        GNOTE( [NSString stringWithFormat:@"  needle-скан: hits=%d", hits]);
+        GNOTE( [NSString stringWithFormat:@"  0x17: page-list=%#llx PTE-table=%#llx", listPage, ptePage]);
+        for (int wp = 0; wp < 2; wp++) {
+            uint64_t pa = wp ? ptePage : listPage;
+            if (!pa) continue;
+            GNOTE( [NSString stringWithFormat:@"  --- заголовок %s %#llx:", wp ? "PTE-table" : "page-list", pa]);
+            uint8_t hd[0x80];
+            kreadbuf(gPrimitives.phystokv(pa), hd, 0x80);
+            for (int q = 0; q < 16; q += 2) {
+                uint64_t a0, a1;
+                memcpy(&a0, hd + q * 8, 8); memcpy(&a1, hd + q * 8 + 8, 8);
+                GNOTE( [NSString stringWithFormat:@"    [%2d] %#llx %#llx", q, a0, a1]);
+            }
+        }
+
+        // 3e. ГЛАВНОЕ: heap (0x21) — есть ли копия phys (дескриптор ranges,
+        //     который драйвер читает при map)? 20k страниц.
+        int hits = 0;
+        GNOTE( [NSString stringWithFormat:@"  скан типа 0x21 (heap, %u страниц)…", typeCount[0x21]]);
+        for (uint32_t i = 0; i < nall && hits < 24; i++) {
+            if ((uint32_t)(allPages[i] >> 32) != 0x21) continue;
+            uint64_t pa = pb + ((uint64_t)(uint32_t)allPages[i] << 14);
+            uint64_t va = gPrimitives.phystokv(pa);
+            uint8_t pgch[0x1000];
+            for (int seg = 0; seg < 4 && hits < 24; seg++) {
+                kreadbuf(va + (uint64_t)seg * 0x1000, pgch, 0x1000);
+                for (int q = 0; q < 512; q++) {
+                    uint64_t v;
+                    memcpy(&v, pgch + q * 8, 8);
+                    uint64_t vm = v & 0xFFFFFFFFF000ULL;
+                    if (!vm) continue;
+                    for (int ni = 0; ni < nsig; ni++) {
+                        if (vm != sigPA[ni]) continue;
+                        GNOTE( [NSString stringWithFormat:@"★ HEAP HIT: page=%#llx slot=%d val=%#llx (bufB[%d])", pa, seg * 512 + q, v, ni]);
+                        for (int c = q - 4; c <= q + 4; c++) {
+                            if (c < 0 || c >= 512) continue;
+                            uint64_t cv;
+                            memcpy(&cv, pgch + c * 8, 8);
+                            GNOTE( [NSString stringWithFormat:@"    ctx[%+d] = %#llx", c - q, cv]);
+                        }
+                        hits++;
+                        break;
+                    }
+                }
+            }
+        }
+        GNOTE( [NSString stringWithFormat:@"  heap-скан: hits=%d", hits]);
+
+        // 3f. 0x0e: идентификация загадочного типа (74-80k страниц) — сэмпл.
+        uint32_t sampled = 0;
+        for (uint32_t i = 0; i < nall && sampled < 3; i++) {
+            if ((uint32_t)(allPages[i] >> 32) != 0x0e) continue;
+            uint64_t pa = pb + ((uint64_t)(uint32_t)allPages[i] << 14);
+            uint8_t sm[0x40];
+            kreadbuf(gPrimitives.phystokv(pa), sm, 0x40);
+            NSMutableString *s = [NSMutableString stringWithFormat:@"  0x0e сэмпл %#llx:", pa];
+            for (int q = 0; q < 8; q++) {
+                uint64_t v;
+                memcpy(&v, sm + q * 8, 8);
+                [s appendFormat:@" %#llx", v];
+            }
+            GNOTE( s);
+            sampled++;
+        }
     }
     free(heapPages); free(allPages);
-    GNOTE( @"  hunt v7 завершён");
+    GNOTE( @"  hunt v8 завершён");
     gGartLive = NO;
     return r;
 }
