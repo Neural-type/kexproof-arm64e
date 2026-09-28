@@ -5347,9 +5347,11 @@ static kp_io_connect_method_fn kpFindIoConnectMethod(void)
 {
     static kp_io_connect_method_fn fn = NULL;
     if (fn) return fn;
+    kpGartLive(@"  icm v3: вход");
     // 1. live-обёртка + live-база IOKit (slide = live - cache)
     void *wLive = dlsym(RTLD_DEFAULT, "IOConnectCallStructMethod");
     if (!wLive) wLive = dlsym(RTLD_DEFAULT, "IOConnectCallMethod");
+    kpGartLive([NSString stringWithFormat:@"  icm v3: wLive=%p", wLive]);
     if (!wLive) { kpGartLive(@"  icm: нет live-обёртки"); return NULL; }
     uintptr_t liveBase = 0;
     const char *wantPath = "IOKit.framework";
@@ -5357,6 +5359,7 @@ static kp_io_connect_method_fn kpFindIoConnectMethod(void)
         const char *nm = _dyld_get_image_name(i);
         if (nm && strstr(nm, wantPath)) { liveBase = (uintptr_t)_dyld_get_image_header(i); break; }
     }
+    kpGartLive([NSString stringWithFormat:@"  icm v3: liveBase=%#lx images=%u", liveBase, _dyld_image_count()]);
     // 2. dyld-кэш как ФАЙЛ (читаемый): mappings/images
     const char *paths[] = {
         "/System/Volumes/Preboot/Cryptexes/OS/System/Library/Caches/com.apple.dyld/dyld_shared_cache_arm64e",
@@ -5369,11 +5372,12 @@ static kp_io_connect_method_fn kpFindIoConnectMethod(void)
     for (int pi = 0; paths[pi] && !f; pi++) { f = fopen(paths[pi], "rb"); if (f) usedPi = pi; }
     if (!f || !liveBase) { kpGartLive([NSString stringWithFormat:@"  icm: f=%p liveBase=%#lx — стоп", f, liveBase]); if (f) fclose(f); return NULL; }
     uint8_t hdr[0x20];
-    if (fread(hdr, 1, sizeof hdr, f) != sizeof hdr) { fclose(f); return NULL; }
+    if (fread(hdr, 1, sizeof hdr, f) != sizeof hdr) { kpGartLive(@"  icm: hdr fread fail"); fclose(f); return NULL; }
     uint32_t mappingOffset = *(uint32_t *)(hdr + 0x10);
     uint32_t mappingCount = *(uint32_t *)(hdr + 0x14);
     uint32_t imagesOffset = *(uint32_t *)(hdr + 0x18);
     uint32_t imagesCount = *(uint32_t *)(hdr + 0x1C);
+    kpGartLive([NSString stringWithFormat:@"  icm v3: кэш #%d mappings=%u images=%u", usedPi, mappingCount, imagesCount]);
     uint64_t cacheBase = 0, funcCacheVA = 0;
     char pathbuf[256];
     for (uint32_t i = 0; i < imagesCount && i < 4096; i++) {
@@ -5405,7 +5409,7 @@ static kp_io_connect_method_fn kpFindIoConnectMethod(void)
     if (foff < 0) { kpGartLive(@"  icm: mapping не найден"); fclose(f); return NULL; }
     uint32_t ins[32];
     fseeko(f, foff, SEEK_SET);
-    if (fread(ins, 4, 32, f) != 32) { fclose(f); return NULL; }
+    if (fread(ins, 4, 32, f) != 32) { kpGartLive(@"  icm: ins fread fail"); fclose(f); return NULL; }
     fclose(f);
     for (int i = 0; i < 32; i++) {
         uint32_t op = ins[i];
