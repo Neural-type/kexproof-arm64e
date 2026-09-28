@@ -5368,16 +5368,17 @@ static void *kpListReaderMulti(void *arg)
             for (int i = 0; i < 64; i++) {
                 uint64_t f0 = kp_rc_kread64(bv + (uint64_t)i * 0x10);
                 if (!f0) continue;
+                // логируем ВСЕ ненулевые (cap 512)
+                unsigned slot = gRdLogN;
+                if (slot < 512) {
+                    gRdLogC[slot] = c; gRdLogI[slot] = i; gRdLogV0[slot] = f0;
+                    gRdLogN = slot + 1;
+                }
                 for (int j = 0; j < gRdNPA; j++) {
                     if (f0 == gRdPAs[j]) {
                         gRdHits++;
                         if (gRdWinCand < 0) gRdWinCand = c;
-                        unsigned slot = gRdLogN;
-                        if (slot < 512) {
-                            gRdLogC[slot] = c; gRdLogI[slot] = i; gRdLogV0[slot] = f0;
-                            gRdLogN = slot + 1;
-                        }
-                        kpGartLive([NSString stringWithFormat:@"    D3v3 ПОПАДАНИЕ: cand[%d] rec[%d] поле0=%#llx == sigPA[%d]", c, i, f0, j]);
+                        kpGartLive([NSString stringWithFormat:@"    ПОПАДАНИЕ: cand[%d] rec[%d] поле0=%#llx == sigPA[%d]", c, i, f0, j]);
                         break;
                     }
                 }
