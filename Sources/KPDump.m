@@ -6,6 +6,7 @@
 #import <stdatomic.h>
 #import <string.h>
 #import <dlfcn.h>
+#import <mach-o/dyld.h>
 #import <sys/mman.h>
 #import <sys/utsname.h>
 #import <sys/wait.h>
