@@ -5352,9 +5352,6 @@ static kp_io_connect_method_fn kpFindIoConnectMethod(void)
     if (!wLive) { kpGartLive(@"  icm: нет live-обёртки"); return NULL; }
     uintptr_t liveBase = 0;
     const char *wantPath = "IOKit.framework";
-    extern uint32_t _dyld_image_count(void);
-    extern const struct mach_header_64 *_dyld_get_image_header(unsigned);
-    extern const char *_dyld_get_image_name(unsigned);
     for (uint32_t i = 0; i < _dyld_image_count(); i++) {
         const char *nm = _dyld_get_image_name(i);
         if (nm && strstr(nm, wantPath)) { liveBase = (uintptr_t)_dyld_get_image_header(i); break; }
