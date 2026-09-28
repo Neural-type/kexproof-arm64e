@@ -5635,10 +5635,6 @@ static void *kpListReaderMulti(void *arg)
     free(iommuPages);
     munlock((void *)svx, 0x4000);
     vm_deallocate(mach_task_self(), svx, 0x4000);
-
-out_m:
-    munlock((void *)mem, 0x4000); vm_deallocate(mach_task_self(), mem, 0x4000);
-    munlock((void *)svx, 0x4000); vm_deallocate(mach_task_self(), svx, 0x4000);
     gGartLive = NO;
     return r;
 }
