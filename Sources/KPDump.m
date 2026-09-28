@@ -5583,16 +5583,36 @@ static void *kpListReaderMulti(void *arg)
         resId = *(uint32_t *)out16;
         uint64_t shmVA = *(uint64_t *)(out16 + 8);
         GNOTE( [NSString stringWithFormat:@"  A: sel7 kr=%#x outSz=%zu resourceId=%#llx shmemVA=%#llx", kr7, outSz, resId, shmVA]);
+
+        // registry: uc+0x120 → AGXShared+0x88 → +0x10 array, +0x28 count.
+        // Снимаем ФАКТИЧЕСКИЙ id очереди (lookup требует count > id).
+        uint64_t mp = kp_untag_ptr([self rcResolveThreadKVA:conn]);
+        uint64_t uc2 = kp_untag_ptr(kp_rc_kread64(mp + 0x30));
+        uint64_t sh2 = kp_untag_ptr(kp_rc_kread64(uc2 + 0x120));
+        uint64_t reg = kp_untag_ptr(kp_rc_kread64(sh2 + 0x88));
+        uint64_t arr = kp_untag_ptr(kp_rc_kread64(reg + 0x10));
+        uint64_t rcnt = kp_rc_kread64(reg + 0x28);
+        GNOTE( [NSString stringWithFormat:@"  registry: uc=%#llx shared=%#llx reg=%#llx array=%#llx count=%llu", uc2, sh2, reg, arr, rcnt]);
+        for (uint64_t ri = 0; ri < rcnt && ri < 8; ri++) {
+            uint64_t ent = kp_untag_ptr(kp_rc_kread64(arr + ri * 8));
+            if (!kpLooksLikeKernelPointer(ent)) { GNOTE( [NSString stringWithFormat:@"    array[%llu]=%#llx (не указатель)", ri, ent]); continue; }
+            uint64_t v0 = kp_rc_kread64(ent);
+            uint64_t v1 = kp_rc_kread64(ent + 8);
+            uint64_t v2 = kp_rc_kread64(ent + 0x10);
+            uint64_t v3 = kp_rc_kread64(ent + 0x18);
+            GNOTE( [NSString stringWithFormat:@"    array[%llu]=%#llx: +0=%#llx +8=%#llx +0x10=%#llx +0x18=%#llx", ri, ent, v0, v1, v2, v3]);
+        }
     }
     uint64_t vaA = 0;
-    {
+    for (int vi = 0; vi < 2 && !vaA; vi++) {
+        uint64_t tryId = vi ? 0 : resId;   // сначала id из sel7, потом 0
         uint64_t cmd[17]; memset(cmd, 0, sizeof cmd);
         cmd[0] = 0x80;
         cmd[3] = 0x8000;
         cmd[4] = (uint64_t)mem;
         cmd[5] = 0x8000;
         cmd[6] = 1;
-        cmd[7] = resId;
+        cmd[7] = tryId;
         cmd[8] = (uint64_t)mem;
         cmd[9] = 0x8000;
         cmd[10] = 2;
@@ -5606,10 +5626,9 @@ static void *kpListReaderMulti(void *arg)
                                                      cmd, sizeof cmd,
                                                      outScal, &outScalCnt,
                                                      outS, &outSCnt);
-        GNOTE( [NSString stringWithFormat:@"  A: sel9(async) kr=%#x outScalCnt=%u outSCnt=%zu", kr9, outScalCnt, outSCnt]);
-        for (int i = 0; i < 8; i++) GNOTE( [NSString stringWithFormat:@"    scal[%d]=%#llx", i, outScal[i]]);
+        GNOTE( [NSString stringWithFormat:@"  A: sel9(async) cmd[7]=%#llx kr=%#x outScalCnt=%u outSCnt=%zu", tryId, kr9, outScalCnt, outSCnt]);
         uint64_t *o64 = (uint64_t *)outS;
-        for (int i = 0; i < 12; i++) GNOTE( [NSString stringWithFormat:@"    out[%d]=%#llx", i, o64[i]]);
+        for (int i = 0; i < 8; i++) GNOTE( [NSString stringWithFormat:@"    out[%d]=%#llx", i, o64[i]]);
         vaA = o64[0];
         if (!vaA) vaA = o64[6];
         if (!vaA) vaA = outScal[0];
