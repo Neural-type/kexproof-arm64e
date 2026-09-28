@@ -147,6 +147,11 @@ NS_ASSUME_NONNULL_BEGIN
 // panic IS the confirmation. Unpatched on 18.6.
 + (NSString *)jpegUafReport;
 
+// Reachability-матрица: по одному IOServiceOpen на сервис-кандидат из
+// bug-hunt (M2Scaler, AVE2, AVD, JPEG, IOAudio2, HID, IOGPU…). kr=0 =
+// поверхность живая из нашей песочницы. Безопасно (open/close only).
++ (NSString *)reachabilityReport;
+
 // IOSurfaceRootUserClient surface map: open IOSurfaceRoot, call selectors
 // 0-63 with empty/0x58/0x1000 feeds, log kr per method. Reveals which
 // methods exist (not-Unsupported) for the reverse phase.

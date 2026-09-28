@@ -43,7 +43,7 @@
     titleLabel.textAlignment = NSTextAlignmentCenter;
 
     UILabel *subtitle = [self makeLabel:13 weight:UIFontWeightRegular color:[UIColor colorWithRed:0.55 green:0.85 blue:0.65 alpha:1.0]];
-    subtitle.text = @"CVE-2025-43520 · ClearSword · дамп SPTM/TXM · 1.9.91";
+    subtitle.text = @"CVE-2025-43520 · ClearSword · дамп SPTM/TXM · 1.9.92";
     subtitle.textAlignment = NSTextAlignmentCenter;
 
     self.statusLabel = [self makeLabel:13 weight:UIFontWeightSemibold color:[UIColor secondaryLabelColor]];
@@ -79,7 +79,7 @@
                                     color:[UIColor colorWithRed:0.25 green:0.55 blue:0.45 alpha:1.0]];
     [self.physmapButton addTarget:self action:@selector(physmapTapped) forControlEvents:UIControlEventTouchUpInside];
 
-    self.geoButton = [self makeButton:@"PAC test (TaskRop forging)"
+    self.geoButton = [self makeButton:@"Reachability matrix (какие сервисы открыты)"
                                 color:[UIColor colorWithRed:0.20 green:0.50 blue:0.62 alpha:1.0]];
     [self.geoButton addTarget:self action:@selector(geoTapped) forControlEvents:UIControlEventTouchUpInside];
 
@@ -219,7 +219,7 @@
     [self setExperimentButton:self.exploitButton enabled:!self.jobRunning && !KPRunner.hasKRW];
     [self setExperimentButton:self.dumpButton enabled:krw];
     [self setExperimentButton:self.physmapButton enabled:krw];
-    [self setExperimentButton:self.geoButton enabled:krw];
+    [self setExperimentButton:self.geoButton enabled:!self.jobRunning];
     [self setExperimentButton:self.gartButton enabled:krw];
 }
 
@@ -554,15 +554,13 @@
 }
 
 - (void)geoTapped {
-    [self runUnprivilegedDiagnosticWithStatus:@"PAC test: выполняется…" work:^NSDictionary *{
-        return @{@"report": [KPDump pacTestReport]};
+    [self runUnprivilegedDiagnosticWithStatus:@"Reachability-матрица: выполняется…" work:^NSDictionary *{
+        return @{@"report": [KPDump reachabilityReport]};
     } completion:^(NSDictionary *result) {
             NSString *report = result[@"report"];
-            self.statusLabel.text = [report containsString:@"no-sandbox ПРИМЕНЁН"]
-                ? @"PAC forging VERIFIED — kcall открыт"
-                : @"PAC test завершён — см. лог";
+            self.statusLabel.text = @"Reachability: готово — см. лог";
             [self appendLogText:report];
-            [self saveExperimentReport:report fileName:@"kexproof-pac.txt"];
+            [self saveExperimentReport:report fileName:@"kexproof-reachability.txt"];
     }];
 }
 

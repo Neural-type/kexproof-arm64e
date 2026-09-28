@@ -4573,6 +4573,40 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
     return submitted;
 }
 
+// Reachability-матрица: по одному IOServiceOpen на сервис-кандидат из охоты
+// (agent-45). Отвечает: что реально открывается из нашей песочницы → что
+// аудировать/атаковать глубоко. Только открытие/закрытие — безопасно.
++ (NSString *)reachabilityReport
+{
+    NSMutableString *r = [NSMutableString string];
+    kpNote(r, @"=== Reachability matrix (по одному IOServiceOpen на сервис) ===");
+    kpNote(r, @"kr=0 → ОТКРЫВАЕТСЯ (нет kernel-side гейта) → аудировать глубоко; 0xe00002c5/0xe00002c2 → закрыт (entitlement/sandbox)");
+    const char *services[] = {
+        "IOAccessoryManager", "IOAccessoryEAInterface", "AppleSARService", "ApplePPMCPMS",
+        "AppleM2ScalerCSCDriver", "AppleAVE2", "AppleAVD", "AppleJPEGDriver",
+        "IOAudio2Device", "IOStream", "IOHIDEventService", "IOGPU",
+        NULL,
+    };
+    for (int i = 0; services[i]; i++) {
+        io_service_t svc = IOServiceGetMatchingService(kIOMasterPortDefault, IOServiceMatching(services[i]));
+        if (!svc) {
+            kpNote(r, [NSString stringWithFormat:@"  %-28s сервис не найден (sandbox прячет / нет)", services[i]]);
+            continue;
+        }
+        io_connect_t conn = 0;
+        kern_return_t kr = IOServiceOpen(svc, mach_task_self(), 0, &conn);
+        if (kr == 0 && conn) {
+            kpNote(r, [NSString stringWithFormat:@"  %-28s ★ ОТКРЫЛСЯ (conn=%#x) — ПОВЕРХНОСТЬ ЖИВАЯ", services[i], conn]);
+            IOServiceClose(conn);
+        } else {
+            kpNote(r, [NSString stringWithFormat:@"  %-28s kr=0x%x (%s)", services[i], kr, mach_error_string(kr)]);
+        }
+        IOObjectRelease(svc);
+    }
+    kpNote(r, @"=== конец матрицы ===");
+    return r;
+}
+
 + (NSString *)jpegUafReport
 {
     NSMutableString *r = [NSMutableString string];
