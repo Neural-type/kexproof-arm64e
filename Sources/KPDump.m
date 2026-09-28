@@ -5346,16 +5346,54 @@ static kp_io_connect_method_fn kpFindIoConnectMethod(void)
 {
     static kp_io_connect_method_fn fn = NULL;
     if (fn) return fn;
-    void *w = dlsym(RTLD_DEFAULT, "io_connect_method_scalarI_structureO");
-    if (!w) return NULL;
-    uint32_t *insn = (uint32_t *)w;
-    for (int i = 0; i < 16; i++) {
-        uint32_t op = insn[i];
-        if ((op & 0xFC000000) == 0x94000000 || (op & 0xFC000000) == 0x14000000) {  // BL или B
-            int32_t imm = (int32_t)(op & 0x3FFFFFF);
-            if (imm & 0x2000000) imm |= (int32_t)0xFC000000;
-            fn = (kp_io_connect_method_fn)((uint8_t *)(insn + i) + ((int64_t)imm << 2));
+    const char *names[] = {
+        "io_connect_method_scalarI_structureO",
+        "io_connect_method_structureI_structureO",
+        "io_connect_method_scalarI_scalarO",
+        "io_connect_method_scalarI_structureI",
+        "IOConnectCallStructMethod",
+        "IOConnectCallMethod",
+        "IOConnectCallScalarMethod",
+        NULL,
+    };
+    for (int ni = 0; names[ni] && !fn; ni++) {
+        void *w = dlsym(RTLD_DEFAULT, names[ni]);
+        if (!w) continue;
+        uint32_t *insn = (uint32_t *)w;
+        for (int i = 0; i < 32 && !fn; i++) {
+            uint32_t op = insn[i];
+            if ((op & 0xFC000000) == 0x94000000 || (op & 0xFC000000) == 0x14000000) {  // bl/b
+                int32_t imm = (int32_t)(op & 0x3FFFFFF);
+                if (imm & 0x2000000) imm |= (int32_t)0xFC000000;
+                fn = (kp_io_connect_method_fn)((uint8_t *)(insn + i) + ((int64_t)imm << 2));
+                break;
+            }
+            if ((op & 0x9F000000) == 0x90000000) {   // adrp Xd, page
+                int rd = op & 31;
+                int64_t imm = ((int64_t)((op >> 5) & 0x7FFFF) << 2) | ((op >> 29) & 3);
+                if (imm & 0x100000) imm |= ~0x1FFFFFL;
+                uint64_t page = ((uintptr_t)(insn + i) & ~0xFFFULL) + (imm << 12);
+                // следующий add Xd, Xd, #imm (+ optional shift)
+                if (i + 1 < 32) {
+                    uint32_t op2 = insn[i + 1];
+                    if ((op2 & 0xFF000000) == 0x91000000 && (op2 & 31) == rd && ((op2 >> 5) & 31) == rd) {
+                        uint64_t add = (op2 >> 10) & 0xFFF;
+                        if ((op2 >> 22) & 1) add <<= 12;
+                        fn = (kp_io_connect_method_fn)(page + add);
+                        break;
+                    }
+                }
+            }
+        }
+        if (fn) {
+            kpGartLive([NSString stringWithFormat:@"  icm stub ← %s = %p", names[ni], fn]);
             break;
+        }
+        // дамп первых инструкций для оффлайн-разбора
+        if (w && ni >= 4) {
+            NSMutableString *dmp = [NSMutableString stringWithFormat:@"  %s @ %p:", names[ni], w];
+            for (int i = 0; i < 8; i++) [dmp appendFormat:@" %08x", insn[i]];
+            kpGartLive(dmp);
         }
     }
     return fn;
