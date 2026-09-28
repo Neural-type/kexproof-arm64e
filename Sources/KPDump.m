@@ -5346,56 +5346,81 @@ static kp_io_connect_method_fn kpFindIoConnectMethod(void)
 {
     static kp_io_connect_method_fn fn = NULL;
     if (fn) return fn;
-    const char *names[] = {
-        "io_connect_method_scalarI_structureO",
-        "io_connect_method_structureI_structureO",
-        "io_connect_method_scalarI_scalarO",
-        "io_connect_method_scalarI_structureI",
-        "IOConnectCallStructMethod",
-        "IOConnectCallMethod",
-        "IOConnectCallScalarMethod",
+    // 1. live-обёртка + live-база IOKit (slide = live - cache)
+    void *wLive = dlsym(RTLD_DEFAULT, "IOConnectCallStructMethod");
+    if (!wLive) wLive = dlsym(RTLD_DEFAULT, "IOConnectCallMethod");
+    if (!wLive) { kpGartLive(@"  icm: нет live-обёртки"); return NULL; }
+    uintptr_t liveBase = 0;
+    const char *wantPath = "IOKit.framework";
+    extern uint32_t _dyld_image_count(void);
+    extern const struct mach_header_64 *_dyld_get_image_header(unsigned);
+    extern const char *_dyld_get_image_name(unsigned);
+    for (uint32_t i = 0; i < _dyld_image_count(); i++) {
+        const char *nm = _dyld_get_image_name(i);
+        if (nm && strstr(nm, wantPath)) { liveBase = (uintptr_t)_dyld_get_image_header(i); break; }
+    }
+    // 2. dyld-кэш как ФАЙЛ (читаемый): mappings/images
+    const char *paths[] = {
+        "/System/Volumes/Preboot/Cryptexes/OS/System/Library/Caches/com.apple.dyld/dyld_shared_cache_arm64e",
+        "/System/Library/Caches/com.apple.dyld/dyld_shared_cache_arm64e",
+        "/System/Volumes/Preboot/Cryptexes/OS/System/Library/Caches/com.apple.dyld/dyld_shared_cache_arm64e.1",
         NULL,
     };
-    for (int ni = 0; names[ni] && !fn; ni++) {
-        void *w = dlsym(RTLD_DEFAULT, names[ni]);
-        if (!w) continue;
-        uint32_t *insn = (uint32_t *)w;
-        for (int i = 0; i < 32 && !fn; i++) {
-            uint32_t op = insn[i];
-            if ((op & 0xFC000000) == 0x94000000 || (op & 0xFC000000) == 0x14000000) {  // bl/b
-                int32_t imm = (int32_t)(op & 0x3FFFFFF);
-                if (imm & 0x2000000) imm |= (int32_t)0xFC000000;
-                fn = (kp_io_connect_method_fn)((uint8_t *)(insn + i) + ((int64_t)imm << 2));
-                break;
-            }
-            if ((op & 0x9F000000) == 0x90000000) {   // adrp Xd, page
-                int rd = op & 31;
-                int64_t imm = ((int64_t)((op >> 5) & 0x7FFFF) << 2) | ((op >> 29) & 3);
-                if (imm & 0x100000) imm |= ~0x1FFFFFL;
-                uint64_t page = ((uintptr_t)(insn + i) & ~0xFFFULL) + (imm << 12);
-                // следующий add Xd, Xd, #imm (+ optional shift)
-                if (i + 1 < 32) {
-                    uint32_t op2 = insn[i + 1];
-                    if ((op2 & 0xFF000000) == 0x91000000 && (op2 & 31) == rd && ((op2 >> 5) & 31) == rd) {
-                        uint64_t add = (op2 >> 10) & 0xFFF;
-                        if ((op2 >> 22) & 1) add <<= 12;
-                        fn = (kp_io_connect_method_fn)(page + add);
-                        break;
-                    }
-                }
-            }
-        }
-        if (fn) {
-            kpGartLive([NSString stringWithFormat:@"  icm stub ← %s = %p", names[ni], fn]);
+    FILE *f = NULL;
+    int usedPi = -1;
+    for (int pi = 0; paths[pi] && !f; pi++) { f = fopen(paths[pi], "rb"); if (f) usedPi = pi; }
+    if (!f || !liveBase) { kpGartLive([NSString stringWithFormat:@"  icm: f=%p liveBase=%#lx — стоп", f, liveBase]); if (f) fclose(f); return NULL; }
+    uint8_t hdr[0x20];
+    if (fread(hdr, 1, sizeof hdr, f) != sizeof hdr) { fclose(f); return NULL; }
+    uint32_t mappingOffset = *(uint32_t *)(hdr + 0x10);
+    uint32_t mappingCount = *(uint32_t *)(hdr + 0x14);
+    uint32_t imagesOffset = *(uint32_t *)(hdr + 0x18);
+    uint32_t imagesCount = *(uint32_t *)(hdr + 0x1C);
+    uint64_t cacheBase = 0, funcCacheVA = 0;
+    char pathbuf[256];
+    for (uint32_t i = 0; i < imagesCount && i < 4096; i++) {
+        uint8_t ie[0x20];
+        fseeko(f, imagesOffset + (off_t)i * 0x20, SEEK_SET);
+        if (fread(ie, 1, sizeof ie, f) != sizeof ie) break;
+        uint64_t addr = *(uint64_t *)(ie + 0);
+        uint32_t poff = *(uint32_t *)(ie + 0x18);
+        if (!poff) continue;
+        fseeko(f, poff, SEEK_SET);
+        memset(pathbuf, 0, sizeof pathbuf);
+        if (!fread(pathbuf, 1, sizeof pathbuf - 1, f)) continue;
+        if (strstr(pathbuf, wantPath)) {
+            cacheBase = addr;
+            funcCacheVA = addr + ((uintptr_t)wLive - liveBase);
             break;
         }
-        // дамп первых инструкций для оффлайн-разбора
-        if (w && ni >= 4) {
-            NSMutableString *dmp = [NSMutableString stringWithFormat:@"  %s @ %p:", names[ni], w];
-            for (int i = 0; i < 8; i++) [dmp appendFormat:@" %08x", insn[i]];
-            kpGartLive(dmp);
+    }
+    if (!funcCacheVA) { kpGartLive([NSString stringWithFormat:@"  icm: IOKit не найден в кэше #%d", usedPi]); fclose(f); return NULL; }
+    uint64_t slide = liveBase - cacheBase;
+    off_t foff = -1;
+    for (uint32_t m = 0; m < mappingCount && m < 64; m++) {
+        uint8_t me[0x20];
+        fseeko(f, mappingOffset + (off_t)m * 0x20, SEEK_SET);
+        if (fread(me, 1, sizeof me, f) != sizeof me) break;
+        uint64_t va = *(uint64_t *)(me + 0), sz = *(uint64_t *)(me + 8), fo = *(uint64_t *)(me + 16);
+        if (funcCacheVA >= va && funcCacheVA < va + sz) { foff = (off_t)(fo + (funcCacheVA - va)); break; }
+    }
+    if (foff < 0) { kpGartLive(@"  icm: mapping не найден"); fclose(f); return NULL; }
+    uint32_t ins[32];
+    fseeko(f, foff, SEEK_SET);
+    if (fread(ins, 4, 32, f) != 32) { fclose(f); return NULL; }
+    fclose(f);
+    for (int i = 0; i < 32; i++) {
+        uint32_t op = ins[i];
+        if ((op & 0xFC000000) == 0x94000000 || (op & 0xFC000000) == 0x14000000) {
+            int32_t imm = (int32_t)(op & 0x3FFFFFF);
+            if (imm & 0x2000000) imm |= (int32_t)0xFC000000;
+            uint64_t targetCacheVA = funcCacheVA + (uint64_t)i * 4 + ((int64_t)imm << 2);
+            fn = (kp_io_connect_method_fn)(targetCacheVA + slide);
+            break;
         }
     }
+    kpGartLive([NSString stringWithFormat:@"  icm v3: liveBase=%#lx cacheBase=%#llx slide=%#llx foff=%#llx ins0=%08x fn=%p",
+                   liveBase, cacheBase, slide, (long long)foff, ins[0], fn]);
     return fn;
 }
 static uint64_t gRaceBufs[12];
