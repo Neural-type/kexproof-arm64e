@@ -87,7 +87,7 @@
                                  color:[UIColor colorWithRed:0.35 green:0.45 blue:0.30 alpha:1.0]];
     [self.gartButton addTarget:self action:@selector(gartTapped) forControlEvents:UIControlEventTouchUpInside];
 
-    self.m2uafButton = [self makeButton:@"JPEG UAF CVE-2026-20687 (РЕБУТ?)"
+    self.m2uafButton = [self makeButton:@"NECP UAF (flow dangling)"
                                   color:[UIColor colorWithRed:0.65 green:0.18 blue:0.18 alpha:1.0]];
     [self.m2uafButton addTarget:self action:@selector(m2uafTapped) forControlEvents:UIControlEventTouchUpInside];
 
@@ -516,14 +516,14 @@
 // Если completion отработал — паники не было: баг не сработал в этом прогоне.
 - (void)m2uafTapped {
     [self runUnprivilegedDiagnosticWithStatus:@"JPEG UAF: victim→reclaim→trigger… (МОЖЕТ ПАНИКОВАТЬ!)" work:^NSDictionary *{
-        return @{@"report": [KPDump jpegUafReport]};
+        return @{@"report": [KPDump necpUafProbeReport]};
     } completion:^(NSDictionary *result) {
             NSString *report = result[@"report"];
-            BOOL ran = ![report containsString:@"JPEG UAF SKIP"];
-            self.statusLabel.text = ran ? @"JPEG UAF: паники нет — открой Camera"
-                                        : @"JPEG UAF: прогон невозможен — см. лог";
+            BOOL ran = ![report containsString:@"NECP SKIP"];
+            self.statusLabel.text = ran ? @"NECP UAF: готово — см. лог"
+                                        : @"NECP: прогон невозможен — см. лог";
             [self appendLogText:report];
-            [self saveExperimentReport:report fileName:@"kexproof-jpeguaf.txt"];
+            [self saveExperimentReport:report fileName:@"kexproof-necp.txt"];
     }];
 }
 
