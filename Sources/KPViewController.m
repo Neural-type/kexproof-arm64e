@@ -43,7 +43,7 @@
     titleLabel.textAlignment = NSTextAlignmentCenter;
 
     UILabel *subtitle = [self makeLabel:13 weight:UIFontWeightRegular color:[UIColor colorWithRed:0.55 green:0.85 blue:0.65 alpha:1.0]];
-    subtitle.text = @"CVE-2025-43520 · ClearSword · дамп SPTM/TXM · 1.9.88";
+    subtitle.text = @"CVE-2025-43520 · ClearSword · дамп SPTM/TXM · 1.9.89";
     subtitle.textAlignment = NSTextAlignmentCenter;
 
     self.statusLabel = [self makeLabel:13 weight:UIFontWeightSemibold color:[UIColor secondaryLabelColor]];
@@ -177,7 +177,7 @@
         [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleShortVersionString"], [NSDate date]];
     [[KPLog shared] append:@"KexProof загружен. Эксплойт работает в обычной песочнице приложения, без джейлбрейк-энтитлментов."];
 
-    // 1.9.88: auto-fire the exploit 1.5s after launch — after a panic-reboot
+    // 1.9.89: auto-fire the exploit 1.5s after launch — after a panic-reboot
     // the whole ritual is: open the app, put the phone down, wait.
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
@@ -337,7 +337,7 @@
     [self exploitTappedWithRetry:0];
 }
 
-// 1.9.88: auto-run + auto-retry. A failed attempt that did NOT panic returns
+// 1.9.89: auto-run + auto-retry. A failed attempt that did NOT panic returns
 // here with the app alive — so we just go again, 2s later, until a win. The
 // race is a lottery; tapping is not the user's job.
 - (void)exploitTappedWithRetry:(int)attempt {
