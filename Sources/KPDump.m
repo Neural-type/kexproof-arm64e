@@ -5698,6 +5698,36 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
     uint32_t srcID = IOSurfaceGetID(srcS);
     kpNote(r, [NSString stringWithFormat:@"  surfaces: srcID=%u dstID=%u (подменяем backing у dst)", srcID, dstID]);
 
+    // 1.9.113: PIPELINE-контроль ДО подмен. Мы ни разу не проверяли, что
+    // скейлер с TSD=0 вообще пишет — если это молчаливый no-op (валидация
+    // kr=0, execute скипает), ни один swap ничего не покажет. Submit на
+    // НЕтронутом dst → читаем его пиксели из юзерспейса.
+    {
+        io_service_t svc0 = IOServiceGetMatchingService(kIOMasterPortDefault,
+                                                        IOServiceMatching("AppleM2ScalerCSCDriver"));
+        if (svc0) {
+            io_connect_t conn0 = 0;
+            if (IOServiceOpen(svc0, mach_task_self(), 0, &conn0) == KERN_SUCCESS && conn0) {
+                uint8_t tsd0[0x1B0];
+                memset(tsd0, 0, sizeof(tsd0));
+                *(uint32_t *)(tsd0 + 0) = srcID;
+                *(uint32_t *)(tsd0 + 4) = dstID;
+                kern_return_t pkr = IOConnectCallMethod(conn0, 1, NULL, 0, tsd0, sizeof(tsd0), NULL, NULL, NULL, NULL);
+                kpNote(r, [NSString stringWithFormat:@"  PIPELINE-контроль submit (нет подмены): kr=0x%x", pkr]);
+                IOServiceClose(conn0);
+            }
+            IOObjectRelease(svc0);
+        }
+        usleep(100000);
+        IOSurfaceLock(dstS, 0, NULL);
+        uint32_t *px0 = (uint32_t *)IOSurfaceGetBaseAddress(dstS);
+        int nz = 0;
+        if (px0) for (int i = 0; i < 1024; i++) if (px0[i]) nz++;
+        IOSurfaceUnlock(dstS, 0, NULL);
+        kpNote(r, [NSString stringWithFormat:@"  PIPELINE-контроль: ненулевых dword в dst после submit = %d %@", nz,
+                  nz ? @"— скейлер РАБОТАЕТ с TSD=0 (DMA идёт, значит DVA кэш/другое поле)" : @"— DMA НЕ ИДЁТ вообще (TSD=0 no-op), swap-тесты ни о чём"]);
+    }
+
     // control page: marker-filled, we own it; get its PA through our own pmap
     uint8_t *ctl = valloc(0x4000);
     memset(ctl, 0xCC, 0x4000);
