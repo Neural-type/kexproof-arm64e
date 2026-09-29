@@ -5869,6 +5869,17 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
             nColl++;
             uint64_t cnt = 0;
             if (!kpRead(coll + 0xd8, &cnt, 8, "ps coll cnt", r)) continue;
+            // 1.9.122: cnt=0 по всем 8 на 1.9.121 — печатаем сырые значения
+            // (реальный layout collection-объекта на этом билде)
+            kpNote(r, [NSString stringWithFormat:@"    UC-кандидат idx=%#x: ucVA=%#llx coll=%#llx [+0xd8]=%#llx", idx,
+                      (unsigned long long)ucVA, (unsigned long long)coll, (unsigned long long)cnt]);
+            if (nColl == 1) {
+                for (uint32_t oo = 0xc0; oo <= 0x100; oo += 8) {
+                    uint64_t dq = 0;
+                    if (kpRead(coll + oo, &dq, 8, "ps coll dump", r))
+                        kpNote(r, [NSString stringWithFormat:@"      coll+%#03x = %#018llx", oo, (unsigned long long)dq]);
+                }
+            }
             if (cnt <= dstID || cnt > 0x20000) continue;
             nCnt++;
             uint64_t arr = 0;
