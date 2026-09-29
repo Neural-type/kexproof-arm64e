@@ -21,6 +21,7 @@
 @property (nonatomic, strong) UIButton *physmapButton;
 @property (nonatomic, strong) UIButton *geoButton;
 @property (nonatomic, strong) UIButton *gartButton;
+@property (nonatomic, strong) UIButton *m2tButton;
 @property (nonatomic, strong) UIButton *shareButton;
 @property (nonatomic, strong) UILabel *statusLabel;
 @property (nonatomic, copy, nullable) NSString *reportPath;
@@ -43,7 +44,7 @@
     titleLabel.textAlignment = NSTextAlignmentCenter;
 
     UILabel *subtitle = [self makeLabel:13 weight:UIFontWeightRegular color:[UIColor colorWithRed:0.55 green:0.85 blue:0.65 alpha:1.0]];
-    subtitle.text = @"CVE-2025-43520 · ClearSword · дамп SPTM/TXM · 1.9.92";
+    subtitle.text = @"CVE-2025-43520 · ClearSword · дамп SPTM/TXM · 1.9.93";
     subtitle.textAlignment = NSTextAlignmentCenter;
 
     self.statusLabel = [self makeLabel:13 weight:UIFontWeightSemibold color:[UIColor secondaryLabelColor]];
@@ -91,6 +92,12 @@
                                   color:[UIColor colorWithRed:0.65 green:0.18 blue:0.18 alpha:1.0]];
     [self.m2uafButton addTarget:self action:@selector(m2uafTapped) forControlEvents:UIControlEventTouchUpInside];
 
+    // CVE-2026-43655 teardown race: calibration-first (фаза A kread-only),
+    // затем close victim'а ПОД параллельным submitter'ом. ДЕСТРУКТИВНО.
+    self.m2tButton = [self makeButton:@"M2 teardown UAF (CVE-2026-43655)"
+                                color:[UIColor colorWithRed:0.58 green:0.30 blue:0.10 alpha:1.0]];
+    [self.m2tButton addTarget:self action:@selector(m2tTapped) forControlEvents:UIControlEventTouchUpInside];
+
     self.shareButton = [self makeButton:@"Поделиться отчётом"
                                   color:[UIColor colorWithRed:0.25 green:0.35 blue:0.60 alpha:1.0]];
     [self.shareButton addTarget:self action:@selector(shareTapped) forControlEvents:UIControlEventTouchUpInside];
@@ -111,6 +118,7 @@
     [self.view addSubview:self.geoButton];
     [self.view addSubview:self.gartButton];
     [self.view addSubview:self.m2uafButton];
+    [self.view addSubview:self.m2tButton];
     [self.view addSubview:self.shareButton];
 
     UILayoutGuide *safe = self.view.safeAreaLayoutGuide;
@@ -160,7 +168,12 @@
         [self.m2uafButton.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:12],
         [self.m2uafButton.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-12],
         [self.m2uafButton.heightAnchor constraintEqualToConstant:38],
-        [self.m2uafButton.bottomAnchor constraintEqualToAnchor:self.shareButton.topAnchor constant:-8],
+        [self.m2uafButton.bottomAnchor constraintEqualToAnchor:self.m2tButton.topAnchor constant:-7],
+
+        [self.m2tButton.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:12],
+        [self.m2tButton.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-12],
+        [self.m2tButton.heightAnchor constraintEqualToConstant:38],
+        [self.m2tButton.bottomAnchor constraintEqualToAnchor:self.shareButton.topAnchor constant:-8],
 
         [self.shareButton.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:12],
         [self.shareButton.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-12],
@@ -221,6 +234,7 @@
     [self setExperimentButton:self.physmapButton enabled:krw];
     [self setExperimentButton:self.geoButton enabled:!self.jobRunning];
     [self setExperimentButton:self.gartButton enabled:krw];
+    [self setExperimentButton:self.m2tButton enabled:krw];
 }
 
 - (void)appendLogText:(NSString *)text {
@@ -561,6 +575,17 @@
             self.statusLabel.text = @"Reachability: готово — см. лог";
             [self appendLogText:report];
             [self saveExperimentReport:report fileName:@"kexproof-reachability.txt"];
+    }];
+}
+
+- (void)m2tTapped {
+    [self runDiagnosticWithStatus:@"M2 teardown UAF: калибровка → гонка (паника возможна)…" work:^NSDictionary *{
+        return @{@"report": [KPDump m2TeardownUafReport]};
+    } completion:^(NSDictionary *result) {
+            NSString *report = result[@"report"];
+            self.statusLabel.text = @"M2 teardown: прогон завершён без паники — см. лог";
+            [self appendLogText:report];
+            [self saveExperimentReport:report fileName:@"kexproof-m2teardown.txt"];
     }];
 }
 

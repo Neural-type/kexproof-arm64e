@@ -189,6 +189,19 @@ NS_ASSUME_NONNULL_BEGIN
 // без паники = баг не сработал в этом прогоне, повторить.
 + (NSString *)m2ScalerUafReport;
 
+// M2Scaler teardown UAF (CVE-2026-43655), calibration-first вариант.
+// Отличия от m2ScalerUafReport: (1) фаза A ДО гонки — kread-дамп живого
+// IOSurfaceAcceleratorClient (18.6: 0x168) + цепочка [client+0xe8]→[prov+0xb8]
+// scheduler-кандидата, diff-снапшоты до/после async-опа показывают, где лежат
+// op-записи на этом железе; (2) оффсет credit калибруется маркером 0xCAFEBABE
+// через sel 10 (статика 18.6: sel 10 пишет [client+0x148]; PoC 26.4 — +0x158);
+// (3) параллельный submitter-тред на втором коннекшене гонит scheduler ВО
+// ВРЕМЯ IOServiceClose(victim), а не после. Требует живого KRW (калибровка);
+// ДЕСТРУКТИВНО — успех = паника. Каждая строка fsync'ится в
+// Documents/kexproof-m2teardown.txt + kexproof-live.log. Кнопку подключает
+// владелец (в KPViewController не лезем).
++ (NSString *)m2TeardownUafReport;
+
 // EXP-13: nest/unnest race rig — MAY PANIC (by design). Walks to our pmap's
 // nested subordinate (shared cache), picks one live twig page-table frame,
 // then races 4 fork/_exit churn threads against a ~30 ms poll of that twig's
