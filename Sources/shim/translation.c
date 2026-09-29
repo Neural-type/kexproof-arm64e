@@ -22,6 +22,12 @@ uint64_t kp_papt_table_n = 0;
 // fast-path entries {va_base, start_pfn(u32)@8, count(u24)|flags(u8)@12}.
 uint32_t kp_papt_format = 0;
 
+// KexProof 1.9.143: обход таблиц через early_kread64 — единственный примитив,
+// читающий все регионы (kreadbuf флаки: zone map 0xffffffdd/df… давал
+// kvtophys=0 на proc_ro/IOSurface-объектах). Все вызовы kvtophys — только
+// после победы эксплойта, когда сокет-пара примитива жива.
+extern uint64_t early_kread64(uint64_t kaddr);
+
 // Address translation physical <-> virtual
 
 uint64_t sptm_phystokv(uint64_t pa)
@@ -137,13 +143,13 @@ uint64_t vtophys_lvl(uint64_t tte_ttep, uint64_t va, uint64_t *leaf_level, uint6
 		uint64_t tteEntry = 0;
 		if (physical) {
 			uint64_t tte_pa = tte_ttep + (tteIndex * sizeof(uint64_t));
-			tteEntry = physread64(tte_pa);
+			tteEntry = early_kread64(phystokv(tte_pa));
 			if (leaf_tte_ttep) *leaf_tte_ttep = tte_pa;
 			if (leaf_level) *leaf_level = curLevel;
 		}
 		else if (gPrimitives.kreadbuf && !physical) {
 			uint64_t tte_va = tte_ttep + (tteIndex * sizeof(uint64_t));
-			tteEntry = kread64(tte_va);
+			tteEntry = early_kread64(tte_va);
 			if (leaf_tte_ttep) *leaf_tte_ttep = tte_va;
 			if (leaf_level) *leaf_level = curLevel;
 		}
