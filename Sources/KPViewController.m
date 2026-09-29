@@ -45,7 +45,7 @@
     titleLabel.textAlignment = NSTextAlignmentCenter;
 
     UILabel *subtitle = [self makeLabel:13 weight:UIFontWeightRegular color:[UIColor colorWithRed:0.55 green:0.85 blue:0.65 alpha:1.0]];
-    subtitle.text = @"CVE-2025-43520 · ClearSword · дамп SPTM/TXM · 1.9.95";
+    subtitle.text = @"CVE-2025-43520 · ClearSword · дамп SPTM/TXM · 1.9.96";
     subtitle.textAlignment = NSTextAlignmentCenter;
 
     self.statusLabel = [self makeLabel:13 weight:UIFontWeightSemibold color:[UIColor secondaryLabelColor]];
@@ -630,7 +630,7 @@
         [items addObject:[NSURL fileURLWithPath:prev]];
     }
     // инкрементальные файлы стадий (переживают панику)
-    for (NSString *fn in @[@"kexproof-gart.txt", @"kexproof-pac.txt"]) {
+    for (NSString *fn in @[@"kexproof-gart.txt", @"kexproof-pac.txt", @"kexproof-m2teardown.txt", @"kexproof-jpeg.txt", @"kexproof-reachability.txt"]) {
         NSString *fp = [NSHomeDirectory() stringByAppendingPathComponent:[@"Documents/" stringByAppendingString:fn]];
         if ([[NSFileManager defaultManager] fileExistsAtPath:fp]) {
             [items addObject:[NSURL fileURLWithPath:fp]];
