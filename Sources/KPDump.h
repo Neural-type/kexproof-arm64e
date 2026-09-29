@@ -157,10 +157,11 @@ NS_ASSUME_NONNULL_BEGIN
 // methods exist (not-Unsupported) for the reverse phase.
 + (NSString *)iosurfaceProbeReport;
 
-// IOSurface backing-PA swap: overwrite ranges[0].pa of a surface in its
-// writable kernel object (+0x360/+0x3a4 per the interface doc), then submit
-// the scaler — the DMA engine writes into the swapped page. Control page
-// first (pixels must land), then a protected page to test DART validation.
+// IOSurface backing-PA swap: backing PA узнаём авторитетно (vtophys по нашей
+// pmap пиксельного VA — 1.9.108, конец object-археологии), поле подмены ищем
+// heap-сканом по паре {backingPA, 0x4000} (ranges[0] в IOMemoryDescriptor),
+// затем submit скейлера — DMA пишет в подменённую страницу мимо SPTM. Сначала
+// контрольная страница (пиксели должны лечь), потом защищённая (proc_ro.ucred).
 + (NSString *)iosurfacePaSwapReport;
 
 // Binary check that the Plume sideloader granted the lara entitlements:
