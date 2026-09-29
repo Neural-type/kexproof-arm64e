@@ -5698,6 +5698,13 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
     uint32_t srcID = IOSurfaceGetID(srcS);
     kpNote(r, [NSString stringWithFormat:@"  surfaces: srcID=%u dstID=%u (подменяем backing у dst)", srcID, dstID]);
 
+    // 1.9.116: src заполняем паттерном 0x41 — нулевой src даёт нулевой выход
+    // при ЛЮБОМ рабочем DMA, и «DMA не идёт» был ложным выводом из нулей.
+    IOSurfaceLock(srcS, 0, NULL);
+    uint8_t *spix = (uint8_t *)IOSurfaceGetBaseAddress(srcS);
+    if (spix) memset(spix, 0x41, 0x1000);
+    IOSurfaceUnlock(srcS, 0, NULL);
+
     // 1.9.114 (раунд 15): DVA кэшируется при ПЕРВОМ wire поверхности — подмена
     // должна стоять ДО первого submit настоящего dst. Поэтому калибровка TSD
     // идёт на ВЫКИДНЫХ поверхностях (какой rect-оффсет даёт реальный DMA), а
@@ -5709,6 +5716,14 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
     {
         IOSurfaceRef calS = IOSurfaceCreate((__bridge CFDictionaryRef)sp);
         IOSurfaceRef calD = IOSurfaceCreate((__bridge CFDictionaryRef)sp);
+        // 1.9.116: src был НУЛЕВЫМ — скейлер копировал нули в нули, nz=0 при
+        // ЛЮБОМ рабочем DMA. Заполняем паттерном 0x41, иначе калибровка слепа.
+        if (calS) {
+            IOSurfaceLock(calS, 0, NULL);
+            uint32_t *spx = (uint32_t *)IOSurfaceGetBaseAddress(calS);
+            if (spx) for (int i = 0; i < 1024; i++) spx[i] = 0x41414141;
+            IOSurfaceUnlock(calS, 0, NULL);
+        }
         io_service_t svc0 = IOServiceGetMatchingService(kIOMasterPortDefault,
                                                         IOServiceMatching("AppleM2ScalerCSCDriver"));
         if (calS && calD && svc0) {
