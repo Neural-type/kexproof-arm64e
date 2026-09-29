@@ -202,6 +202,15 @@ NS_ASSUME_NONNULL_BEGIN
 // владелец (в KPViewController не лезем).
 + (NSString *)m2TeardownUafReport;
 
+// Итерация 3 по панике 045942 (символизировано: ldrb [sched+0x118 +
+// entry->credit+0xc3c], RMW entry+0xbc4 += byte): credit = наш индекс через
+// sel 10 (struct+0). Управляемый OOB-read за scheduler'ом вместо краша:
+// discovery driver→scheduler→entry-array→entry VA по маркеру, затем свип
+// смещений с валидацией delta(entry+0xbc4) против прямого kread.
+// НЕ деструктивно по замыслу (малые смещения, mapped-зона). Пишет
+// Documents/kexproof-m2oracle.txt (fsync) + os_log [M2O].
++ (NSString *)m2OracleReport;
+
 // EXP-13: nest/unnest race rig — MAY PANIC (by design). Walks to our pmap's
 // nested subordinate (shared cache), picks one live twig page-table frame,
 // then races 4 fork/_exit churn threads against a ~30 ms poll of that twig's
