@@ -5833,7 +5833,7 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
     //    верификация [surfVA+0x10]==dstID. UC находим перебором наших портов —
     //    читаем kreadbuf'ом (1.9.120 промах: kpRead не транслирует zone map,
     //    где UC и живёт — фреймворковский UC отбрасывался молча).
-    uint64_t surfVA = 0, rangesVA = 0;
+    uint64_t surfVA = 0, rangesVA = 0, rootVA = 0;
     {
         // 1.9.137: реестр клиентов по TASK (раунд 21, findClientByTask):
         //    IOSurfaceRoot → кэш 2 слота @ root+0x418/+0x428, иначе count @
@@ -5842,7 +5842,7 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
         //    Авторитетный путь — класс UC идентифицировать не нужно.
         io_service_t isvc = IOServiceGetMatchingService(kIOMasterPortDefault,
                                                         IOServiceMatching("IOSurfaceRoot"));
-        uint64_t rootVA = isvc ? kpM2TClientVA(r, isTable, isvc, @"iosurfroot") : 0;
+        rootVA = isvc ? kpM2TClientVA(r, isTable, isvc, @"iosurfroot") : 0;
         kpNote(r, [NSString stringWithFormat:@"  IOSurfaceRoot: svc=0x%x rootVA=%#llx taskVA=%#llx",
                   isvc, (unsigned long long)rootVA, (unsigned long long)taskVA]);
         if (isvc) IOObjectRelease(isvc);
