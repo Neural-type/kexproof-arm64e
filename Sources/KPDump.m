@@ -6649,7 +6649,7 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
         // немапнутого/защищённого указателя из скана dartObj.
         kpNote(r, [NSString stringWithFormat:@"  [P2] kvtophys: provVA→%#llx dartVA→%#llx (0 = walker не резолвит zone-map)",
                   (unsigned long long)kvtophys(provVA), (unsigned long long)kvtophys(dartVA)]);
-        uint64_t pteVA = 0, origPTE = 0;
+        __block uint64_t pteVA = 0, origPTE = 0;   // 1.9.174: __block — scanTbl пишет их из рекурсивного блока (CI failure)
         uint64_t kslide2 = kconstant(base) - 0xfffffff007004000ULL;
         // 1.9.164 (р.38): таргетированный PTE — дикий скан dartObj УБРАН (он и
         // ребутил девайс SPTM-ресетом). Путь: provider+0xb8=scheduler →
