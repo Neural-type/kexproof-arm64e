@@ -6827,7 +6827,6 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
             // 64 + kvtophys на каждой странице — безопасно и без зацикливания.
             __block int nvis = 0;
             uint64_t *visited = (uint64_t *)malloc(64 * sizeof(uint64_t));   // heap-указатель: блоки массивы не захватывают (CI error 6831)
-            __block int nvis = 0;
             __block void (^scanTbl)(uint64_t, int);
             scanTbl = ^void(uint64_t tblVA, int depth) {
                 if (pteVA || depth > 3) return;
