@@ -6852,6 +6852,11 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
         // [mapper+0x170+segIdx*8] = per-seg struct, L0 embedded @ +0x00, bounds
         // [s+0x20] ≤ DVA < [s+0x28] выбирают segIdx; count [mapper+0xa54].
         if (!pteVA && kpLooksLikeKernelPointer(mapVA) && dva) {
+            uint64_t pageIdx25 = dva >> 14;
+            uint32_t idxs[4] = { (uint32_t)((pageIdx25 & 0x3e00000000ULL) >> 33),
+                                 (uint32_t)((pageIdx25 & 0x1ffc00000ULL) >> 22),
+                                 (uint32_t)((pageIdx25 & 0x3ff800ULL) >> 11),
+                                 (uint32_t)(pageIdx25 & 0x7ff) };
             uint32_t segCnt = (uint32_t)(early_kread64(mapVA + 0xa54) & 0xffff);
             if (segCnt > 16) segCnt = 16;
             kpNote(r, [NSString stringWithFormat:@"  [P2.5] mapper-walk: segCnt=%u", segCnt]);
