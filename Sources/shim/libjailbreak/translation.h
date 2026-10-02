@@ -33,5 +33,6 @@ extern uint32_t kp_papt_format;
 void kpSetFrameTableVA(uint64_t va);
 int kpFrameDeadly(uint64_t pa);
 int kpFrameTypeOf(uint64_t pa);
+void kpSetFrameTypeLogger(void (*cb)(int, uint64_t));
 
 #endif

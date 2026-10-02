@@ -29,28 +29,37 @@ uint32_t kp_papt_format = 0;
 extern uint64_t early_kread64(uint64_t kaddr);
 
 // KexProof 1.9.177: frame-type инструмент против SPTM/EL2 ресетов (тихая
-// смерть без паники). УРОК прогона 1.9.177: deadly-список {0x13,0x14,0x17,0x37}
-// из карты р.25 НЕВЕРЕН для нашего примитива — табличные фреймы TTBR1 одного из
-// этих типов ЧИТАЮТСЯ (walker работал годами). Поэтому: walker не гейтится,
-// типы считаем переписью (census), блокируем ТОЛЬКО 0x37 до выяснения убийцы.
+// смерть без паники). УРОКИ: deadly-список {0x13,0x14,0x17,0x37} из карты р.25
+// НЕВЕРЕН (табличные фреймы того типа ЧИТАЮТСЯ); census поймал настоящего
+// убийцу на железе = 0xb (последний тип перед смертью; 0xc/0x6/0x21 живы).
+// Блок {0x37, 0xb} + census через callback (KPDump логирует в syslog).
 static uint64_t kp_frameTableVA = 0;
 void kpSetFrameTableVA(uint64_t va) { kp_frameTableVA = va; }
+
+static void (*kp_ftLogger)(int, uint64_t) = 0;
+void kpSetFrameTypeLogger(void (*cb)(int, uint64_t)) { kp_ftLogger = cb; }
 
 // Тип фрейма по PA (-1 = таблица не задана / PA вне диапазона).
 int kpFrameTypeOf(uint64_t pa)
 {
-	if (!kp_frameTableVA) return -1;
-	uint64_t physBase = kconstant(physBase);
-	uint64_t physSize = kconstant(physSize);
-	if (pa < physBase || pa >= physBase + physSize) return -1;
-	uint64_t idx = (pa - physBase) >> 14;
-	uint64_t q = early_kread64(kp_frameTableVA + idx * 16);
-	return (int)((q >> 16) & 0xff);
+	int t = -1;
+	if (kp_frameTableVA) {
+		uint64_t physBase = kconstant(physBase);
+		uint64_t physSize = kconstant(physSize);
+		if (pa >= physBase && pa < physBase + physSize) {
+			uint64_t idx = (pa - physBase) >> 14;
+			uint64_t q = early_kread64(kp_frameTableVA + idx * 16);
+			t = (int)((q >> 16) & 0xff);
+		}
+	}
+	if (kp_ftLogger) kp_ftLogger(t, pa);
+	return t;
 }
 
 int kpFrameDeadly(uint64_t pa)
 {
-	return kpFrameTypeOf(pa) == 0x37;
+	int t = kpFrameTypeOf(pa);
+	return t == 0x37 || t == 0xb;
 }
 
 // Address translation physical <-> virtual
@@ -168,6 +177,10 @@ uint64_t vtophys_lvl(uint64_t tte_ttep, uint64_t va, uint64_t *leaf_level, uint6
 		uint64_t tteEntry = 0;
 		if (physical) {
 			uint64_t tte_pa = tte_ttep + (tteIndex * sizeof(uint64_t));
+			if (kpFrameDeadly(tte_pa)) {   // 1.9.178b: не читаем deadly-таблицу (0x37/0xb — поймано census'ом)
+				errno = 1042;
+				return 0;
+			}
 			tteEntry = early_kread64(phystokv(tte_pa));
 			if (leaf_tte_ttep) *leaf_tte_ttep = tte_pa;
 			if (leaf_level) *leaf_level = curLevel;

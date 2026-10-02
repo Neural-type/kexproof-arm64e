@@ -54,21 +54,22 @@ static void kpNote(NSMutableString *report, NSString *line)
     if (report) [report appendFormat:@"%@\n", line];
 }
 
-// 1.9.177: безопасный ли VA для дерефа — walker дал PA + frame-тип не 0x37
-// (единственный подтверждённый ресет-кандидат; список {0x13,0x14,0x17,0x37} из
-// карты неверен — таблицы того типа ЧИТАЮТСЯ). Плюс census типов в syslog:
-// если всё же ресет — последний напечатанный тип и есть убийца.
+// 1.9.178b: безопасный ли VA для дерефа — walker дал PA + тип не deadly
+// ({0x37, 0xb} — пойман census'ом на железе: последний тип перед смертью).
+// Census-лог идёт из translation.c через callback — последний тип в syslog
+// перед любым ресетом и есть убийца.
+static void kpFrameTypeLogCb(int t, uint64_t pa)
+{
+    static uint32_t seenBits[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    if (t < 0 || (seenBits[t >> 5] & (1u << (t & 31)))) return;
+    seenBits[t >> 5] |= (1u << (t & 31));
+    kpNote(NULL, [NSString stringWithFormat:@"  [frame-type census] type=0x%x (pa=%#llx)", t, (unsigned long long)pa]);
+}
+
 static BOOL kpSafeToRead(uint64_t va)
 {
     uint64_t pa = kvtophys(va);
-    if (!pa) return 0;
-    int t = kpFrameTypeOf(pa);
-    static uint32_t seenBits[8] = {0, 0, 0, 0, 0, 0, 0, 0};
-    if (t >= 0 && !(seenBits[t >> 5] & (1u << (t & 31)))) {
-        seenBits[t >> 5] |= (1u << (t & 31));
-        kpNote(NULL, [NSString stringWithFormat:@"  [frame-type census] type=0x%x (pa=%#llx)", t, (unsigned long long)pa]);
-    }
-    return t != 0x37;
+    return pa && !kpFrameDeadly(pa);
 }
 
 // The EL2 domain faults in the physical aperture when read via the socket
@@ -1512,6 +1513,7 @@ static BOOL kpPAIsManaged(uint64_t pa)
     }
     gFrameTableVA = va;
     kpSetFrameTableVA(va);   // 1.9.177: frame-type гейт для walker'а (translation.c)
+    kpSetFrameTypeLogger(kpFrameTypeLogCb);   // 1.9.178b: census типов в syslog
     return va;
 }
 
