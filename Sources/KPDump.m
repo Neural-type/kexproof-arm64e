@@ -48,13 +48,21 @@ static BOOL kpLooksLikeKernelPointer(uint64_t v)
     return (v & 0xFFFFFF0000000000ULL) == 0xFFFFFF0000000000ULL;
 }
 
-// 1.9.177: безопасный ли VA для дерефа — walker (уже frame-gated внутри) дал
-// PA, и финальный PA не deadly frame-типа (0x13/0x14/0x17/0x37). Иначе чтение
-// = SPTM/EL2 ресет без паники (ресеты #2-4).
+// 1.9.177: безопасный ли VA для дерефа — walker дал PA + frame-тип не 0x37
+// (единственный подтверждённый ресет-кандидат; список {0x13,0x14,0x17,0x37} из
+// карты неверен — таблицы того типа ЧИТАЮТСЯ). Плюс census типов в syslog:
+// если всё же ресет — последний напечатанный тип и есть убийца.
 static BOOL kpSafeToRead(uint64_t va)
 {
     uint64_t pa = kvtophys(va);
-    return pa && !kpFrameDeadly(pa);
+    if (!pa) return 0;
+    int t = kpFrameTypeOf(pa);
+    static uint32_t seenBits[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    if (t >= 0 && !(seenBits[t >> 5] & (1u << (t & 31)))) {
+        seenBits[t >> 5] |= (1u << (t & 31));
+        kpNote(NULL, [NSString stringWithFormat:@"  [frame-type census] type=0x%x (pa=%#llx)", t, (unsigned long long)pa]);
+    }
+    return t != 0x37;
 }
 
 static void kpNote(NSMutableString *report, NSString *line)

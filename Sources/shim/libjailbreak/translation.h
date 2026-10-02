@@ -26,10 +26,12 @@ extern uint64_t kp_papt_table_va;
 extern uint64_t kp_papt_table_n;
 extern uint32_t kp_papt_format;
 
-// KexProof 1.9.177: frame-type гейт против SPTM/EL2 ресетов на чтении deadly
-// frame-типов (0x13/0x14/0x17/0x37). Setter зовётся из KPDump при резолве
-// frame table; kpFrameDeadly используется walker'ом и сканами.
+// KexProof 1.9.177: frame-type инструмент против SPTM/EL2 ресетов. Setter
+// зовётся из KPDump при резолве frame table. Список {0x13,0x14,0x17,0x37}
+// неверен для нашего примитива (таблицы TTBR1 того типа ЧИТАЮТСЯ) — гейт только
+// 0x37 + census типов через kpFrameTypeOf.
 void kpSetFrameTableVA(uint64_t va);
 int kpFrameDeadly(uint64_t pa);
+int kpFrameTypeOf(uint64_t pa);
 
 #endif

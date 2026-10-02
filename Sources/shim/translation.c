@@ -28,23 +28,29 @@ uint32_t kp_papt_format = 0;
 // после победы эксплойта, когда сокет-пара примитива жива.
 extern uint64_t early_kread64(uint64_t kaddr);
 
-// KexProof 1.9.177: frame-type гейт против SPTM/EL2 ресетов (тихая смерть без
-// паники — 1.9.162 + два marker-ханта). Чтение страницы с frame-типом
-// 0x13/0x14/0x17 (фолт) или 0x37 (ресет) = мгновенный ребут. Walker больше не
-// читает таблицы таких страниц; kpFrameDeadly также гейтит финальные дерефы.
+// KexProof 1.9.177: frame-type инструмент против SPTM/EL2 ресетов (тихая
+// смерть без паники). УРОК прогона 1.9.177: deadly-список {0x13,0x14,0x17,0x37}
+// из карты р.25 НЕВЕРЕН для нашего примитива — табличные фреймы TTBR1 одного из
+// этих типов ЧИТАЮТСЯ (walker работал годами). Поэтому: walker не гейтится,
+// типы считаем переписью (census), блокируем ТОЛЬКО 0x37 до выяснения убийцы.
 static uint64_t kp_frameTableVA = 0;
 void kpSetFrameTableVA(uint64_t va) { kp_frameTableVA = va; }
 
-int kpFrameDeadly(uint64_t pa)
+// Тип фрейма по PA (-1 = таблица не задана / PA вне диапазона).
+int kpFrameTypeOf(uint64_t pa)
 {
-	if (!kp_frameTableVA) return 0;
+	if (!kp_frameTableVA) return -1;
 	uint64_t physBase = kconstant(physBase);
 	uint64_t physSize = kconstant(physSize);
-	if (pa < physBase || pa >= physBase + physSize) return 1;
+	if (pa < physBase || pa >= physBase + physSize) return -1;
 	uint64_t idx = (pa - physBase) >> 14;
 	uint64_t q = early_kread64(kp_frameTableVA + idx * 16);
-	uint32_t type = (uint32_t)(q >> 16) & 0xff;
-	return type == 0x13 || type == 0x14 || type == 0x17 || type == 0x37;
+	return (int)((q >> 16) & 0xff);
+}
+
+int kpFrameDeadly(uint64_t pa)
+{
+	return kpFrameTypeOf(pa) == 0x37;
 }
 
 // Address translation physical <-> virtual
@@ -162,10 +168,6 @@ uint64_t vtophys_lvl(uint64_t tte_ttep, uint64_t va, uint64_t *leaf_level, uint6
 		uint64_t tteEntry = 0;
 		if (physical) {
 			uint64_t tte_pa = tte_ttep + (tteIndex * sizeof(uint64_t));
-			if (kpFrameDeadly(tte_pa)) {   // 1.9.177: не читаем таблицу deadly frame-типа — SPTM/EL2 ресет
-				errno = 1042;
-				return 0;
-			}
 			tteEntry = early_kread64(phystokv(tte_pa));
 			if (leaf_tte_ttep) *leaf_tte_ttep = tte_pa;
 			if (leaf_level) *leaf_level = curLevel;
