@@ -48,6 +48,12 @@ static BOOL kpLooksLikeKernelPointer(uint64_t v)
     return (v & 0xFFFFFF0000000000ULL) == 0xFFFFFF0000000000ULL;
 }
 
+static void kpNote(NSMutableString *report, NSString *line)
+{
+    [[KPLog shared] append:line];
+    if (report) [report appendFormat:@"%@\n", line];
+}
+
 // 1.9.177: безопасный ли VA для дерефа — walker дал PA + frame-тип не 0x37
 // (единственный подтверждённый ресет-кандидат; список {0x13,0x14,0x17,0x37} из
 // карты неверен — таблицы того типа ЧИТАЮТСЯ). Плюс census типов в syslog:
@@ -63,12 +69,6 @@ static BOOL kpSafeToRead(uint64_t va)
         kpNote(NULL, [NSString stringWithFormat:@"  [frame-type census] type=0x%x (pa=%#llx)", t, (unsigned long long)pa]);
     }
     return t != 0x37;
-}
-
-static void kpNote(NSMutableString *report, NSString *line)
-{
-    [[KPLog shared] append:line];
-    if (report) [report appendFormat:@"%@\n", line];
 }
 
 // The EL2 domain faults in the physical aperture when read via the socket
