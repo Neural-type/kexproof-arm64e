@@ -59,7 +59,10 @@ int kpFrameTypeOf(uint64_t pa)
 int kpFrameDeadly(uint64_t pa)
 {
 	int t = kpFrameTypeOf(pa);
-	return t == 0x37 || t == 0xb;
+	// 1.9.227: + 0x15 и 0x18 — census поймал их последними перед смертью
+	// (1.9.226, pid 549: walker/kpSafeToRead читает табличную страницу этих
+	// типов — PPL-read-защита, та же семья что 0xb). Возвращаем errno, не смерть.
+	return t == 0x37 || t == 0xb || t == 0x15 || t == 0x18;
 }
 
 // Address translation physical <-> virtual
