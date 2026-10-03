@@ -7534,6 +7534,7 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                             if (gu3 == 0) kpNote(r, @"=== ROOT ДОСТИГНУТ: getuid()==0 — spec-яд форж ucred РАБОТАЕТ ===");
                         }
                     }
+                }
             }
         }
         if (cmdVA) {
