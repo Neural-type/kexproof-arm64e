@@ -65,6 +65,11 @@ int kpFrameDeadly(uint64_t pa)
 	return t == 0x37 || t == 0xb || t == 0x15 || t == 0x18;
 }
 
+// 1.9.252: адрес и уровень последней deadly-таблицы, на которой walker встал.
+// Форж забирает их для physread через DART (таблица читается DMA-копией мимо SPTM).
+uint64_t kp_lastDeadlyTte = 0;
+int kp_lastDeadlyLvl = -1;
+
 // Address translation physical <-> virtual
 
 uint64_t sptm_phystokv(uint64_t pa)
@@ -181,6 +186,8 @@ uint64_t vtophys_lvl(uint64_t tte_ttep, uint64_t va, uint64_t *leaf_level, uint6
 		if (physical) {
 			uint64_t tte_pa = tte_ttep + (tteIndex * sizeof(uint64_t));
 			if (kpFrameDeadly(tte_pa)) {   // 1.9.178b: не читаем deadly-таблицу (0x37/0xb — поймано census'ом)
+				kp_lastDeadlyTte = tte_pa;   // 1.9.252: форж прочитает её через DART-копию
+				kp_lastDeadlyLvl = (int)curLevel;
 				errno = 1042;
 				return 0;
 			}

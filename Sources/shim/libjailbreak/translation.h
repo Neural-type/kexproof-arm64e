@@ -35,4 +35,9 @@ int kpFrameDeadly(uint64_t pa);
 int kpFrameTypeOf(uint64_t pa);
 void kpSetFrameTypeLogger(void (*cb)(int, uint64_t));
 
+// 1.9.252: адрес/уровень последней deadly-таблицы, на которой встал walker
+// (форж читает её через DART-копию — CPU-чтение deadly, DMA-чтение мимо SPTM).
+extern uint64_t kp_lastDeadlyTte;
+extern int kp_lastDeadlyLvl;
+
 #endif
