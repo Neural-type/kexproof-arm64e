@@ -7219,6 +7219,11 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
             if (!rmdHitArr) kpNote(r, @"  [RMD] записи pfn в цепочке rootMD нет — дамп его полей для разбора");
         }
     }
+    // 1.9.262 fast-path: сюда прыгаем из CHAIN при nDep>0 — пропускаем ТОЛЬКО
+    // диагностические фазы (EARLY/DEP/VAD/PAR/OWN/RMD); svc/victim/tsdV/victim#1
+    // идут штатно ниже. (Метка БЫЛА перед tsdV — victim открывался в спане,
+    // kr=0x10000003 на retry, 262b.)
+kpx_submit1: ;
     // 3. Trusted-path резолв surfVA через M2 async op-entry (1.9.124):
     //    async submit резолвит surface ptr в op-entry БЕЗ execute/снапшота
     //    (раунд 13: DVA-снапшот только при execute). Вся цепочка — из РЕАЛЬНЫХ
@@ -7273,9 +7278,6 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
     // пробрасывается → ldr по НЕмапнутому cmd → NULL deref) — srcBad/уронить-map
     // ЗАПРЕЩЕНЫ. victim#1 = НАСТОЯЩИЙ src: валидный identity-оп, mapping кэшится
     // НА PIPE (не op-entry). DVA потом берём прямо оттуда.
-    // 1.9.262 fast-path: сюда прыгаем из CHAIN при nDep>0 (вся середина — только
-    // когда CHAIN мимо: диагностика целиком, потом тот же submit/retry).
-kpx_submit1: ;
     uint8_t tsdV[0x1B0];
     memcpy(tsdV, tsdGood, sizeof(tsdV));
     *(uint32_t *)(tsdV + 0) = srcID;
