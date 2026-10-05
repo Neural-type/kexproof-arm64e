@@ -4,6 +4,7 @@
 #import "KPDump.h"
 
 #import <unistd.h>
+#import <sys/sysctl.h>
 
 @interface KPViewController ()
 @property (nonatomic, strong) UITextView *logView;
@@ -234,6 +235,20 @@
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         if (!self.jobRunning && !KPRunner.hasKRW) {
+            // 1.9.267: страж того же бута — повторный прогон на загрязнённом
+            // драйвере обречён (258/259 и 262c/264 — одинаковый slide в обоих
+            // парах). kern.boottime в NSUserDefaults живёт между запусками и
+            // умирает с ребутом: совпал = тот же бут → автостарт пропускаем.
+            struct timeval bt = {0}; size_t bsz = sizeof(bt);
+            long curBoot = 0;
+            if (sysctlbyname("kern.boottime", &bt, &bsz, NULL, 0) == 0) curBoot = bt.tv_sec;
+            NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+            long lastBoot = [ud integerForKey:@"kexLastBoot"];
+            if (curBoot && curBoot == lastBoot) {
+                [[KPLog shared] append:@"[auto] ⚠ ТОТ ЖЕ БУТ (boottime совпал) — драйвер загрязнён прошлым прогоном. РЕБУТНИ и запусти снова. Автостарт пропущен."];
+                return;
+            }
+            if (curBoot) [ud setInteger:curBoot forKey:@"kexLastBoot"];
             [[KPLog shared] append:@"[auto] запускаю эксплойт сам (автостарт)"];
             [self exploitTapped];
         }
