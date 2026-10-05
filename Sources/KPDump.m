@@ -7936,20 +7936,45 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                 // Контент-охота прямо здесь (р.63/69: zone-map покрыт резолвером
                 // ядра — таблица существует). 24-B формат: {PA, VA, npages}.
                 if (!pagePA && !kp_papt_table_va) {
+                    // 1.9.275: ДИАГНОСТИКА охоты — сначала дамп сток-таблицы: что
+                    // реально лежит в [libsptm_papt_ranges] (stub или настоящая) и
+                    // сколько записей считает резолвер. Потом по контенту.
+                    uint64_t stockN = kread32(kread64(ksymbol(libsptm_n_papt_ranges)));
+                    uint64_t stockT = kread_ptr(ksymbol(libsptm_papt_ranges));
+                    kpNote(r, [NSString stringWithFormat:@"  [FORGE] PAPT сток: tbl=%#llx n=%llu", (unsigned long long)stockT, (unsigned long long)stockN]);
+                    if (kpLooksLikeKernelPointer(stockT)) {
+                        uint8_t se[48];
+                        memset(se, 0, sizeof(se));
+                        if (kpRead(stockT, se, sizeof(se), "papt stock dump", nil))
+                            kpNote(r, [NSString stringWithFormat:@"    stock[0]: %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x... | %#018llx %#018llx %#018llx",
+                                      se[0],se[1],se[2],se[3],se[4],se[5],se[6],se[7],se[8],se[9],se[10],se[11],
+                                      *(uint64_t *)se, *(uint64_t *)(se + 8), *(uint64_t *)(se + 16)]);
+                    }
                     NSArray<NSNumber *> *pts = [self libsptmBlockPointeesWithLog:nil];
+                    kpNote(r, [NSString stringWithFormat:@"  [FORGE] PAPT охота: %d pointee-кандидатов", (int)pts.count]);
                     for (NSNumber *pv in pts) {
                         uint64_t cand = pv.unsignedLongLongValue;
                         uint8_t f2[48];
                         memset(f2, 0, sizeof(f2));
                         if (!kpRead(cand, f2, sizeof(f2), "papt hunt", nil)) continue;
-                        if (kpPaptEntryPlausible(f2) && kpPaptEntryPlausible(f2 + 24)) {
-                            kp_papt_table_va = cand; kp_papt_format = 0;
-                            kp_papt_table_n = kread32(kread64(ksymbol(libsptm_n_papt_ranges)));
-                            kpNote(r, [NSString stringWithFormat:@"  [FORGE] PAPT найдена контент-охотой @ %#llx (n=%llu)",
-                                      (unsigned long long)cand, (unsigned long long)kp_papt_table_n]);
+                        BOOL ok24 = kpPaptEntryPlausible(f2) && kpPaptEntryPlausible(f2 + 24);
+                        if (!ok24) {
+                            // 16-B формат: {va_base, start_pfn(u32)@8, count(u24)@12} — записи с +8
+                            uint64_t vb = 0; uint32_t sp = 0, rc = 0;
+                            memcpy(&vb, f2 + 8, 8); memcpy(&sp, f2 + 16, 4); memcpy(&rc, f2 + 20, 4);
+                            if (kpLooksLikeKernelPointer(vb) && sp && (rc & 0xFFFFFF) && (rc & 0xFFFFFF) < 0x80000) {
+                                ok24 = YES; kp_papt_format = 1;
+                            }
+                        }
+                        if (ok24) {
+                            kp_papt_table_va = cand;
+                            kp_papt_table_n = stockN ? stockN : 96;
+                            kpNote(r, [NSString stringWithFormat:@"  [FORGE] PAPT найдена @ %#llx (fmt=%s n=%llu)",
+                                      (unsigned long long)cand, kp_papt_format ? "16-B" : "24-B", (unsigned long long)kp_papt_table_n]);
                             break;
                         }
                     }
+                    if (!kp_papt_table_va) kpNote(r, @"  [FORGE] PAPT охота: ни один кандидат не прошёл валидацию");
                 }
                 // 1.9.251 (р.63): walker ветки VM/RO охраняется deadly-таблицами
                 // (census 0x15) → pagePA=0. Fallback — PAPT/арена ядра (kpZoneVtoP).
